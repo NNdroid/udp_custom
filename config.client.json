@@ -1,0 +1,29 @@
+{
+  "_description": "udp_custom ARQ Reliable UDP Stream Tunnel Client Configuration (DNAT + client-chosen random ports)",
+  "_fields": {
+    "mode": "Operational mode: 'client' (absent or 'server' runs the server)",
+    "listen": "Local TCP port for local applications to connect to (e.g. 127.0.0.1:1080)",
+    "server": "Remote udp_custom server address with port range: 'host:lo-hi', e.g. '1.2.3.4:25000-26000'. The firewall DNATs the whole range onto the server's single listen port. The client randomly picks N ports from this range for every packet (and, with 'sockets' > 1, across N local sockets too). Do NOT list a single port here unless you intentionally disable spreading.",
+    "target": "Informational only: the backend the SERVER forwards to (the server picks it, clients cannot choose)",
+    "passwords": "Pre-shared key (PSK) password for authentication (first entry is used)",
+    "magic": "4-byte protocol magic header string matching server (default: UDPC)",
+    "pubkey": "Server Noise Curve25519 static public key (hex or base64). Empty = no encryption; non-empty = Noise_NK handshake + AEAD",
+    "sockets": "Local UDP sockets for n:n client-side spreading (1 = single local socket, packets still spread across the remote port range). The client opens this many local sockets and spreads across the remote port range, producing up to sockets x range independent NAT mappings. 32 matches the recommended server-side path count.",
+    "paths": "Number of DISTINCT remote ports the client randomly picks from the server's port range for the whole session (the client is the source of truth; the server mirrors each back via origdst). 0 = spread every packet across the ENTIRE range (original behaviour). 32 pins a fixed 32-port subset, which bounds the server's per-port reply-socket pool and the number of independent NAT mappings. Must be <= the size of the server's port_range.",
+    "send_window": "Max DATA frames in flight before backpressure (0 = 256)",
+    "log_level": "Logging verbosity: debug, info, warn, error"
+  },
+  "mode": "client",
+  "listen": "127.0.0.1:1080",
+  "server": "1.2.3.4:25000-26000",
+  "target": "tcp://127.0.0.1:22",
+  "passwords": [
+    "secret_psk_token_1"
+  ],
+  "magic": "UDPC",
+  "pubkey": "",
+  "sockets": 32,
+  "paths": 32,
+  "send_window": 256,
+  "log_level": "info"
+}

@@ -1,0 +1,30 @@
+{
+  "_description": "udp_custom ARQ Reliable UDP Stream Tunnel Server Configuration (DNAT + IP_RECVORIGDSTADDR multi-path)",
+  "_fields": {
+    "mode": "Operational mode: 'server'",
+    "listen": "The SINGLE UDP port the server binds, e.g. ':36712'. The firewall DNATs the whole client port range (see 'port_range') onto this one port. The server NEVER binds the range itself — it relies on origdst to recover each packet's pre-DNAT destination port and reply from it.",
+    "port_range": "FIRST-CLASS server port range, e.g. '25000-26000' (host optional). The single source of truth for the client port range: the firewall DNATs this whole range onto 'listen'. Used at runtime to validate incoming origdst ports (a packet outside the range is a misconfiguration signal) and as the default --range for 'gen-nftables' / 'gen-iptables'. The server never binds these ports.",
+    "host": "Public server IP / domain fed to 'gen-uri' so the generated client config knows where to dial (e.g. '1.2.3.4'). Not used at runtime by the server itself.",
+    "origdst": "REQUIRED (Linux only). Enables IP_RECVORIGDSTADDR so the server recovers each client packet's original destination port (pre-DNAT) and replies FROM that exact port. Without it every reply leaves from 'listen' and any NAT stricter than full-cone drops it. Ignored on non-Linux platforms.",
+    "sendsock_max": "Per-port reply-socket pool cap (LRU). One socket is bound per distinct origdst port so the kernel stamps the reply's source port correctly. Set it >= the size of 'port_range' (e.g. 1024 for a ~1000-port range) to avoid per-packet rebinding.",
+    "target": "Backend service to forward traffic to (tcp://127.0.0.1:22 or udp://127.0.0.1:51820)",
+    "passwords": "List of valid pre-shared keys (PSKs) for HMAC authentication (aliases: token, psk)",
+    "magic": "4-byte protocol magic header string (default: UDPC)",
+    "privkey": "Noise Curve25519 static private key for end-to-end AEAD encryption (generate with 'udp_custom gen-keys'). Empty = open mode (no encryption).",
+    "log_level": "Logging verbosity: debug, info, warn, error"
+  },
+  "mode": "server",
+  "listen": ":36712",
+  "port_range": "25000-26000",
+  "host": "1.2.3.4",
+  "origdst": true,
+  "sendsock_max": 1024,
+  "target": "tcp://127.0.0.1:22",
+  "passwords": [
+    "secret_psk_token_1",
+    "secret_psk_token_2"
+  ],
+  "magic": "UDPC",
+  "privkey": "",
+  "log_level": "info"
+}

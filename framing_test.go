@@ -218,7 +218,7 @@ func TestFramingLargeMessageAcrossTunnelChunks(t *testing.T) {
 // likes, and the client must still recover every message intact and in order.
 func TestFramingEndToEndThroughTunnel(t *testing.T) {
 	target := newEchoTarget(t, 0)
-	serverUDP := "127.0.0.1:39740"
+	serverUDP := "127.0.0.1:0"
 	srv, err := NewUDPCServer(ServerConfig{
 		ListenAddr: serverUDP,
 		TargetAddr: target.addr(),
@@ -228,9 +228,9 @@ func TestFramingEndToEndThroughTunnel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewUDPCServer: %v", err)
 	}
+	serverUDP = srv.conn.LocalAddr().String()
 	go srv.Start()
 	defer srv.Close()
-	time.Sleep(100 * time.Millisecond)
 
 	c := newFakeClient(t, "C", serverUDP, "psk", nil)
 	defer c.close()

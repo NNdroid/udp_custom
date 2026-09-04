@@ -54,8 +54,8 @@ func (e *rttEstimator) Sample(rtt time.Duration) {
 	} else {
 		// Subsequent samples: RFC 6298 step 2.3 (alpha=1/8, beta=1/4).
 		errVal := rtt - e.srtt
-		e.srtt += time.Duration(0.125 * float64(errVal))
-		e.rttvar += time.Duration(0.25 * float64(absDuration(errVal)-e.rttvar))
+		e.srtt += errVal / 8
+		e.rttvar += (absDuration(errVal) - e.rttvar) / 4
 	}
 
 	e.rto = e.srtt + 4*e.rttvar

@@ -23,6 +23,7 @@ const (
 	shareIvLen      = 12
 	shareIterations = 10000
 	shareKeyLen     = 32
+	shareMaxSize    = 1 << 20
 )
 
 // shareEnvelope mirrors the JSON envelope produced by ShareCryptoUtils.encrypt:
@@ -68,7 +69,14 @@ func gunzipData(b []byte) ([]byte, error) {
 		return nil, err
 	}
 	defer r.Close()
-	return io.ReadAll(r)
+	plain, err := io.ReadAll(io.LimitReader(r, shareMaxSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(plain) > shareMaxSize {
+		return nil, fmt.Errorf("decompressed share profile is larger than %d bytes", shareMaxSize)
+	}
+	return plain, nil
 }
 
 // encryptStunURI encrypts plaintext profile JSON with the PIN and returns the full "stun://" URI
@@ -140,6 +148,9 @@ func decryptStunURI(payload, pin string) (string, error) {
 	}
 	// Strip whitespace / BOM the way the Android client does before decoding.
 	clean = stripWs(clean)
+	if base64.StdEncoding.DecodedLen(len(clean)) > shareMaxSize {
+		return "", fmt.Errorf("share envelope is larger than %d bytes", shareMaxSize)
+	}
 
 	envBytes, err := base64.StdEncoding.DecodeString(clean)
 	if err != nil {
@@ -152,6 +163,9 @@ func decryptStunURI(payload, pin string) (string, error) {
 	if env.V != 1 {
 		return "", fmt.Errorf("unsupported share envelope version %d", env.V)
 	}
+	if env.G != 0 && env.G != 1 {
+		return "", fmt.Errorf("unsupported share compression flag %d", env.G)
+	}
 	salt, err := base64.StdEncoding.DecodeString(env.S)
 	if err != nil {
 		return "", err
@@ -163,6 +177,15 @@ func decryptStunURI(payload, pin string) (string, error) {
 	ct, err := base64.StdEncoding.DecodeString(env.C)
 	if err != nil {
 		return "", err
+	}
+	if len(salt) != shareSaltLen {
+		return "", fmt.Errorf("invalid share salt length %d", len(salt))
+	}
+	if len(iv) != shareIvLen {
+		return "", fmt.Errorf("invalid share nonce length %d", len(iv))
+	}
+	if len(ct) < 16 {
+		return "", fmt.Errorf("share ciphertext is too short")
 	}
 
 	key := pbkdf2.Key([]byte(pin), salt, shareIterations, shareKeyLen, sha256.New)

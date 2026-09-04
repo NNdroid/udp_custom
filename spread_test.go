@@ -133,7 +133,7 @@ func TestSpreadDialerMultiSocketAgainstServer(t *testing.T) {
 	defer echoLn.Close()
 	go echoServeAll(t, echoLn)
 
-	serverUDP := "127.0.0.1:39720"
+	serverUDP := "127.0.0.1:0"
 	srv, err := NewUDPCServer(ServerConfig{
 		ListenAddr: serverUDP,
 		TargetAddr: echoLn.Addr().String(),
@@ -142,9 +142,9 @@ func TestSpreadDialerMultiSocketAgainstServer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewUDPCServer: %v", err)
 	}
+	serverUDP = srv.conn.LocalAddr().String()
 	go srv.Start()
 	defer srv.Close()
-	time.Sleep(100 * time.Millisecond)
 
 	// Single remote port (no DNAT available in tests) x 3 local sockets.
 	d, err := NewSpreadDialer(serverUDP, 3, 0)

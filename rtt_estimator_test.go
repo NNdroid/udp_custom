@@ -79,7 +79,6 @@ func TestServerSession_HandleAckSamplesRTT(t *testing.T) {
 	now := time.Now()
 	sess.unackedMu.Lock()
 	sess.unacked[7] = &unackedPkt{
-		frame:     &UDPCFrame{Seq: 7},
 		firstSent: now.Add(-100 * time.Millisecond),
 		sentTime:  now.Add(-100 * time.Millisecond),
 		rto:       200 * time.Millisecond,
@@ -109,7 +108,6 @@ func TestServerSession_HandleAckKarnNoSample(t *testing.T) {
 	now := time.Now()
 	sess.unackedMu.Lock()
 	sess.unacked[8] = &unackedPkt{
-		frame:     &UDPCFrame{Seq: 8},
 		firstSent: now.Add(-500 * time.Millisecond),
 		sentTime:  now.Add(-500 * time.Millisecond),
 		rto:       200 * time.Millisecond,

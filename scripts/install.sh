@@ -3,8 +3,8 @@ set -e
 
 APP_NAME="udp_custom"
 GITHUB_REPO="NNdroid/${APP_NAME}"
-# Optional: pin to a specific release tag following the version rule
-# (v1.0.yyyyMMdd-<commit>). Leave empty to always fetch the latest release.
+# Optional: pin to a release tag, e.g. v1.0.20260904-1a2b3c4.
+# Leave empty to fetch the latest GitHub Release.
 APP_VERSION="${APP_VERSION:-}"
 INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/${APP_NAME}"
@@ -32,8 +32,18 @@ get_arch() {
     aarch64) echo "arm64" ;;
     armv7l)  echo "arm" ;;
     i386|i686) echo "386" ;;
-    *)       echo "amd64" ;;
+    *)
+      echo -e "${RED}Unsupported CPU architecture: ${arch}${PLAIN}" >&2
+      return 1
+      ;;
   esac
+}
+
+validate_app_version() {
+  if [ -n "${APP_VERSION}" ] && ! [[ "${APP_VERSION}" =~ ^v1\.0\.[0-9]{8}-[0-9a-f]{7}$ ]]; then
+    echo -e "${RED}APP_VERSION must be v1.0.yyyyMMdd-<7-character-git-hash>.${PLAIN}" >&2
+    exit 1
+  fi
 }
 
 # 生成分享 URI 时的额外参数：
@@ -53,6 +63,7 @@ gen_uri_extra_args() {
 
 install_binary() {
   local goarch
+  validate_app_version
   goarch=$(get_arch)
   mkdir -p "${INSTALL_DIR}"
 
@@ -64,7 +75,9 @@ install_binary() {
     cp "./${APP_NAME}" "${INSTALL_DIR}/${APP_NAME}"
   elif command -v go >/dev/null 2>&1 && [ -f "./main.go" ]; then
     echo -e "${CYAN}--> Building from source with Go...${PLAIN}"
-    CGO_ENABLED=0 go build -ldflags "-s -w" -o "${INSTALL_DIR}/${APP_NAME}" .
+    local source_version
+    source_version="v1.0.$(date -u +%Y%m%d)-$(git rev-parse --short=7 HEAD 2>/dev/null || printf 'local')"
+    CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.Version=${source_version}" -o "${INSTALL_DIR}/${APP_NAME}" .
   else
     echo -e "${CYAN}--> Downloading release binary (${goarch})...${PLAIN}"
     local download_url

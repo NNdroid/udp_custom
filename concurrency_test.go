@@ -262,7 +262,7 @@ func echoStream(c *fakeClient, frames int, timeout time.Duration) ([]byte, time.
 // session, with no cross-talk.
 func TestTwoClientsOneServer_ConcurrentEcho(t *testing.T) {
 	target := newEchoTarget(t, 0)
-	serverUDP := "127.0.0.1:39730"
+	serverUDP := "127.0.0.1:0"
 
 	srv, err := NewUDPCServer(ServerConfig{
 		ListenAddr: serverUDP,
@@ -273,9 +273,9 @@ func TestTwoClientsOneServer_ConcurrentEcho(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewUDPCServer: %v", err)
 	}
+	serverUDP = srv.conn.LocalAddr().String()
 	go srv.Start()
 	defer srv.Close()
-	time.Sleep(100 * time.Millisecond)
 
 	a := newFakeClient(t, "A", serverUDP, "psk-alpha", nil)
 	defer a.close()
@@ -334,7 +334,7 @@ func TestTwoClientsOneServer_ConcurrentNoise(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	serverUDP := "127.0.0.1:39731"
+	serverUDP := "127.0.0.1:0"
 	srv, err := NewUDPCServer(ServerConfig{
 		ListenAddr: serverUDP,
 		TargetAddr: target.addr(),
@@ -345,9 +345,9 @@ func TestTwoClientsOneServer_ConcurrentNoise(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewUDPCServer: %v", err)
 	}
+	serverUDP = srv.conn.LocalAddr().String()
 	go srv.Start()
 	defer srv.Close()
-	time.Sleep(100 * time.Millisecond)
 
 	a := newFakeClient(t, "A", serverUDP, "psk-shared", &kp.PublicKey)
 	defer a.close()
@@ -402,7 +402,7 @@ func TestTwoClientsOneServer_ConcurrentNoise(t *testing.T) {
 // shared state and must stay consistent.
 func TestTwoClientsOneServer_RacingHandshakes(t *testing.T) {
 	target := newEchoTarget(t, 0)
-	serverUDP := "127.0.0.1:39732"
+	serverUDP := "127.0.0.1:0"
 	srv, err := NewUDPCServer(ServerConfig{
 		ListenAddr: serverUDP,
 		TargetAddr: target.addr(),
@@ -412,9 +412,9 @@ func TestTwoClientsOneServer_RacingHandshakes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewUDPCServer: %v", err)
 	}
+	serverUDP = srv.conn.LocalAddr().String()
 	go srv.Start()
 	defer srv.Close()
-	time.Sleep(100 * time.Millisecond)
 
 	sids := make([]uint32, 2)
 	errs := make(chan error, 2)
@@ -465,7 +465,7 @@ func TestTwoClientsOneServer_SlowPeerDoesNotBlock(t *testing.T) {
 		frames    = 4
 	)
 	target := newEchoTarget(t, slowDelay)
-	serverUDP := "127.0.0.1:39733"
+	serverUDP := "127.0.0.1:0"
 	srv, err := NewUDPCServer(ServerConfig{
 		ListenAddr: serverUDP,
 		TargetAddr: target.addr(),
@@ -475,9 +475,9 @@ func TestTwoClientsOneServer_SlowPeerDoesNotBlock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewUDPCServer: %v", err)
 	}
+	serverUDP = srv.conn.LocalAddr().String()
 	go srv.Start()
 	defer srv.Close()
-	time.Sleep(100 * time.Millisecond)
 
 	// Client A handshakes first, so it owns the first (slow) target connection.
 	a := newFakeClient(t, "A", serverUDP, "psk", nil)
@@ -581,7 +581,7 @@ func BenchmarkTwoClientsOneServer(b *testing.B) {
 	}()
 
 	srv, err := NewUDPCServer(ServerConfig{
-		ListenAddr: "127.0.0.1:39734",
+		ListenAddr: "127.0.0.1:0",
 		TargetAddr: echoLn.Addr().String(),
 		Passwords:  []string{"psk"},
 		LogLevel:   "error",
@@ -591,7 +591,6 @@ func BenchmarkTwoClientsOneServer(b *testing.B) {
 	}
 	go srv.Start()
 	defer srv.Close()
-	time.Sleep(100 * time.Millisecond)
 
 	// Minimal clients (no reconciliation with the testing.T helpers above).
 	type client struct {
@@ -600,7 +599,7 @@ func BenchmarkTwoClientsOneServer(b *testing.B) {
 		seq  uint32
 	}
 	dials := make([]*client, 2)
-	saddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:39734")
+	saddr := srv.conn.LocalAddr().(*net.UDPAddr)
 	for i := range dials {
 		conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
 		if err != nil {
@@ -660,6 +659,17 @@ func BenchmarkTwoClientsOneServer(b *testing.B) {
 						continue
 					}
 					if f.Cmd == CMD_DATA {
+						// Release the server's bounded send window; without this
+						// benchmark eventually stalls after 256 responses and only
+						// measures retransmission timeouts.
+						ack := (&UDPCFrame{
+							Magic: UDPC_MAGIC_DEFAULT, Version: UDPC_VERSION, Cmd: CMD_ACK,
+							SessionID: c.sid, Ack: f.Seq,
+						}).Encode()
+						if _, err := c.conn.WriteToUDP(ack, saddr); err != nil {
+							atomic.AddInt32(&failed, 1)
+							return
+						}
 						break
 					}
 				}

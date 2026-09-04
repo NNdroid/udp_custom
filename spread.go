@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"sync"
 	"sync/atomic"
-	"time"
 )
 
 // n:n port spreading — CLIENT-SIDE reference implementation.
@@ -45,11 +45,13 @@ type spreadSocket struct {
 
 // SpreadDialer spreads outgoing packets over K local sockets x N remote ports.
 type SpreadDialer struct {
-	host       string
+	serverIP   net.IP
 	pr         *PortRange
 	socks      []*spreadSocket
 	rr         uint64 // round-robin cursor over sockets
 	fixedPaths int    // chosen remote-port subset size; 0 = whole range
+	closed     int32
+	closeOnce  sync.Once
 }
 
 // NewSpreadDialer parses a server address that carries a port range
@@ -75,6 +77,10 @@ func NewSpreadDialer(serverAddr string, numSockets, numPaths int) (*SpreadDialer
 	if numSockets <= 0 {
 		numSockets = 1
 	}
+	serverIP, err := resolveServerIP(host)
+	if err != nil {
+		return nil, err
+	}
 
 	// Selector pool: either the whole range (per-packet random) or a fixed
 	// subset of numPaths ports chosen once for this session.
@@ -89,9 +95,15 @@ func NewSpreadDialer(serverAddr string, numSockets, numPaths int) (*SpreadDialer
 		}
 	}
 
-	d := &SpreadDialer{host: host, pr: pr, socks: make([]*spreadSocket, 0, numSockets), fixedPaths: fixedPaths}
+	d := &SpreadDialer{serverIP: serverIP, pr: pr, socks: make([]*spreadSocket, 0, numSockets), fixedPaths: fixedPaths}
+	network := "udp6"
+	bindIP := net.IPv6unspecified
+	if serverIP.To4() != nil {
+		network = "udp4"
+		bindIP = net.IPv4zero
+	}
 	for i := 0; i < numSockets; i++ {
-		conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+		conn, err := net.ListenUDP(network, &net.UDPAddr{IP: bindIP, Port: 0})
 		if err != nil {
 			d.Close()
 			return nil, fmt.Errorf("spread socket %d: %w", i, err)
@@ -106,6 +118,29 @@ func NewSpreadDialer(serverAddr string, numSockets, numPaths int) (*SpreadDialer
 		d.socks = append(d.socks, &spreadSocket{conn: conn, sel: NewPortSelector(selPR, SelectorRandom)})
 	}
 	return d, nil
+}
+
+func resolveServerIP(host string) (net.IP, error) {
+	if ip := net.ParseIP(host); ip != nil {
+		return append(net.IP(nil), ip...), nil
+	}
+	addrs, err := net.LookupIP(host)
+	if err != nil {
+		return nil, fmt.Errorf("spread: resolve host %q: %w", host, err)
+	}
+	var ipv6 net.IP
+	for _, ip := range addrs {
+		if v4 := ip.To4(); v4 != nil {
+			return append(net.IP(nil), v4...), nil
+		}
+		if ipv6 == nil && ip.To16() != nil {
+			ipv6 = ip
+		}
+	}
+	if ipv6 != nil {
+		return append(net.IP(nil), ipv6...), nil
+	}
+	return nil, fmt.Errorf("spread: host %q has no IP address", host)
 }
 
 // Paths returns the number of distinct remote ports the client uses. 0 means
@@ -127,19 +162,23 @@ func pickPortsFromRange(pr *PortRange, n int) []int {
 		}
 		return out
 	}
-	// Partial Fisher-Yates over port indices, then map back through PortAt.
-	idx := make([]int, total)
-	for i := range idx {
-		idx[i] = i
-	}
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-	for i := 0; i < n; i++ {
-		j := i + rng.Intn(total-i)
-		idx[i], idx[j] = idx[j], idx[i]
-	}
+	// Sparse partial Fisher-Yates: only materialise the n swapped positions,
+	// not the entire (potentially 65K-port) range.
+	rng := rand.New(rand.NewSource(randomSeed()))
+	swaps := make(map[int]int, n*2)
 	out := make([]int, n)
 	for i := 0; i < n; i++ {
-		out[i] = pr.PortAt(idx[i])
+		j := i + rng.Intn(total-i)
+		vi := i
+		if v, ok := swaps[i]; ok {
+			vi = v
+		}
+		vj := j
+		if v, ok := swaps[j]; ok {
+			vj = v
+		}
+		swaps[i], swaps[j] = vj, vi
+		out[i] = pr.PortAt(vj)
 	}
 	return out
 }
@@ -150,12 +189,16 @@ func (d *SpreadDialer) Len() int { return len(d.socks) }
 // PortRange returns the parsed remote port range.
 func (d *SpreadDialer) PortRange() *PortRange { return d.pr }
 
+func (d *SpreadDialer) acceptsRemote(addr *net.UDPAddr) bool {
+	return addr != nil && addr.IP.Equal(d.serverIP) && d.pr.Contains(addr.Port)
+}
+
 // Next picks the next (socketIndex, remotePort) pair WITHOUT sending anything.
 // Exposed for tests and for clients that want to batch their writes.
 // Socket indices rotate round-robin; the port comes from that socket's own
 // random selector.
 func (d *SpreadDialer) Next() (int, int) {
-	if len(d.socks) == 0 {
+	if len(d.socks) == 0 || atomic.LoadInt32(&d.closed) == 1 {
 		return -1, 0
 	}
 	idx := int(atomic.AddUint64(&d.rr, 1)-1) % len(d.socks)
@@ -165,16 +208,14 @@ func (d *SpreadDialer) Next() (int, int) {
 // SendAt writes a frame from a specific local socket to a freshly chosen
 // remote port.
 func (d *SpreadDialer) SendAt(idx int, frame []byte) error {
+	if atomic.LoadInt32(&d.closed) == 1 {
+		return fmt.Errorf("spread: dialer closed")
+	}
 	if idx < 0 || idx >= len(d.socks) {
 		return fmt.Errorf("spread: socket index %d out of range (have %d)", idx, len(d.socks))
 	}
 	port := d.socks[idx].sel.Next()
-	dst := &net.UDPAddr{IP: net.ParseIP(d.host), Port: port}
-	if dst.IP == nil {
-		// host is a domain name — resolve it and let WriteTo go through the
-		// slower path; clients usually cache the resolved IP instead.
-		return fmt.Errorf("spread: host %q is not an IP; resolve it before sending", d.host)
-	}
+	dst := &net.UDPAddr{IP: d.serverIP, Port: port}
 	_, err := d.socks[idx].conn.WriteToUDP(frame, dst)
 	return err
 }
@@ -183,8 +224,12 @@ func (d *SpreadDialer) SendAt(idx int, frame []byte) error {
 // selection. Call it once per datagram: the (socket, port) pair is what
 // produces the n x n tuple spread.
 func (d *SpreadDialer) Send(frame []byte) error {
-	idx, _ := d.Next()
-	return d.SendAt(idx, frame)
+	idx, port := d.Next()
+	if idx < 0 {
+		return fmt.Errorf("spread: dialer closed")
+	}
+	_, err := d.socks[idx].conn.WriteToUDP(frame, &net.UDPAddr{IP: d.serverIP, Port: port})
+	return err
 }
 
 // Conn returns the underlying socket at idx so the client can run its own
@@ -208,8 +253,10 @@ func (d *SpreadDialer) Conns() []*net.UDPConn {
 
 // Close releases every local socket.
 func (d *SpreadDialer) Close() {
-	for _, s := range d.socks {
-		_ = s.conn.Close()
-	}
-	d.socks = nil
+	d.closeOnce.Do(func() {
+		atomic.StoreInt32(&d.closed, 1)
+		for _, s := range d.socks {
+			_ = s.conn.Close()
+		}
+	})
 }

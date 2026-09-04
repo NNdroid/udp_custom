@@ -29,7 +29,14 @@ curl -fsSL https://raw.githubusercontent.com/NNdroid/udp_custom/master/scripts/i
 curl -fsSL https://raw.githubusercontent.com/NNdroid/udp_custom/master/scripts/install.sh | sudo bash -s install client
 ```
 
-### 3. Upgrade / Uninstall
+### 3. Pin a Release Version (Optional)
+Leave `APP_VERSION` unset to install the latest release. To install a specific
+raw-binary release, supply its tag (`v1.0.yyyyMMdd-<7-character-git-hash>`):
+```bash
+curl -fsSL https://raw.githubusercontent.com/NNdroid/udp_custom/master/scripts/install.sh | sudo env APP_VERSION=v1.0.20260904-1a2b3c4 bash -s install server
+```
+
+### 4. Upgrade / Uninstall
 ```bash
 # One-key Upgrade (Keeps existing config.json)
 curl -fsSL https://raw.githubusercontent.com/NNdroid/udp_custom/master/scripts/install.sh | sudo bash -s upgrade
@@ -38,7 +45,7 @@ curl -fsSL https://raw.githubusercontent.com/NNdroid/udp_custom/master/scripts/i
 curl -fsSL https://raw.githubusercontent.com/NNdroid/udp_custom/master/scripts/install.sh | sudo bash -s uninstall
 ```
 
-### 4. Service Management
+### 5. Service Management
 ```bash
 systemctl start udp_custom    # Start service
 systemctl stop udp_custom     # Stop service

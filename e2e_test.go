@@ -33,7 +33,7 @@ func TestUDPCustom_TCP_And_UDP_E2E(t *testing.T) {
 	}()
 
 	// 2. Start UDPCServer
-	serverUDP := "127.0.0.1:39712"
+	serverUDP := "127.0.0.1:0"
 	srv, err := NewUDPCServer(ServerConfig{
 		ListenAddr: serverUDP,
 		TargetAddr: echoAddr,
@@ -42,10 +42,9 @@ func TestUDPCustom_TCP_And_UDP_E2E(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewUDPCServer: %v", err)
 	}
+	serverUDP = srv.conn.LocalAddr().String()
 	go srv.Start()
 	defer srv.Close()
-
-	time.Sleep(100 * time.Millisecond)
 
 	// 3. Client connection
 	cConn, err := net.Dial("udp", serverUDP)

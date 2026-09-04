@@ -61,26 +61,49 @@ func (f *UDPCFrame) Encode() []byte {
 }
 
 func DecodeUDPCFrame(buf []byte, expectedMagic uint32) (*UDPCFrame, error) {
+	var frame UDPCFrame
+	if err := decodeUDPCFrame(buf, expectedMagic, &frame); err != nil {
+		return nil, err
+	}
+	if len(frame.Data) > 0 {
+		frame.Data = append([]byte(nil), frame.Data...)
+	}
+	return &frame, nil
+}
+
+// decodeUDPCFrame decodes into dst and borrows the payload from buf. It is used
+// by the socket read loops, which finish dispatching a frame before reusing the
+// receive buffer. Code that retains Data must copy it first.
+func decodeUDPCFrame(buf []byte, expectedMagic uint32, dst *UDPCFrame) error {
 	if len(buf) < UDPC_HDR_SIZE+4 {
-		return nil, errors.New("frame too short")
+		return errors.New("frame too short")
+	}
+	if len(buf) > UDPC_MAX_PKT {
+		return errors.New("frame exceeds maximum packet size")
+	}
+	magic := binary.BigEndian.Uint32(buf[0:4])
+	if expectedMagic != 0 && magic != expectedMagic {
+		return errors.New("magic mismatch")
+	}
+	if buf[4] != UDPC_VERSION {
+		return errors.New("unsupported protocol version")
+	}
+	if !validUDPCCommand(buf[5]) {
+		return errors.New("unknown command")
 	}
 	dataLen := int(binary.BigEndian.Uint16(buf[22:24]))
-	if len(buf) < UDPC_HDR_SIZE+dataLen+4 {
-		return nil, errors.New("invalid payload length")
+	expectedLen := UDPC_HDR_SIZE + dataLen + 4
+	if len(buf) != expectedLen {
+		return errors.New("invalid payload length")
 	}
 
 	checksum := binary.BigEndian.Uint32(buf[UDPC_HDR_SIZE+dataLen : UDPC_HDR_SIZE+dataLen+4])
 	calculated := crc32.ChecksumIEEE(buf[:UDPC_HDR_SIZE+dataLen])
 	if checksum != calculated {
-		return nil, errors.New("checksum mismatch")
+		return errors.New("checksum mismatch")
 	}
 
-	magic := binary.BigEndian.Uint32(buf[0:4])
-	if expectedMagic != 0 && magic != expectedMagic {
-		return nil, errors.New("magic mismatch")
-	}
-
-	frame := &UDPCFrame{
+	*dst = UDPCFrame{
 		Magic:      magic,
 		Version:    buf[4],
 		Cmd:        buf[5],
@@ -89,12 +112,18 @@ func DecodeUDPCFrame(buf []byte, expectedMagic uint32) (*UDPCFrame, error) {
 		Seq:        binary.BigEndian.Uint32(buf[12:16]),
 		Ack:        binary.BigEndian.Uint32(buf[16:20]),
 		WindowSize: binary.BigEndian.Uint16(buf[20:22]),
+		Data:       buf[UDPC_HDR_SIZE : UDPC_HDR_SIZE+dataLen],
 	}
 	if dataLen > 0 {
-		frame.Data = make([]byte, dataLen)
-		copy(frame.Data, buf[UDPC_HDR_SIZE:UDPC_HDR_SIZE+dataLen])
+		dst.Data = buf[UDPC_HDR_SIZE : UDPC_HDR_SIZE+dataLen]
+	} else {
+		dst.Data = nil
 	}
-	return frame, nil
+	return nil
+}
+
+func validUDPCCommand(cmd uint8) bool {
+	return cmd >= CMD_HANDSHAKE_SYN && cmd <= CMD_FIN
 }
 
 // ComputeAuthHMAC generates an HMAC-SHA256 signature for handshake authentication

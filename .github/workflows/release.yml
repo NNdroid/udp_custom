@@ -1,147 +1,108 @@
 name: Release
 
-# Triggers:
-#   1. Push of a tag like `v1.0.20260828-abc1234`  -> builds binaries and publishes a GitHub Release.
-#   2. Manual `workflow_dispatch` (with optional version input) -> builds binaries and uploads a single
-#      Actions artifact (no release is created). Use this for test/dev builds.
-#
-# Version rule: v1.0.<yyyyMMdd>-<git short commit hash>
-#   - On a tag push: the tag name itself is used (e.g. v1.0.20260828-abc1234).
-#   - On manual dispatch: use the provided `version` input, or fall back to v1.0.<date>-<sha>.
-#
-# Output: raw binaries only (NO zip / tar.gz). Each asset is named <app>_<goos>_<goarch>[.exe].
-#   The 32-bit ARM build is named <app>_linux_arm (GOARM=7) to match install.sh's download convention.
-
+# Pushing v1.0.yyyyMMdd-<current-commit-short-sha> creates a GitHub Release.
+# A manual run creates no Release; it uploads one Actions artifact instead.
 on:
   push:
     tags:
-      - 'v*'
+      - 'v1.0.*'
   workflow_dispatch:
-    inputs:
-      version:
-        description: 'Release version tag (e.g. v1.0.20260828-abc1234). Leave blank to auto-generate v1.0.<date>-<short-sha>.'
-        required: false
-        default: ''
 
 permissions:
-  contents: write   # needed to create GitHub Releases
+  contents: write
 
 jobs:
   build:
-    name: Build Binaries
+    name: Build raw binaries
     runs-on: ubuntu-latest
     env:
       APP_NAME: udp_custom
+
     steps:
-      - name: Checkout Code
+      - name: Check out source
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Determine Version
-        id: get_version
+      - name: Determine and validate version
+        id: version
         shell: bash
         run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            VERSION="${{ inputs.version }}"
-          elif [ "${{ github.ref_type }}" = "tag" ]; then
-            VERSION="${{ github.ref_name }}"
+          set -euo pipefail
+          short_sha=$(git rev-parse --short=7 HEAD)
+
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            version="${GITHUB_REF_NAME}"
+            if ! [[ "${version}" =~ ^v1\.0\.[0-9]{8}-${short_sha}$ ]]; then
+              echo "Tag must be v1.0.yyyyMMdd-${short_sha} (the short hash of the tagged commit)." >&2
+              exit 1
+            fi
           else
-            DATE_STR=$(date +'%Y%m%d')
-            SHORT_SHA=$(git rev-parse --short HEAD)
-            VERSION="v1.0.${DATE_STR}-${SHORT_SHA}"
+            version="v1.0.$(date -u +%Y%m%d)-${short_sha}"
           fi
-          echo "RELEASE_VERSION=${VERSION}" >> "$GITHUB_ENV"
-          echo "Building Release version: ${VERSION}"
+
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "Building ${version}"
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.26'
+          go-version-file: go.mod
           check-latest: true
 
-      - name: Run Tests
-        shell: bash
-        run: |
-          go test -race ./...
+      - name: Test
+        run: go test -race ./...
 
-      - name: Build All Platforms (raw binaries, no archives)
+      - name: Build raw binaries
         shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          VERSION="${{ env.RELEASE_VERSION }}"
-          APP_NAME="${{ env.APP_NAME }}"
+          set -euo pipefail
           mkdir -p dist
 
-          PLATFORMS=(
-            "linux/amd64"
-            "linux/arm64"
-            "linux/arm/v7"
-            "linux/386"
-            "linux/mipsle"
-            "windows/amd64"
-            "windows/arm64"
-            "windows/386"
-            "darwin/amd64"
-            "darwin/arm64"
-            "freebsd/amd64"
+          platforms=(
+            'linux/amd64'
+            'linux/arm64'
+            'linux/arm/v7'
+            'linux/386'
+            'darwin/amd64'
+            'darwin/arm64'
+            'windows/amd64'
+            'windows/arm64'
+            'windows/386'
           )
 
-          for PLATFORM in "${PLATFORMS[@]}"; do
-            IFS="/" read -r GOOS GOARCH GOARM <<< "$PLATFORM"
+          for platform in "${platforms[@]}"; do
+            IFS=/ read -r goos goarch goarm <<< "${platform}"
+            binary_name="${APP_NAME}_${goos}_${goarch}"
+            output="dist/${binary_name}"
+            [ "${goos}" = 'windows' ] && output="${output}.exe"
 
-            # Asset / installer naming.
-            BIN_NAME="${APP_NAME}_${GOOS}_${GOARCH}"
-            if [ -n "$GOARM" ]; then
-              # install.sh expects "linux_arm" (no _v7 suffix) for 32-bit ARM.
-              if [ "$GOOS" = "linux" ] && [ "$GOARCH" = "arm" ]; then
-                BIN_NAME="${APP_NAME}_linux_arm"
-              else
-                BIN_NAME="${APP_NAME}_${GOOS}_${GOARCH}_${GOARM}"
-              fi
-            fi
-
-            OUTPUT="dist/${BIN_NAME}"
-            if [ "$GOOS" = "windows" ]; then
-              OUTPUT="${OUTPUT}.exe"
-            fi
-
-            echo "Building ${PLATFORM} -> ${OUTPUT} (version ${VERSION})"
-            if [ -n "$GOARM" ]; then
-              ARM_VER="${GOARM#v}"
-              CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" GOARM="$ARM_VER" \
-                go build -trimpath -ldflags="-s -w -X main.Version=${VERSION}" -o "$OUTPUT" .
+            echo "Building ${platform} -> ${output}"
+            if [ -n "${goarm:-}" ]; then
+              CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" GOARM="${goarm#v}" \
+                go build -trimpath -ldflags="-s -w -X main.Version=${VERSION}" -o "${output}" .
             else
-              CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
-                go build -trimpath -ldflags="-s -w -X main.Version=${VERSION}" -o "$OUTPUT" .
+              CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" \
+                go build -trimpath -ldflags="-s -w -X main.Version=${VERSION}" -o "${output}" .
             fi
           done
 
-          echo "=== Built artifacts ==="
-          ls -lh dist
-
-      - name: Generate Checksums
-        if: github.event_name == 'push'
-        shell: bash
-        run: |
-          cd dist
-          sha256sum * > sha256sums.txt
-          cd ..
-
-      - name: Upload Build Artifact (manual dispatch only)
+      # GitHub bundles artifact downloads itself; this workflow never creates or
+      # uploads a zip/tar file. Each listed item is a raw executable.
+      - name: Upload manual build artifact
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.APP_NAME }}-${{ env.RELEASE_VERSION }}
+          name: ${{ env.APP_NAME }}-${{ steps.version.outputs.version }}
           path: dist/*
           if-no-files-found: error
 
-      - name: Create GitHub Release (tag push only)
+      - name: Create GitHub Release
         if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ env.RELEASE_VERSION }}
-          name: ${{ env.APP_NAME }} ${{ env.RELEASE_VERSION }}
+          name: ${{ env.APP_NAME }} ${{ steps.version.outputs.version }}
           files: dist/*
-          draft: false
-          prerelease: false
           generate_release_notes: true

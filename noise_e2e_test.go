@@ -35,7 +35,7 @@ func TestUDPCustom_Noise_E2E(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	serverUDP := "127.0.0.1:39713"
+	serverUDP := "127.0.0.1:0"
 	srv, err := NewUDPCServer(ServerConfig{
 		ListenAddr: serverUDP,
 		TargetAddr: echoLn.Addr().String(),
@@ -45,9 +45,9 @@ func TestUDPCustom_Noise_E2E(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewUDPCServer: %v", err)
 	}
+	serverUDP = srv.conn.LocalAddr().String()
 	go srv.Start()
 	defer srv.Close()
-	time.Sleep(100 * time.Millisecond)
 
 	cConn, err := net.Dial("udp", serverUDP)
 	if err != nil {
@@ -169,7 +169,7 @@ func TestUDPCustom_HandshakeReplay_Idempotent(t *testing.T) {
 		}
 	}()
 
-	serverUDP := "127.0.0.1:39714"
+	serverUDP := "127.0.0.1:0"
 	srv, err := NewUDPCServer(ServerConfig{
 		ListenAddr: serverUDP,
 		TargetAddr: echoLn.Addr().String(),
@@ -178,9 +178,9 @@ func TestUDPCustom_HandshakeReplay_Idempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewUDPCServer: %v", err)
 	}
+	serverUDP = srv.conn.LocalAddr().String()
 	go srv.Start()
 	defer srv.Close()
-	time.Sleep(100 * time.Millisecond)
 
 	cConn, err := net.Dial("udp", serverUDP)
 	if err != nil {

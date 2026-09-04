@@ -245,7 +245,7 @@ func (rf *ReplayFilter) CheckAndAdd(seq uint32) bool {
 }
 
 type unackedPkt struct {
-	frame         *UDPCFrame
+	wire          []byte    // immutable encoded frame; reused verbatim on retries
 	firstSent     time.Time // when the frame was first sent; used to sample RTT
 	sentTime      time.Time
 	rto           time.Duration
@@ -290,7 +290,7 @@ type ServerSession struct {
 	// pathAddrs maps each server-side port this session has been seen on to
 	// the client's public (post-NAT) address for that path.
 	pathAddrs map[int]net.Addr
-	pathMu    sync.Mutex
+	pathMu    sync.RWMutex
 
 	closed    int32
 	closeChan chan struct{}
@@ -450,13 +450,15 @@ func (s *UDPCServer) serveConn(conn *net.UDPConn) {
 			}
 		}
 
-		frame, err := DecodeUDPCFrame(buf[:n], s.cfg.Magic)
-		if err != nil {
+		var frame UDPCFrame
+		if err := decodeUDPCFrame(buf[:n], s.cfg.Magic, &frame); err != nil {
 			continue // ignore invalid magic / corrupted packets
 		}
 
-		s.logDebug("[Recv] origDst=%d from=%s cmd=0x%02X seq=%d ack=%d sid=0x%08X len=%d",
-			origDstPort, remoteAddr, frame.Cmd, frame.Seq, frame.Ack, frame.SessionID, n)
+		if s.logLevel <= 0 {
+			s.logDebug("[Recv] origDst=%d from=%s cmd=0x%02X seq=%d ack=%d sid=0x%08X len=%d",
+				origDstPort, remoteAddr, frame.Cmd, frame.Seq, frame.Ack, frame.SessionID, n)
+		}
 
 		if frame.Cmd == CMD_HANDSHAKE_SYN {
 			// Cheap DoS gates before anything expensive happens: per-IP rate
@@ -465,7 +467,10 @@ func (s *UDPCServer) serveConn(conn *net.UDPConn) {
 				s.logWarn("[Handshake] 🚦 Rate-limited SYN from %s", remoteAddr)
 				continue
 			}
-			go s.handleHandshake(remoteAddr, frame, origDstPort)
+			// The receive buffer is reused on the next read while handshake
+			// verification runs asynchronously, so retain this one payload.
+			frame.Data = append([]byte(nil), frame.Data...)
+			go s.handleHandshake(remoteAddr, &frame, origDstPort)
 			continue
 		}
 
@@ -480,11 +485,7 @@ func (s *UDPCServer) serveConn(conn *net.UDPConn) {
 		// any valid-SID frame) is preserved.
 		if sessVal, ok := s.sessions.Load(frame.SessionID); ok && sessVal != nil {
 			sess := sessVal.(*ServerSession)
-			sess.touch()
-			allowIPChange := !s.hasPrivKey
-			sess.updateRemoteAddr(remoteAddr, allowIPChange)
-			sess.setPath(origDstPort, remoteAddr)
-			sess.handleIncomingFrame(frame, remoteAddr)
+			sess.handleIncomingFrame(&frame, remoteAddr, origDstPort)
 		}
 	}
 }
@@ -523,11 +524,23 @@ func (s *UDPCServer) handleHandshake(remoteAddr net.Addr, frame *UDPCFrame, orig
 	// legitimate case (client lost our ACK and retransmits the SYN) and kills
 	// the replay case (captive SYN within the ±300s window can no longer force
 	// a fresh target connection per replay).
-	if cached := s.synCache.Lookup(nonceArr, time.Now()); cached != nil {
+	cached, owner := s.synCache.Acquire(nonceArr, time.Now())
+	if cached != nil {
 		s.logInfo("[Handshake] ♻️ Replayed SYN from %s: resending cached ACK", remoteAddr)
 		s.replyFromOrigPort(origPort, remoteAddr, cached)
 		return
 	}
+	if !owner {
+		// Another goroutine is already establishing this exact nonce. Its ACK
+		// will be cached shortly; a normal client retransmission will receive it.
+		return
+	}
+	handshakeComplete := false
+	defer func() {
+		if !handshakeComplete {
+			s.synCache.Abort(nonceArr)
+		}
+	}()
 
 	// Cap concurrent handshakes: the target dial below can block for up to 5s
 	// (TCP), so unbounded SYN intake would pile up goroutines and sockets.
@@ -644,7 +657,8 @@ func (s *UDPCServer) handleHandshake(remoteAddr net.Addr, frame *UDPCFrame, orig
 		Data:       ackData,
 	}
 	ackEncoded := ackFrame.Encode()
-	s.synCache.Remember(nonceArr, ackEncoded, time.Now())
+	s.synCache.Complete(nonceArr, ackEncoded)
+	handshakeComplete = true
 	s.replyFromOrigPort(origPort, remoteAddr, ackEncoded)
 
 	s.logInfo("[Session 0x%08X] ✅ Established for %s -> Target [%s] %s", sid, remoteAddr, targetNet, targetHostPort)
@@ -685,7 +699,9 @@ func (s *UDPCServer) replyFromOrigPort(origPort int, addr net.Addr, data []byte)
 		if err == nil {
 			if n, werr := c.WriteToUDP(data, udpAddr); werr == nil {
 				atomic.AddUint64(&s.sendViaPort, 1)
-				s.logDebug("[Send] to=%s via=origPort:%d cmd=0x%02X len=%d", udpAddr, origPort, cmd, n)
+				if s.logLevel <= 0 {
+					s.logDebug("[Send] to=%s via=origPort:%d cmd=0x%02X len=%d", udpAddr, origPort, cmd, n)
+				}
 				return
 			} else {
 				s.logWarn("[Send] ❌ origPort %d write to=%s cmd=0x%02X: %v (fallback to main)", origPort, udpAddr, cmd, werr)
@@ -698,7 +714,9 @@ func (s *UDPCServer) replyFromOrigPort(origPort int, addr net.Addr, data []byte)
 	// client connected to ListenAddr directly, i.e. no port spreading).
 	if n, werr := s.conn.WriteToUDP(data, udpAddr); werr == nil {
 		atomic.AddUint64(&s.sendViaMain, 1)
-		s.logDebug("[Send] to=%s via=main cmd=0x%02X len=%d", udpAddr, cmd, n)
+		if s.logLevel <= 0 {
+			s.logDebug("[Send] to=%s via=main cmd=0x%02X len=%d", udpAddr, cmd, n)
+		}
 		return
 	}
 	s.logWarn("[Send] ❌ main write failed cmd=0x%02X", cmd)
@@ -713,24 +731,23 @@ func (sess *ServerSession) sendToSession(data []byte) {
 	s := sess.server
 	localPort := int(atomic.LoadInt32(&sess.lastOrigPort))
 
-	sess.pathMu.Lock()
+	sess.pathMu.RLock()
 	addr := sess.pathAddrs[localPort]
-	sess.pathMu.Unlock()
+	if addr == nil {
+		for p, a := range sess.pathAddrs {
+			if p > 0 {
+				localPort, addr = p, a
+				break
+			}
+		}
+	}
+	sess.pathMu.RUnlock()
 	if addr != nil && localPort > 0 {
+		atomic.StoreInt32(&sess.lastOrigPort, int32(localPort))
 		s.replyFromOrigPort(localPort, addr, data)
 		return
 	}
-	// Fallback: try any known path, then the main socket with the last addr.
-	sess.pathMu.Lock()
-	for p, a := range sess.pathAddrs {
-		if p > 0 {
-			sess.pathMu.Unlock()
-			atomic.StoreInt32(&sess.lastOrigPort, int32(p))
-			s.replyFromOrigPort(p, a, data)
-			return
-		}
-	}
-	sess.pathMu.Unlock()
+	// Fallback to the main socket with the last authenticated address.
 	if ra := sess.getRemoteAddr(); ra != nil {
 		s.replyFromOrigPort(0, ra, data)
 	}
@@ -757,24 +774,32 @@ func cmdOfEncoded(data []byte) byte {
 // only set allowIPChange when the frame was authenticated (PSK/Noise). Under
 // Noise this means: successful DATA decryption, enforced in handleData.
 func (sess *ServerSession) updateRemoteAddr(newAddr net.Addr, allowIPChange bool) {
+	sess.raddrMu.RLock()
+	unchanged := sameAddr(sess.raddr, newAddr)
+	sess.raddrMu.RUnlock()
+	if unchanged {
+		return
+	}
 	sess.raddrMu.Lock()
 	defer sess.raddrMu.Unlock()
 	if sess.raddr == nil {
 		sess.raddr = newAddr
 		return
 	}
-	if sess.raddr.String() == newAddr.String() {
+	if sameAddr(sess.raddr, newAddr) {
 		return
 	}
-	sameIP := ipOf(sess.raddr) == ipOf(newAddr)
+	sameIP := sameAddrIP(sess.raddr, newAddr)
 	if !sameIP && !allowIPChange {
 		sess.server.logWarn("[Session 0x%08X] 🛡️ Ignored unauthenticated address change %s -> %s (need an authenticated DATA frame)",
 			sess.sessionID, sess.raddr, newAddr)
 		return
 	}
 	if sameIP {
-		sess.server.logDebug("[Session 0x%08X] 🔄 NAT rebinding (same IP, new port): %s -> %s",
-			sess.sessionID, sess.raddr, newAddr)
+		if sess.server.logLevel <= 0 {
+			sess.server.logDebug("[Session 0x%08X] 🔄 NAT rebinding (same IP, new port): %s -> %s",
+				sess.sessionID, sess.raddr, newAddr)
+		}
 	} else {
 		sess.server.logInfo("[Session 0x%08X] 🔄 Connection Migration: %s -> %s",
 			sess.sessionID, sess.raddr, newAddr)
@@ -796,6 +821,24 @@ func ipOf(addr net.Addr) string {
 	return addr.String()
 }
 
+func sameAddr(a, b net.Addr) bool {
+	ua, aok := a.(*net.UDPAddr)
+	ub, bok := b.(*net.UDPAddr)
+	if aok && bok {
+		return ua.Port == ub.Port && ua.Zone == ub.Zone && ua.IP.Equal(ub.IP)
+	}
+	return a != nil && b != nil && a.String() == b.String()
+}
+
+func sameAddrIP(a, b net.Addr) bool {
+	ua, aok := a.(*net.UDPAddr)
+	ub, bok := b.(*net.UDPAddr)
+	if aok && bok {
+		return ua.Zone == ub.Zone && ua.IP.Equal(ub.IP)
+	}
+	return a != nil && b != nil && ipOf(a) == ipOf(b)
+}
+
 func (sess *ServerSession) getRemoteAddr() net.Addr {
 	sess.raddrMu.RLock()
 	defer sess.raddrMu.RUnlock()
@@ -811,9 +854,23 @@ func (sess *ServerSession) setPath(origPort int, addr net.Addr) {
 	if origPort <= 0 || addr == nil {
 		return
 	}
+	if atomic.LoadInt32(&sess.lastOrigPort) == int32(origPort) {
+		sess.pathMu.RLock()
+		unchanged := sameAddr(sess.pathAddrs[origPort], addr)
+		sess.pathMu.RUnlock()
+		if unchanged {
+			return
+		}
+	}
 	sess.pathMu.Lock()
 	if sess.pathAddrs == nil {
 		sess.pathAddrs = make(map[int]net.Addr)
+	}
+	if _, exists := sess.pathAddrs[origPort]; !exists && len(sess.pathAddrs) >= sess.server.sockPool.limit {
+		for port := range sess.pathAddrs {
+			delete(sess.pathAddrs, port)
+			break
+		}
 	}
 	sess.pathAddrs[origPort] = addr
 	sess.pathMu.Unlock()
@@ -829,13 +886,29 @@ func (sess *ServerSession) touch() {
 	sess.activeMu.Unlock()
 }
 
-func (sess *ServerSession) handleIncomingFrame(frame *UDPCFrame, remoteAddr net.Addr) {
+func (sess *ServerSession) handleIncomingFrame(frame *UDPCFrame, remoteAddr net.Addr, origPort int) {
+	// Noise authenticates DATA frames, but the compact control frames have no
+	// per-packet tag. Do not let a different IP use a guessed SessionID to ACK
+	// data, keep a session alive, overwrite its reply path, or tear it down.
+	if sess.noiseSession != nil && frame.Cmd != CMD_DATA && !sess.sameRemoteIP(remoteAddr) {
+		return
+	}
+
+	if frame.Cmd == CMD_DATA {
+		sess.handleDataFromPath(frame, remoteAddr, origPort)
+		return
+	}
+
+	// In open mode this preserves the legacy migration behaviour. In Noise
+	// mode the source passed the same-IP check above, so only NAT port rebinding
+	// is allowed for unauthenticated control frames.
+	sess.updateRemoteAddr(remoteAddr, sess.noiseSession == nil)
+	sess.setPath(origPort, remoteAddr)
+	sess.touch()
+
 	switch frame.Cmd {
 	case CMD_ACK:
 		sess.handleAck(frame.Ack)
-
-	case CMD_DATA:
-		sess.handleData(frame, remoteAddr)
 
 	case CMD_PING:
 		pong := &UDPCFrame{
@@ -852,6 +925,16 @@ func (sess *ServerSession) handleIncomingFrame(frame *UDPCFrame, remoteAddr net.
 		sess.server.logInfo("[Session 0x%08X] Received FIN from client", sess.sessionID)
 		sess.Close()
 	}
+}
+
+func (sess *ServerSession) sameRemoteIP(addr net.Addr) bool {
+	if addr == nil {
+		return false
+	}
+	sess.raddrMu.RLock()
+	current := sess.raddr
+	sess.raddrMu.RUnlock()
+	return current != nil && sameAddrIP(current, addr)
 }
 
 func (sess *ServerSession) handleAck(ackSeq uint32) {
@@ -881,11 +964,36 @@ func (sess *ServerSession) handleAck(ackSeq uint32) {
 }
 
 func (sess *ServerSession) handleData(frame *UDPCFrame, remoteAddr net.Addr) {
+	sess.handleDataFromPath(frame, remoteAddr, 0)
+}
+
+func (sess *ServerSession) handleDataFromPath(frame *UDPCFrame, remoteAddr net.Addr, origPort int) {
 	// Replay gate: reject anything already accepted (delivered or buffered).
 	// Wrap-safe; also filters the reserved Seq 0.
 	if frame.Seq == 0 || sess.replayFilter.Seen(frame.Seq) {
 		return
 	}
+
+	// Authenticate before a frame is allowed into the reorder queue. Otherwise
+	// an attacker who guesses a SessionID can poison future sequence slots with
+	// undecryptable ciphertext and block legitimate retransmissions.
+	payload := frame.Data
+	if sess.noiseSession != nil && sess.noiseSession.RecvCipher != nil {
+		plain, err := sess.noiseSession.RecvCipher.Decrypt(frame.Seq, frame.Data)
+		if err != nil {
+			atomic.AddUint64(&sess.server.decryptFailures, 1)
+			sess.server.logWarn("[Session 0x%08X] ⚠️ Noise decrypt failed for Seq %d: %v (waiting for retransmission)",
+				sess.sessionID, frame.Seq, err)
+			return
+		}
+		payload = plain
+	}
+
+	// Only a successfully authenticated DATA frame may migrate a Noise session
+	// to a different IP or install a new reply path.
+	sess.updateRemoteAddr(remoteAddr, true)
+	sess.setPath(origPort, remoteAddr)
+	sess.touch()
 
 	expected := atomic.LoadUint32(&sess.recvSeq)
 	if frame.Seq != expected {
@@ -905,7 +1013,10 @@ func (sess *ServerSession) handleData(frame *UDPCFrame, remoteAddr net.Addr) {
 			if len(sess.recvQueue) >= sess.server.maxRecvQueue {
 				atomic.AddUint64(&sess.server.queueFullDrops, 1)
 			} else {
-				sess.recvQueue[frame.Seq] = frame.Data
+				// Open-mode payloads borrow the socket read buffer; encrypted
+				// payloads are already owned by the AEAD result. Copy in both
+				// cases to keep the queue's ownership rule simple and explicit.
+				sess.recvQueue[frame.Seq] = append([]byte(nil), payload...)
 			}
 		}
 		sess.recvMu.Unlock()
@@ -913,13 +1024,13 @@ func (sess *ServerSession) handleData(frame *UDPCFrame, remoteAddr net.Addr) {
 	}
 
 	// In-order delivery. Gather the contiguous run (this frame plus anything
-	// already buffered behind it) under the lock, then decrypt and deliver
+	// already buffered behind it) under the lock, then deliver
 	// OUTSIDE the lock so a slow target write cannot stall the receive path.
 	type pending struct {
-		seq uint32
-		ct  []byte
+		seq     uint32
+		payload []byte
 	}
-	run := []pending{{seq: expected, ct: frame.Data}}
+	run := []pending{{seq: expected, payload: payload}}
 	sess.recvMu.Lock()
 	next := expected + 1
 	for {
@@ -928,29 +1039,18 @@ func (sess *ServerSession) handleData(frame *UDPCFrame, remoteAddr net.Addr) {
 			break
 		}
 		delete(sess.recvQueue, next)
-		run = append(run, pending{seq: next, ct: raw})
+		run = append(run, pending{seq: next, payload: raw})
 		next++
 	}
 	sess.recvMu.Unlock()
 
 	delivered := uint32(0)
 	for _, p := range run {
-		payload := p.ct
-		if sess.noiseSession != nil && sess.noiseSession.RecvCipher != nil {
-			plain, err := sess.noiseSession.RecvCipher.Decrypt(p.seq, p.ct)
-			if err != nil {
-				// Corruption or a frame we cannot open: do not advance recvSeq
-				// past it and do not Ack it, so the client retransmits. With
-				// Seq-derived nonces the retransmission carries the same
-				// ciphertext, so a transient corruption self-heals.
-				atomic.AddUint64(&sess.server.decryptFailures, 1)
-				sess.server.logWarn("[Session 0x%08X] ⚠️ Noise decrypt failed for Seq %d: %v (waiting for retransmission)",
-					sess.sessionID, p.seq, err)
-				break
-			}
-			payload = plain
+		if err := sess.writeToTarget(p.payload); err != nil {
+			sess.server.logWarn("[Session 0x%08X] target write failed: %v", sess.sessionID, err)
+			sess.Close()
+			return
 		}
-		sess.writeToTarget(payload)
 		sess.replayFilter.Accept(p.seq)
 		delivered++
 	}
@@ -960,12 +1060,6 @@ func (sess *ServerSession) handleData(frame *UDPCFrame, remoteAddr net.Addr) {
 	}
 
 	atomic.StoreUint32(&sess.recvSeq, expected+delivered)
-
-	// The frame that advanced the stream passed PSK authentication at
-	// handshake and (when enabled) a successful AEAD open here, so it is
-	// allowed to move the session to a new IP. This is the ONLY
-	// address-migration path when Noise is enabled.
-	sess.updateRemoteAddr(remoteAddr, true)
 
 	// Ack the highest contiguous sequence we have just delivered.
 	sess.sendCumulativeACK(expected + delivered - 1)
@@ -986,15 +1080,36 @@ func (sess *ServerSession) sendCumulativeACK(ackSeq uint32) {
 	sess.sendToSession(ackFrame.Encode())
 }
 
-func (sess *ServerSession) writeToTarget(data []byte) {
+func (sess *ServerSession) writeToTarget(data []byte) error {
 	if len(data) == 0 {
-		return
+		return nil
 	}
 	if sess.targetNetwork == "udp" && sess.udpConn != nil {
-		sess.udpConn.Write(data)
+		n, err := sess.udpConn.Write(data)
+		if err == nil && n != len(data) {
+			err = io.ErrShortWrite
+		}
+		return err
 	} else if sess.tcpConn != nil {
-		sess.tcpConn.Write(data)
+		return writeAll(sess.tcpConn, data)
 	}
+	return fmt.Errorf("target connection unavailable")
+}
+
+func writeAll(w io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := w.Write(data)
+		if n > 0 {
+			data = data[n:]
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
 }
 
 func (sess *ServerSession) sendData(payload []byte) error {
@@ -1034,10 +1149,11 @@ func (sess *ServerSession) sendData(payload []byte) error {
 	encoded := frame.Encode()
 
 	sess.unackedMu.Lock()
+	now := time.Now()
 	sess.unacked[seq] = &unackedPkt{
-		frame:     frame,
-		firstSent: time.Now(),
-		sentTime:  time.Now(),
+		wire:      encoded,
+		firstSent: now,
+		sentTime:  now,
 		rto:       sess.rttEst.RTO(), // adaptive RTO replaces the old fixed 200ms
 		retries:   0,
 	}
@@ -1116,7 +1232,7 @@ func (sess *ServerSession) retransmitLoop() {
 					if pkt.rto > sess.rttEst.maxRTT {
 						pkt.rto = sess.rttEst.maxRTT
 					}
-					sess.sendToSession(pkt.frame.Encode())
+					sess.sendToSession(pkt.wire)
 				}
 			}
 			sess.unackedMu.Unlock()
@@ -1157,11 +1273,53 @@ type synRecord struct {
 type synCache struct {
 	mu      sync.Mutex
 	entries map[[16]byte]synRecord
-	fifo    [][16]byte // insertion order, for eviction
+	fifo    []synFIFOEntry // insertion order, for eviction
+}
+
+type synFIFOEntry struct {
+	nonce     [16]byte
+	createdAt time.Time
 }
 
 func newSynCache() *synCache {
 	return &synCache{entries: make(map[[16]byte]synRecord)}
+}
+
+// Acquire atomically returns a completed cached ACK or reserves the nonce for
+// exactly one handshake goroutine. A nil ACK with owner=false means another
+// goroutine currently owns the same in-progress handshake.
+func (c *synCache) Acquire(nonce [16]byte, now time.Time) (ack []byte, owner bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if rec, ok := c.entries[nonce]; ok {
+		if now.Sub(rec.createdAt) <= synCacheTTL {
+			return rec.ackFrame, false
+		}
+		delete(c.entries, nonce)
+	}
+	c.makeSpaceLocked(now)
+	c.entries[nonce] = synRecord{createdAt: now}
+	c.fifo = append(c.fifo, synFIFOEntry{nonce: nonce, createdAt: now})
+	return nil, true
+}
+
+// Complete publishes the immutable ACK for a nonce reserved by Acquire.
+func (c *synCache) Complete(nonce [16]byte, ackFrame []byte) {
+	c.mu.Lock()
+	if rec, ok := c.entries[nonce]; ok && rec.ackFrame == nil {
+		rec.ackFrame = append([]byte(nil), ackFrame...)
+		c.entries[nonce] = rec
+	}
+	c.mu.Unlock()
+}
+
+// Abort removes an in-progress reservation after a failed handshake.
+func (c *synCache) Abort(nonce [16]byte) {
+	c.mu.Lock()
+	if rec, ok := c.entries[nonce]; ok && rec.ackFrame == nil {
+		delete(c.entries, nonce)
+	}
+	c.mu.Unlock()
 }
 
 // Lookup returns the cached ack for a nonce, or nil. Expired entries are
@@ -1187,21 +1345,34 @@ func (c *synCache) Remember(nonce [16]byte, ackFrame []byte, now time.Time) {
 	if _, ok := c.entries[nonce]; ok {
 		return
 	}
-	if len(c.fifo) >= synCacheMax {
-		// Drop every expired entry first, then fall back to FIFO eviction.
-		for k, rec := range c.entries {
-			if now.Sub(rec.createdAt) > synCacheTTL {
-				delete(c.entries, k)
-			}
-		}
-		for len(c.fifo) >= synCacheMax {
-			oldest := c.fifo[0]
-			c.fifo = c.fifo[1:]
-			delete(c.entries, oldest)
+	c.makeSpaceLocked(now)
+	c.entries[nonce] = synRecord{ackFrame: append([]byte(nil), ackFrame...), createdAt: now}
+	c.fifo = append(c.fifo, synFIFOEntry{nonce: nonce, createdAt: now})
+}
+
+func (c *synCache) makeSpaceLocked(now time.Time) {
+	for key, rec := range c.entries {
+		if now.Sub(rec.createdAt) > synCacheTTL {
+			delete(c.entries, key)
 		}
 	}
-	c.entries[nonce] = synRecord{ackFrame: ackFrame, createdAt: now}
-	c.fifo = append(c.fifo, nonce)
+	for len(c.entries) >= synCacheMax && len(c.fifo) > 0 {
+		oldest := c.fifo[0]
+		c.fifo = c.fifo[1:]
+		if rec, ok := c.entries[oldest.nonce]; ok && rec.createdAt.Equal(oldest.createdAt) {
+			delete(c.entries, oldest.nonce)
+		}
+	}
+	// Periodically compact stale FIFO metadata left behind by expiration/abort.
+	if len(c.fifo) > synCacheMax*2 {
+		fresh := c.fifo[:0]
+		for _, item := range c.fifo {
+			if rec, ok := c.entries[item.nonce]; ok && rec.createdAt.Equal(item.createdAt) {
+				fresh = append(fresh, item)
+			}
+		}
+		c.fifo = fresh
+	}
 }
 
 // Len returns the number of cached nonces (used by tests).

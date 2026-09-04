@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 )
 
 // Length-prefixed message framing — CLIENT-SIDE reference implementation.
@@ -73,6 +74,9 @@ func EncodeMessages(msgs ...[]byte) ([]byte, error) {
 		if len(m) > MaxFramedMessage {
 			return nil, fmt.Errorf("%w (%d > %d)", ErrMessageTooLarge, len(m), MaxFramedMessage)
 		}
+		if len(m) > math.MaxInt-total-FrameHeaderSize {
+			return nil, fmt.Errorf("framing: encoded batch too large")
+		}
 		total += FrameHeaderSize + len(m)
 	}
 	out := make([]byte, 0, total)
@@ -140,6 +144,9 @@ func (a *MessageAssembler) Feed(chunk []byte) ([][]byte, error) {
 		if len(a.buf) < FrameHeaderSize+int(n) {
 			break
 		}
+		if msgs == nil {
+			msgs = make([][]byte, 0, 4)
+		}
 		msg := make([]byte, n)
 		copy(msg, a.buf[FrameHeaderSize:FrameHeaderSize+n])
 		msgs = append(msgs, msg)
@@ -149,7 +156,13 @@ func (a *MessageAssembler) Feed(chunk []byte) ([][]byte, error) {
 	// Reclaim the consumed prefix so a long-lived stream does not keep growing
 	// its backing array.
 	if len(a.buf) == 0 {
-		a.buf = a.buf[:0:0]
+		// Retain modest buffers so a long-lived stream does not allocate again
+		// for every complete frame. Oversized backing arrays are still dropped.
+		if cap(a.buf) > 64*1024 {
+			a.buf = nil
+		} else {
+			a.buf = a.buf[:0]
+		}
 	} else if cap(a.buf) > 64*1024 && len(a.buf)*4 < cap(a.buf) {
 		compact := make([]byte, len(a.buf))
 		copy(compact, a.buf)

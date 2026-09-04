@@ -46,9 +46,6 @@ func newSendSockPool(limit int, logf func(format string, v ...interface{})) *sen
 	if limit <= 0 {
 		limit = defaultSendSockMax
 	}
-	if logf == nil {
-		logf = func(format string, v ...interface{}) {}
-	}
 	return &sendSockPool{
 		limit: limit,
 		conns: make(map[int]*net.UDPConn),
@@ -70,20 +67,23 @@ func (p *sendSockPool) Get(port int) (*net.UDPConn, error) {
 
 	if c, ok := p.conns[port]; ok {
 		p.order.MoveToFront(p.elems[port])
-		p.logf("[SockPool] ♻️ hit port=%d (cached=%d/limit=%d)", port, len(p.conns), p.limit)
 		return c, nil
 	}
 
 	uc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: port})
 	if err != nil {
-		p.logf("[SockPool] ❌ bind port=%d failed: %v", port, err)
+		if p.logf != nil {
+			p.logf("[SockPool] ❌ bind port=%d failed: %v", port, err)
+		}
 		return nil, err
 	}
 	_ = uc.SetWriteBuffer(socketBufferSize)
 
 	p.conns[port] = uc
 	p.elems[port] = p.order.PushFront(port)
-	p.logf("[SockPool] ✨ bound port=%d (cached=%d/limit=%d)", port, len(p.conns), p.limit)
+	if p.logf != nil {
+		p.logf("[SockPool] ✨ bound port=%d (cached=%d/limit=%d)", port, len(p.conns), p.limit)
+	}
 
 	for p.order.Len() > p.limit {
 		back := p.order.Back()
@@ -97,7 +97,9 @@ func (p *sendSockPool) Get(port int) (*net.UDPConn, error) {
 			delete(p.conns, victim)
 		}
 		delete(p.elems, victim)
-		p.logf("[SockPool] 🗑️ evict port=%d (cached=%d/limit=%d)", victim, len(p.conns), p.limit)
+		if p.logf != nil {
+			p.logf("[SockPool] 🗑️ evict port=%d (cached=%d/limit=%d)", victim, len(p.conns), p.limit)
+		}
 	}
 
 	return uc, nil

@@ -97,7 +97,7 @@ func ParseNoiseKey(s string) ([32]byte, error) {
 		copy(key[:], b)
 		return key, nil
 	}
-	return key, fmt.Errorf("invalid key format: %s", s)
+	return key, errors.New("invalid key format: expected 32-byte hex or base64 key")
 }
 
 func FormatNoiseKey(key [32]byte) (hexStr, b64Str string) {

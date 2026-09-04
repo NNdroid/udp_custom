@@ -64,6 +64,7 @@ func startTunnel(t *testing.T, serverUDP string, pubKey [32]byte, useNoise bool,
 	if err != nil {
 		t.Fatalf("NewUDPCServer: %v", err)
 	}
+	serverUDP = srv.conn.LocalAddr().String()
 	go srv.Start()
 
 	cli, err := NewClient(ClientConfig{
@@ -112,7 +113,7 @@ func (tn *tunnel) dial(t *testing.T) net.Conn {
 }
 
 func TestClientMode_StreamRoundTrip(t *testing.T) {
-	tn := startTunnel(t, "127.0.0.1:39750", [32]byte{}, false, 1)
+	tn := startTunnel(t, "127.0.0.1:0", [32]byte{}, false, 1)
 	defer tn.cleanup()
 
 	conn := tn.dial(t)
@@ -135,7 +136,7 @@ func TestClientMode_StreamRoundTrip(t *testing.T) {
 // A transfer far larger than one DATA frame: exercises chunking, the send
 // window, cumulative ACKs and retransmission under load.
 func TestClientMode_LargeTransfer(t *testing.T) {
-	tn := startTunnel(t, "127.0.0.1:39751", [32]byte{}, false, 1)
+	tn := startTunnel(t, "127.0.0.1:0", [32]byte{}, false, 1)
 	defer tn.cleanup()
 
 	conn := tn.dial(t)
@@ -174,7 +175,7 @@ func TestClientMode_LargeTransfer(t *testing.T) {
 // Same tunnel with Noise_NK on: the client must derive matching transport keys
 // from the server's static public key.
 func TestClientMode_NoiseEncrypted(t *testing.T) {
-	tn := startTunnel(t, "127.0.0.1:39752", [32]byte{}, true, 1)
+	tn := startTunnel(t, "127.0.0.1:0", [32]byte{}, true, 1)
 	defer tn.cleanup()
 
 	conn := tn.dial(t)
@@ -197,7 +198,7 @@ func TestClientMode_NoiseEncrypted(t *testing.T) {
 // Two local applications through ONE client: each gets its own session and its
 // own backend connection — and must not see each other's bytes.
 func TestClientMode_TwoLocalConnectionsAreIsolated(t *testing.T) {
-	tn := startTunnel(t, "127.0.0.1:39753", [32]byte{}, false, 2)
+	tn := startTunnel(t, "127.0.0.1:0", [32]byte{}, false, 2)
 	defer tn.cleanup()
 
 	var wg sync.WaitGroup

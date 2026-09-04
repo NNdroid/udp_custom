@@ -214,7 +214,7 @@ func (c *Client) recvLoop(conn *net.UDPConn) {
 		default:
 		}
 		conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-		n, _, err := conn.ReadFromUDP(buf)
+		n, remoteAddr, err := conn.ReadFromUDP(buf)
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				continue
@@ -225,11 +225,14 @@ func (c *Client) recvLoop(conn *net.UDPConn) {
 			c.logWarn("[Client] recv error: %v", err)
 			return
 		}
-		frame, err := DecodeUDPCFrame(buf[:n], c.magic)
-		if err != nil {
+		if !c.dialer.acceptsRemote(remoteAddr) {
 			continue
 		}
-		c.dispatch(frame)
+		var frame UDPCFrame
+		if err := decodeUDPCFrame(buf[:n], c.magic, &frame); err != nil {
+			continue
+		}
+		c.dispatch(&frame)
 	}
 }
 
@@ -239,8 +242,10 @@ func (c *Client) dispatch(frame *UDPCFrame) {
 		ch := c.pendingAck
 		c.ackMu.Unlock()
 		if ch != nil {
+			owned := *frame
+			owned.Data = append([]byte(nil), frame.Data...)
 			select {
-			case ch <- frame:
+			case ch <- &owned:
 			default:
 			}
 		}
@@ -457,9 +462,7 @@ func (s *clientSession) localToRemote() {
 		s.conn.SetReadDeadline(time.Now().Add(1 * time.Second))
 		n, err := s.conn.Read(buf)
 		if n > 0 {
-			payload := make([]byte, n)
-			copy(payload, buf[:n])
-			if serr := s.sendData(payload); serr != nil {
+			if serr := s.sendData(buf[:n]); serr != nil {
 				if !s.isClosed() {
 					s.client.logWarn("[Client] [Session 0x%08X] send failed: %v", s.sid, serr)
 				}
@@ -507,18 +510,20 @@ func (s *clientSession) sendData(payload []byte) error {
 		Magic: s.client.magic, Version: UDPC_VERSION, Cmd: CMD_DATA,
 		SessionID: s.sid, Seq: seq, Data: data,
 	}
+	encoded := outFrame.Encode()
 
 	rto := s.rttEst.RTO()
 	s.unackedMu.Lock()
+	now := time.Now()
 	s.unacked[seq] = &unackedPkt{
-		frame:     outFrame,
-		firstSent: time.Now(),
-		sentTime:  time.Now(),
+		wire:      encoded,
+		firstSent: now,
+		sentTime:  now,
 		rto:       rto,
 	}
 	s.unackedMu.Unlock()
 
-	return s.client.dialer.Send(outFrame.Encode())
+	return s.client.dialer.Send(encoded)
 }
 
 func (s *clientSession) handleAck(ackSeq uint32) {
@@ -562,7 +567,7 @@ func (s *clientSession) retransmitLoop() {
 				}
 				pkt.sentTime = now
 				pkt.rto = minDuration(pkt.rto*3/2, 10*time.Second)
-				_ = s.client.dialer.Send(pkt.frame.Encode())
+				_ = s.client.dialer.Send(pkt.wire)
 			}
 			s.unackedMu.Unlock()
 
@@ -613,10 +618,27 @@ func (s *clientSession) keepAliveLoop() {
 // handleData delivers server data to the local application, buffering
 // out-of-order frames and ACKing every frame it delivers.
 func (s *clientSession) handleData(frame *UDPCFrame) {
-	s.touch()
 	if frame.Seq == 0 {
 		return
 	}
+
+	// Several spread sockets have independent receive loops, so the complete
+	// reorder/decrypt/deliver transition must be serialized. This prevents two
+	// copies of the same expected sequence from both reaching the application.
+	s.recvMu.Lock()
+	defer s.recvMu.Unlock()
+
+	payload := frame.Data
+	if s.noise != nil {
+		plain, err := s.noise.RecvCipher.Decrypt(frame.Seq, frame.Data)
+		if err != nil {
+			s.client.logWarn("[Client] [Session 0x%08X] ⚠️ Decrypt failed for Seq %d: %v", s.sid, frame.Seq, err)
+			return
+		}
+		payload = plain
+	}
+	s.touch()
+
 	expected := atomic.LoadUint32(&s.recvSeq)
 	if frame.Seq != expected {
 		if int32(frame.Seq-expected) < 0 {
@@ -625,20 +647,17 @@ func (s *clientSession) handleData(frame *UDPCFrame) {
 			s.sendACK(frame.Seq)
 			return
 		}
-		s.recvMu.Lock()
 		if _, dup := s.recvQueue[frame.Seq]; !dup && len(s.recvQueue) < 512 {
-			s.recvQueue[frame.Seq] = frame.Data
+			s.recvQueue[frame.Seq] = append([]byte(nil), payload...)
 		}
-		s.recvMu.Unlock()
 		return
 	}
 
 	type pending struct {
-		seq uint32
-		ct  []byte
+		seq     uint32
+		payload []byte
 	}
-	run := []pending{{seq: expected, ct: frame.Data}}
-	s.recvMu.Lock()
+	run := []pending{{seq: expected, payload: payload}}
 	next := expected + 1
 	for {
 		raw, ok := s.recvQueue[next]
@@ -646,23 +665,13 @@ func (s *clientSession) handleData(frame *UDPCFrame) {
 			break
 		}
 		delete(s.recvQueue, next)
-		run = append(run, pending{seq: next, ct: raw})
+		run = append(run, pending{seq: next, payload: raw})
 		next++
 	}
-	s.recvMu.Unlock()
 
 	delivered := uint32(0)
 	for _, p := range run {
-		payload := p.ct
-		if s.noise != nil {
-			plain, err := s.noise.RecvCipher.Decrypt(p.seq, p.ct)
-			if err != nil {
-				s.client.logWarn("[Client] [Session 0x%08X] ⚠️ Decrypt failed for Seq %d: %v", s.sid, p.seq, err)
-				break // do not advance past corrupted frame: the server will retransmit
-			}
-			payload = plain
-		}
-		if _, err := s.conn.Write(payload); err != nil {
+		if err := writeAll(s.conn, p.payload); err != nil {
 			s.close()
 			return
 		}

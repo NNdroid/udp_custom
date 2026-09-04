@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // SelectorMode controls how PortSelector.Next distributes destination ports.
@@ -147,9 +148,15 @@ func NewPortRange(ports []int) (*PortRange, error) {
 	sorted := make([]int, len(ports))
 	copy(sorted, ports)
 	sort.Ints(sorted)
+	if sorted[0] < 1 || sorted[len(sorted)-1] > 65535 {
+		return nil, fmt.Errorf("port out of range (must be 1-65535)")
+	}
 	var ivs []portInterval
 	lo, hi := sorted[0], sorted[0]
 	for _, p := range sorted[1:] {
+		if p == hi {
+			continue
+		}
 		if p == hi+1 {
 			hi = p
 			continue
@@ -241,13 +248,23 @@ type PortSelector struct {
 // NewPortSelector creates a selector over pr. The RNG seed is drawn from
 // crypto/rand so the random spread does not start from a predictable sequence.
 func NewPortSelector(pr *PortRange, mode SelectorMode) *PortSelector {
-	var seed [8]byte
-	_, _ = crand.Read(seed[:])
 	return &PortSelector{
 		pr:   pr,
 		mode: mode,
-		rng:  rand.New(rand.NewSource(int64(binary.LittleEndian.Uint64(seed[:])))),
+		rng:  rand.New(rand.NewSource(randomSeed())),
 	}
+}
+
+var fallbackSeed uint64
+
+func randomSeed() int64 {
+	var seed [8]byte
+	if _, err := crand.Read(seed[:]); err == nil {
+		return int64(binary.LittleEndian.Uint64(seed[:]))
+	}
+	// Preserve availability if the OS RNG fails while ensuring concurrently
+	// created selectors do not all receive the same zero seed.
+	return time.Now().UnixNano() ^ int64(atomic.AddUint64(&fallbackSeed, 1))
 }
 
 // Next returns the destination port for the next outgoing packet. It is cheap

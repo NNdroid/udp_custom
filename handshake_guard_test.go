@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -58,6 +60,55 @@ func TestSynCacheEvictionBound(t *testing.T) {
 	}
 	if c.Len() > synCacheMax {
 		t.Fatalf("cache grew past synCacheMax: %d", c.Len())
+	}
+}
+
+func TestSynCacheAcquireHasSingleConcurrentOwner(t *testing.T) {
+	c := newSynCache()
+	now := time.Now()
+	var nonce [16]byte
+	copy(nonce[:], "same-syn-nonce!!")
+
+	const workers = 64
+	var owners int32
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			ack, owner := c.Acquire(nonce, now)
+			if ack != nil {
+				t.Error("in-progress reservation unexpectedly returned an ACK")
+			}
+			if owner {
+				atomic.AddInt32(&owners, 1)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if got := atomic.LoadInt32(&owners); got != 1 {
+		t.Fatalf("concurrent owners = %d, want exactly 1", got)
+	}
+
+	c.Complete(nonce, []byte("ack"))
+	ack, owner := c.Acquire(nonce, now.Add(time.Second))
+	if owner || !bytes.Equal(ack, []byte("ack")) {
+		t.Fatalf("completed Acquire = (%q, %v), want cached ACK", ack, owner)
+	}
+}
+
+func TestSynCacheAbortReleasesReservation(t *testing.T) {
+	c := newSynCache()
+	var nonce [16]byte
+	if _, owner := c.Acquire(nonce, time.Now()); !owner {
+		t.Fatal("first acquire should own reservation")
+	}
+	c.Abort(nonce)
+	if _, owner := c.Acquire(nonce, time.Now()); !owner {
+		t.Fatal("aborted reservation should be acquirable")
 	}
 }
 

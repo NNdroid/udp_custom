@@ -1,0 +1,75 @@
+name: Test
+
+# Runs the FULL suite (141 test/benchmark/fuzz-seed functions) on every push
+# to main and every pull request. The race detector runs on ALL three
+# platforms: Linux needs nothing extra; macOS has Apple Clang preinstalled;
+# Windows needs a mingw-w64 gcc (installed via Chocolatey) because the race
+# detector is a CGO feature. ubuntu-latest is additionally the only platform
+# that executes origdst_test.go (linux build tag).
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-linux:
+    name: Test (linux, race)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test with race detector
+        run: go test -count=1 -race ./...
+
+      - name: Test coverage summary
+        run: go test -count=1 -cover ./... | grep -E "ok|FAIL"
+
+  test-windows:
+    name: Test (windows, race)
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install MinGW-w64 (CGO backend for the race detector)
+        run: choco install mingw -y --no-progress
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Test with race detector
+        run: go test -count=1 -race ./...
+
+  test-macos:
+    name: Test (macos, race)
+    runs-on: macos-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Test with race detector
+        run: go test -count=1 -race ./...

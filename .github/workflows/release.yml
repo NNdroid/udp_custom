@@ -1,11 +1,13 @@
 name: Release
 
-# Pushing v1.0.yyyyMMdd-<current-commit-short-sha> creates a GitHub Release.
-# A manual run creates no Release; it uploads one Actions artifact instead.
+# Pushing vX.0.yyyyMMdd-<current-commit-short-sha> (v1.0 or v2.0) creates a
+# GitHub Release. A manual run creates no Release; it uploads one Actions
+# artifact instead.
 on:
   push:
     tags:
       - 'v1.0.*'
+      - 'v2.0.*'
   workflow_dispatch:
 
 permissions:
@@ -33,12 +35,12 @@ jobs:
 
           if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
             version="${GITHUB_REF_NAME}"
-            if ! [[ "${version}" =~ ^v1\.0\.[0-9]{8}-${short_sha}$ ]]; then
-              echo "Tag must be v1.0.yyyyMMdd-${short_sha} (the short hash of the tagged commit)." >&2
+            if ! [[ "${version}" =~ ^v(1|2)\.0\.[0-9]{8}-${short_sha}$ ]]; then
+              echo "Tag must be v1.0/v2.0 + yyyyMMdd-${short_sha} (the short hash of the tagged commit)." >&2
               exit 1
             fi
           else
-            version="v1.0.$(date -u +%Y%m%d)-${short_sha}"
+            version="v2.0.$(date -u +%Y%m%d)-${short_sha}"
           fi
 
           echo "version=${version}" >> "${GITHUB_OUTPUT}"

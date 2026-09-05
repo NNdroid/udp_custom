@@ -11,9 +11,11 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+
+	"github.com/NNdroid/udp_custom/tunnel"
 )
 
-var Version = "1.2.0"
+var Version = "2.0.0"
 
 type Config struct {
 	// Mode selects what this binary does: "server" (default, also when absent)
@@ -42,11 +44,21 @@ type Config struct {
 	Listen    string   `json:"listen"`     // UDP listen address / port the server binds, e.g. ":36712". The SINGLE port; a firewall DNAT redirects the client port range onto it.
 	Host      string   `json:"host"`       // Server public IP / domain (used by gen-uri to build the sharing link)
 	PortRange string   `json:"port_range"` // FIRST-CLASS server port range, e.g. "25000-26000" (host optional). The firewall DNATs this whole range onto 'listen'. Used at runtime to validate incoming origdst ports and as the default --range for gen-nftables/gen-iptables.
-	Target    string   `json:"target"`     // Target service address (e.g. "tcp://127.0.0.1:22" or "udp://127.0.0.1:51820")
+	Target    string   `json:"target"`     // Server: DEFAULT target service (e.g. "tcp://127.0.0.1:22"). Client: target requested in the handshake ("" = server default); must pass the server's allowed_targets filter.
 	Passwords []string `json:"passwords"`  // List of pre-shared keys
 	Magic     string   `json:"magic"`      // 4-byte protocol magic
 	PrivKey   string   `json:"privkey"`    // Static private key for Noise encryption (Hex / Base64)
 	LogLevel  string   `json:"log_level"`  // debug, info, warn, error
+
+	// AllowedTargets (server) gates client-requested per-session targets with
+	// '*'/'?' wildcards, e.g. "tcp://127.0.0.1:*". Empty = only the default
+	// 'target'. See tunnel.ServerConfig.AllowedTargets.
+	AllowedTargets []string `json:"allowed_targets"`
+
+	// ReceiveSockets (server, Linux only) opens N SO_REUSEPORT UDP sockets on
+	// 'listen', each with its own read goroutine, scaling packet intake across
+	// cores. 0/1 = single socket. Other platforms clamp to 1.
+	ReceiveSockets int `json:"receive_sockets"`
 
 	// OrigDst enables IP_RECVORIGDSTADDR (Linux only). REQUIRED whenever the
 	// client spreads across more than one destination port: it lets the server
@@ -178,7 +190,7 @@ func runClientMode(cfg *Config, magicStr, lvl string, sendWindow int) {
 		lvl = "info"
 	}
 
-	clientCfg := ClientConfig{
+	clientCfg := tunnel.ClientConfig{
 		ListenAddr: cfg.Listen,
 		ServerAddr: serverAddr,
 		Target:     cfg.Target,
@@ -192,7 +204,7 @@ func runClientMode(cfg *Config, magicStr, lvl string, sendWindow int) {
 
 	// Optional Noise_NK encryption, keyed by the server's static public key.
 	if pk := strings.TrimSpace(cfg.PubKey); pk != "" {
-		pub, err := ParseNoiseKey(pk)
+		pub, err := tunnel.ParseNoiseKey(pk)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "client mode: invalid 'pubkey': %v\n", err)
 			os.Exit(1)
@@ -200,7 +212,7 @@ func runClientMode(cfg *Config, magicStr, lvl string, sendWindow int) {
 		clientCfg.ServerPub = pub
 	}
 
-	cli, err := NewClient(clientCfg)
+	cli, err := tunnel.NewClient(clientCfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to start client: %v\n", err)
 		os.Exit(1)
@@ -267,20 +279,22 @@ func runFromConfig(path string) {
 	// had no detector anywhere before; check them at boot now.
 	validatePortRange(cfg.PortRange, listen, origDst, sendSockMax)
 
-	srvCfg := ServerConfig{
-		ListenAddr:  listen,
-		TargetAddr:  target,
-		Passwords:   cfg.Passwords,
-		Magic:       magicVal,
-		PrivateKey:  cfg.PrivKey,
-		LogLevel:    lvl,
-		OrigDst:     origDst,
-		SendSockMax: sendSockMax,
-		SendWindow:  sendWindow,
-		PortRange:   cfg.PortRange,
+	srvCfg := tunnel.ServerConfig{
+		ListenAddr:     listen,
+		TargetAddr:     target,
+		Passwords:      cfg.Passwords,
+		Magic:          magicVal,
+		PrivateKey:     cfg.PrivKey,
+		LogLevel:       lvl,
+		OrigDst:        origDst,
+		SendSockMax:    sendSockMax,
+		SendWindow:     sendWindow,
+		PortRange:      cfg.PortRange,
+		AllowedTargets: cfg.AllowedTargets,
+		ReceiveSockets: cfg.ReceiveSockets,
 	}
 
-	srv, err := NewUDPCServer(srvCfg)
+	srv, err := tunnel.NewServer(srvCfg)
 	if err != nil {
 		log.Fatalf("Failed to initialize server from config: %v", err)
 	}
@@ -304,13 +318,13 @@ func runFromConfig(path string) {
 func handleUtilityCommands(args []string) {
 	switch args[0] {
 	case "gen-keys":
-		kp, err := GenerateNoiseKeyPair()
+		kp, err := tunnel.GenerateNoiseKeyPair()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to generate keypair: %v\n", err)
 			os.Exit(1)
 		}
-		privHex, privB64 := FormatNoiseKey(kp.PrivateKey)
-		pubHex, pubB64 := FormatNoiseKey(kp.PublicKey)
+		privHex, privB64 := tunnel.FormatNoiseKey(kp.PrivateKey)
+		pubHex, pubB64 := tunnel.FormatNoiseKey(kp.PublicKey)
 		fmt.Println("=== 🔑 Noise Curve25519 Keypair ===")
 		fmt.Printf("Server Private Key (privkey):\n  Hex:    %s\n  Base64: %s\n\n", privHex, privB64)
 		fmt.Printf("Client Public Key (pubkey):\n  Hex:    %s\n  Base64: %s\n", pubHex, pubB64)
@@ -329,35 +343,13 @@ func handleUtilityCommands(args []string) {
 	}
 }
 
-// portRangeOf parses a port-range spec (either bare "lo-hi" or "host:lo-hi")
-// into a *PortRange, returning nil when it cannot be parsed.
-func portRangeOf(spec string) *PortRange {
-	spec = strings.TrimSpace(spec)
-	if spec == "" {
-		return nil
-	}
-	ports, err := ParsePortRangeSpec(spec)
-	if err != nil {
-		if _, hp, e2 := ParseServerAddrWithRange(spec); e2 == nil {
-			ports = hp
-		} else {
-			return nil
-		}
-	}
-	pr, err := NewPortRange(ports)
-	if err != nil {
-		return nil
-	}
-	return pr
-}
-
 // validatePortRange checks the configured client port range against the values
 // that DO affect the running server. It is warn-only: a questionable range must
 // never stop an otherwise healthy server from booting. The three failure modes
 // it catches are all silent in production — they show up only as heavy
 // retransmission, which is indistinguishable from a bad link.
 func validatePortRange(portRange, listen string, origDst bool, sendSockMax int) {
-	pr := portRangeOf(portRange)
+	pr := tunnel.PortRangeOf(portRange)
 	if pr == nil {
 		// No range configured — a single-port (no spreading) deployment,
 		// nothing to validate.
@@ -380,7 +372,7 @@ func validatePortRange(portRange, listen string, origDst bool, sendSockMax int) 
 	// costs a syscall pair per packet and churns source ports.
 	limit := sendSockMax
 	if limit <= 0 {
-		limit = defaultSendSockMax
+		limit = tunnel.DefaultSendSockMax
 	}
 	if pr.Total() > limit {
 		log.Printf("⚠️  [port_range] %d ports exceeds sendsock_max=%d — the reply-socket cache will evict on nearly every packet; raise sendsock_max or shrink the range",
@@ -429,8 +421,8 @@ func runGenURI(args []string) {
 				*host = fileCfg.Host
 			}
 			if *port == "" && fileCfg.PortRange != "" {
-				if ports, pe := ParsePortRangeSpec(fileCfg.PortRange); pe == nil {
-					*port = FormatPortList(ports)
+				if ports, pe := tunnel.ParsePortRangeSpec(fileCfg.PortRange); pe == nil {
+					*port = tunnel.FormatPortList(ports)
 				}
 			}
 			if *port == "" && fileCfg.Listen != "" {
@@ -448,8 +440,8 @@ func runGenURI(args []string) {
 				*pubKey = fileCfg.PubKey
 			}
 			if *pubKey == "" && fileCfg.PrivKey != "" {
-				if kp, pe := ParseNoiseKey(fileCfg.PrivKey); pe == nil {
-					_, pubB64 := FormatNoiseKey(kp)
+				if kp, pe := tunnel.ParseNoiseKey(fileCfg.PrivKey); pe == nil {
+					_, pubB64 := tunnel.FormatNoiseKey(kp)
 					*pubKey = pubB64
 				}
 			}

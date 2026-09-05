@@ -30,6 +30,38 @@ PLATFORMS=(
   "windows/386"
 )
 
+# Opt in with --update-deps (or UPDATE_GO_DEPS=1) to run
+# "go get -u ./..." and "go mod tidy" before compiling.
+UPDATE_GO_DEPS="${UPDATE_GO_DEPS:-0}"
+for ARG in "$@"; do
+  case "${ARG}" in
+    --update-deps|--update-go-deps)
+      UPDATE_GO_DEPS=1
+      ;;
+    *)
+      echo "Unsupported argument: ${ARG}" >&2
+      exit 2
+      ;;
+  esac
+done
+
+case "${UPDATE_GO_DEPS}" in
+  1|true|TRUE|yes|YES)
+    echo "=== Updating Go dependencies ==="
+    (
+      cd "${PROJECT_ROOT}"
+      go get -u ./...
+      go mod tidy
+    )
+    ;;
+  0|false|FALSE|no|NO|"")
+    ;;
+  *)
+    echo "UPDATE_GO_DEPS must be 0/1, true/false, or yes/no; got: ${UPDATE_GO_DEPS}" >&2
+    exit 2
+    ;;
+esac
+
 echo "=== Building ${APP_NAME} ${VERSION} ==="
 
 for PLATFORM in "${PLATFORMS[@]}"; do

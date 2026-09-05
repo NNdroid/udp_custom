@@ -6,6 +6,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/NNdroid/udp_custom/tunnel"
 )
 
 // generateSystemd emits a systemd unit. udp_custom is config-file driven
@@ -71,19 +73,19 @@ func dnatDportsArg(tokens []string) []string {
 	return args
 }
 
-// intervalTokens renders the PortRange as range tokens using sep as the
+// intervalTokens renders the tunnel.PortRange as range tokens using sep as the
 // range separator. iptables multiport wants ":" (e.g. "1024:23000"); nftables
 // wants "-" (e.g. "1024-23000").
-func intervalTokens(pr *PortRange, sep string) []string {
+func intervalTokens(pr *tunnel.PortRange, sep string) []string {
 	if pr == nil {
 		return nil
 	}
 	var out []string
-	for _, iv := range pr.intervals {
-		if iv.lo == iv.hi {
-			out = append(out, strconv.Itoa(iv.lo))
+	for _, iv := range pr.Intervals() {
+		if iv.Lo == iv.Hi {
+			out = append(out, strconv.Itoa(iv.Lo))
 		} else {
-			out = append(out, fmt.Sprintf("%d%s%d", iv.lo, sep, iv.hi))
+			out = append(out, fmt.Sprintf("%d%s%d", iv.Lo, sep, iv.Hi))
 		}
 	}
 	return out
@@ -92,9 +94,9 @@ func intervalTokens(pr *PortRange, sep string) []string {
 // generateIptables prints REDIRECT rules that send every incoming UDP packet on
 // the configured port range to a single internal UDP port. The server keeps
 // listening only on that internal port; the firewall does the spreading/merge.
-func generateIptables(internalPort int, pr *PortRange) {
+func generateIptables(internalPort int, pr *tunnel.PortRange) {
 	fmt.Println("=== Iptables Port Redirection / Hopping Rules ===")
-	if pr == nil || pr.total == 0 {
+	if pr == nil || pr.Total() == 0 {
 		fmt.Printf("Redirecting all incoming UDP (ports 1000-65535) to local port %d:\n\n", internalPort)
 		fmt.Printf("sudo iptables -t nat -A PREROUTING -p udp --dport 1000:65535 -j REDIRECT --to-ports %d\n", internalPort)
 		return
@@ -109,9 +111,9 @@ func generateIptables(internalPort int, pr *PortRange) {
 // generateNftables prints nftables rules that DNAT every incoming UDP packet on
 // the configured port range onto an internal listen address, e.g.
 // "127.0.0.1:36712". nftables handles arbitrary disjoint ranges natively.
-func generateNftables(internalAddr string, pr *PortRange) {
+func generateNftables(internalAddr string, pr *tunnel.PortRange) {
 	fmt.Println("=== nftables Port Range DNAT Rules ===")
-	if pr == nil || pr.total == 0 {
+	if pr == nil || pr.Total() == 0 {
 		fmt.Println("No port range provided.")
 		return
 	}
@@ -149,9 +151,9 @@ func atoiPort(s string) int {
 	return p
 }
 
-// resolveRangeSpec reads --range / -c and returns the parsed PortRange.
+// resolveRangeSpec reads --range / -c and returns the parsed tunnel.PortRange.
 // Resolution order: explicit --range > config 'port_range'.
-func resolveRangeSpec(args []string, fs *flag.FlagSet) (pr *PortRange) {
+func resolveRangeSpec(args []string, fs *flag.FlagSet) (pr *tunnel.PortRange) {
 	rangeSpec := fs.Lookup("range").Value.String()
 	cfgPath := fs.Lookup("c").Value.String()
 	if rangeSpec == "" && cfgPath != "" {
@@ -162,12 +164,12 @@ func resolveRangeSpec(args []string, fs *flag.FlagSet) (pr *PortRange) {
 	if rangeSpec == "" {
 		return nil
 	}
-	ports, err := ParsePortRangeSpec(rangeSpec)
+	ports, err := tunnel.ParsePortRangeSpec(rangeSpec)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Invalid --range %q: %v\n", rangeSpec, err)
 		os.Exit(1)
 	}
-	pr, err = NewPortRange(ports)
+	pr, err = tunnel.NewPortRange(ports)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Invalid range: %v\n", err)
 		os.Exit(1)

@@ -3,7 +3,7 @@ set -e
 
 APP_NAME="udp_custom"
 GITHUB_REPO="NNdroid/${APP_NAME}"
-# Optional: pin to a release tag, e.g. v1.0.20260904-1a2b3c4.
+# Optional: pin to a release tag, e.g. v2.0.20260904-1a2b3c4.
 # Leave empty to fetch the latest GitHub Release.
 APP_VERSION="${APP_VERSION:-}"
 INSTALL_DIR="/usr/local/bin"
@@ -40,8 +40,8 @@ get_arch() {
 }
 
 validate_app_version() {
-  if [ -n "${APP_VERSION}" ] && ! [[ "${APP_VERSION}" =~ ^v1\.0\.[0-9]{8}-[0-9a-f]{7}$ ]]; then
-    echo -e "${RED}APP_VERSION must be v1.0.yyyyMMdd-<7-character-git-hash>.${PLAIN}" >&2
+  if [ -n "${APP_VERSION}" ] && ! [[ "${APP_VERSION}" =~ ^v(1|2)\.0\.[0-9]{8}-[0-9a-f]{7}$ ]]; then
+    echo -e "${RED}APP_VERSION must be v1.0 or v2.0 yyyyMMdd-<7-character-git-hash>.${PLAIN}" >&2
     exit 1
   fi
 }
@@ -76,7 +76,7 @@ install_binary() {
   elif command -v go >/dev/null 2>&1 && [ -f "./main.go" ]; then
     echo -e "${CYAN}--> Building from source with Go...${PLAIN}"
     local source_version
-    source_version="v1.0.$(date -u +%Y%m%d)-$(git rev-parse --short=7 HEAD 2>/dev/null || printf 'local')"
+    source_version="v2.0.$(date -u +%Y%m%d)-$(git rev-parse --short=7 HEAD 2>/dev/null || printf 'local')"
     CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.Version=${source_version}" -o "${INSTALL_DIR}/${APP_NAME}" .
   else
     echo -e "${CYAN}--> Downloading release binary (${goarch})...${PLAIN}"

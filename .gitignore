@@ -34,4 +34,4 @@ go.work.sum
 bin/
 
 .workbuddy/
-.codebuddy/
+PROTOCOL_V2.md

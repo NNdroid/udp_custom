@@ -2,15 +2,18 @@ package main
 
 import (
 	"bytes"
-	"crypto/rand"
-	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/NNdroid/udp_custom/tunnel"
 )
 
 func TestUDPCustom_JSONConfigParsing(t *testing.T) {
@@ -43,6 +46,109 @@ func TestUDPCustom_JSONConfigParsing(t *testing.T) {
 	}
 }
 
+// The shipped config.client.json template must actually boot the client (it
+// used to be silently ignored, which started a SERVER on the client's port).
+func TestClientConfigTemplateBootsClient(t *testing.T) {
+	data, err := os.ReadFile("config.client.json")
+	if err != nil {
+		t.Skipf("config.client.json not available: %v", err)
+	}
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("parse config.client.json: %v", err)
+	}
+	if cfg.Mode != "client" {
+		t.Fatalf("template mode = %q, want client", cfg.Mode)
+	}
+	if cfg.Server == "" {
+		t.Fatal("template is missing 'server'")
+	}
+}
+
+// capturePortRangeLog runs validatePortRange with the standard logger diverted
+// into a buffer so the emitted warnings can be asserted on.
+func capturePortRangeLog(portRange, listen string, origDst bool, sendSockMax int) string {
+	var buf bytes.Buffer
+	prevOut := log.Writer()
+	prevFlags := log.Flags()
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	defer func() {
+		log.SetOutput(prevOut)
+		log.SetFlags(prevFlags)
+	}()
+	validatePortRange(portRange, listen, origDst, sendSockMax)
+	return buf.String()
+}
+
+func TestValidatePortRange(t *testing.T) {
+	tests := []struct {
+		name        string
+		portRange   string
+		listen      string
+		origDst     bool
+		sendSockMax int
+		// want substrings that MUST appear / MUST NOT appear
+		want    []string
+		notWant []string
+	}{
+		{
+			name:      "empty range is silent",
+			portRange: "",
+			listen:    ":36712",
+			origDst:   true,
+			want:      nil,
+		},
+		{
+			name:      "single-port range is silent",
+			portRange: "25000-25000",
+			listen:    ":36712",
+			origDst:   true,
+			want:      nil,
+		},
+		{
+			name:        "range exceeding sendsock_max warns",
+			portRange:   "25000-26000",
+			listen:      ":36712",
+			origDst:     true,
+			sendSockMax: 512,
+			want:        []string{"exceeds sendsock_max"},
+		},
+		{
+			name:      "range with origdst disabled warns",
+			portRange: "25000-25499",
+			listen:    ":36712",
+			origDst:   false,
+			want:      []string{"origdst=false"},
+		},
+		{
+			name:      "range containing the listen port warns",
+			portRange: "25000-26000",
+			listen:    ":25007",
+			origDst:   true,
+			want:      []string{"CONTAINS the listen port"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := capturePortRangeLog(tc.portRange, tc.listen, tc.origDst, tc.sendSockMax)
+			for _, want := range tc.want {
+				if !strings.Contains(got, want) {
+					t.Errorf("missing %q in log output:\n%s", want, got)
+				}
+			}
+			for _, deny := range tc.notWant {
+				if strings.Contains(got, deny) {
+					t.Errorf("unexpected %q in log output:\n%s", deny, got)
+				}
+			}
+		})
+	}
+}
+
+// TestUDPCustom_LiveE2E_FromJSONConfig drives a full tunnel through the JSON
+// config file, the CLI mapping layer, and the tunnel package's public API —
+// exactly what the binary does at startup.
 func TestUDPCustom_LiveE2E_FromJSONConfig(t *testing.T) {
 	tempDir := t.TempDir()
 
@@ -97,7 +203,7 @@ func TestUDPCustom_LiveE2E_FromJSONConfig(t *testing.T) {
 	}
 
 	magicVal := parseMagicHeader(cfg.Magic)
-	srvCfg := ServerConfig{
+	srvCfg := tunnel.ServerConfig{
 		ListenAddr: cfg.Listen,
 		TargetAddr: cfg.Target,
 		Passwords:  cfg.Passwords,
@@ -105,74 +211,42 @@ func TestUDPCustom_LiveE2E_FromJSONConfig(t *testing.T) {
 		PrivateKey: cfg.PrivKey,
 		LogLevel:   cfg.LogLevel,
 	}
-	srv, err := NewUDPCServer(srvCfg)
+	srv, err := tunnel.NewServer(srvCfg)
 	if err != nil {
-		t.Fatalf("NewUDPCServer failed: %v", err)
+		t.Fatalf("NewServer failed: %v", err)
 	}
-	defer srv.Close()
-
 	go srv.Start()
 	time.Sleep(100 * time.Millisecond)
 
-	// 5. Connect Client and Perform Handshake
-	cConn, err := net.Dial("udp", udpAddr)
+	// 5. Connect Client via the public API (DialTunnel, no local listener).
+	cli, err := tunnel.NewClient(tunnel.ClientConfig{
+		ServerAddr: udpAddr,
+		Passwords:  []string{password},
+		LogLevel:   "error",
+	})
 	if err != nil {
-		t.Fatalf("dial udp: %v", err)
+		t.Fatalf("NewClient failed: %v", err)
 	}
-	defer cConn.Close()
+	defer cli.Close()
 
-	var nonce [16]byte
-	rand.Read(nonce[:])
-	now := time.Now().Unix()
-	sig := ComputeAuthHMAC(nonce[:], password, now)
-
-	handshakePayload := make([]byte, 56)
-	copy(handshakePayload[0:16], nonce[:])
-	binary.BigEndian.PutUint64(handshakePayload[16:24], uint64(now))
-	copy(handshakePayload[24:56], sig)
-
-	syn := &UDPCFrame{
-		Magic:   UDPC_MAGIC_DEFAULT,
-		Version: UDPC_VERSION,
-		Cmd:     CMD_HANDSHAKE_SYN,
-		Data:    handshakePayload,
-	}
-	cConn.Write(syn.Encode())
-
-	respBuf := make([]byte, 2048)
-	n, err := cConn.Read(respBuf)
+	conn, err := cli.DialTunnel(t.Context(), tunnel.DialOptions{})
 	if err != nil {
-		t.Fatalf("read handshake ack: %v", err)
+		t.Fatalf("DialTunnel failed: %v", err)
 	}
-	ackFrame, err := DecodeUDPCFrame(respBuf[:n], UDPC_MAGIC_DEFAULT)
-	if err != nil || ackFrame.Cmd != CMD_HANDSHAKE_ACK {
-		t.Fatalf("handshake ack failed: %v, cmd: %d", err, ackFrame.Cmd)
-	}
-	sid := ackFrame.SessionID
+	defer conn.Close()
 
-	// 6. Test Echo Data via JSON Config Server
+	// 6. Test Echo Data through the tunnel net.Conn.
 	testMsg := []byte("Hello UDPCustom Server via JSON Config!")
-	dataFrame := &UDPCFrame{
-		Magic:     UDPC_MAGIC_DEFAULT,
-		Version:   UDPC_VERSION,
-		Cmd:       CMD_DATA,
-		SessionID: sid,
-		Seq:       1,
-		Data:      testMsg,
+	if _, err := conn.Write(testMsg); err != nil {
+		t.Fatalf("write: %v", err)
 	}
-	cConn.Write(dataFrame.Encode())
-
-	// Read ACK
-	n, _ = cConn.Read(respBuf)
-	// Read Echo data
-	n, _ = cConn.Read(respBuf)
-	echoFrame, err := DecodeUDPCFrame(respBuf[:n], UDPC_MAGIC_DEFAULT)
-	if err != nil || echoFrame.Cmd != CMD_DATA {
-		t.Fatalf("decode data failed: %v", err)
+	buf := make([]byte, len(testMsg))
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatalf("read echo: %v", err)
 	}
-
-	if !bytes.Equal(echoFrame.Data, testMsg) {
-		t.Fatalf("echo mismatch: got %q, want %q", echoFrame.Data, testMsg)
+	if !bytes.Equal(buf, testMsg) {
+		t.Fatalf("echo mismatch: got %q, want %q", buf, testMsg)
 	}
 
 	t.Logf("✅ Live E2E UDP Custom Tunnel via JSON Config PASSED!")

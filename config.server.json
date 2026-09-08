@@ -7,10 +7,11 @@
     "host": "Public server IP / domain fed to 'gen-uri' so the generated client config knows where to dial (e.g. '1.2.3.4'). Not used at runtime by the server itself.",
     "origdst": "REQUIRED (Linux only). Enables IP_RECVORIGDSTADDR so the server recovers each client packet's original destination port (pre-DNAT) and replies FROM that exact port. Without it every reply leaves from 'listen' and any NAT stricter than full-cone drops it. Ignored on non-Linux platforms.",
     "sendsock_max": "Per-port reply-socket pool cap (LRU). One socket is bound per distinct origdst port so the kernel stamps the reply's source port correctly. Set it >= the size of 'port_range' (e.g. 1024 for a ~1000-port range) to avoid per-packet rebinding.",
-    "target": "Backend service to forward traffic to (tcp://127.0.0.1:22 or udp://127.0.0.1:51820)",
-    "passwords": "List of valid pre-shared keys (PSKs) for HMAC authentication (aliases: token, psk)",
+    "target": "DEFAULT backend to forward traffic to (tcp://127.0.0.1:22 or udp://127.0.0.1:51820). Used when the client does not request a target in its handshake.",
+    "allowed_targets": "Client-REQUESTED per-session targets are honored only when they match one of these glob patterns ('*'/'?' in host and port; network must match), e.g. 'tcp://127.0.0.1:*' or 'tcp://*.internal:22'. Empty = only the default 'target'; denied requests are silently dropped. The granted endpoint is echoed in the authenticated handshake ACK.",
+    "passwords": "Required non-empty list of pre-shared keys (PSKs); protocol v2 has no unauthenticated mode (aliases: token, psk)",
     "magic": "4-byte protocol magic header string (default: UDPC)",
-    "privkey": "Noise Curve25519 static private key for end-to-end AEAD encryption (generate with 'udp_custom gen-keys'). Empty = open mode (no encryption).",
+    "privkey": "Noise Curve25519 static private key (generate with 'udp_custom gen-keys'). Sessions are ChaCha20-Poly1305 encrypted with the PSK even when empty; adding 'privkey' upgrades them to forward-secret Noise_NK keys (client must set matching 'pubkey').",
     "log_level": "Logging verbosity: debug, info, warn, error"
   },
   "mode": "server",
@@ -20,10 +21,15 @@
   "origdst": true,
   "sendsock_max": 1024,
   "target": "tcp://127.0.0.1:22",
+  "allowed_targets": [
+    "tcp://127.0.0.1:*",
+    "udp://10.0.0.0/8:*"
+  ],
   "passwords": [
     "secret_psk_token_1",
     "secret_psk_token_2"
   ],
+  "receive_sockets": 4,
   "magic": "UDPC",
   "privkey": "",
   "log_level": "info"

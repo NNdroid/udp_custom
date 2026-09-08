@@ -7,6 +7,8 @@ import (
 	"os"
 
 	qrcode "github.com/skip2/go-qrcode"
+
+	"github.com/NNdroid/udp_custom/tunnel"
 )
 
 type StunProfile struct {
@@ -31,8 +33,8 @@ type StunProfile struct {
 func GenerateUDPCustomURI(host, port, password, magic, pubKey, remark, pin string) string {
 	pubHex, pubB64 := "", ""
 	if pubKey != "" {
-		if pk, err := ParseNoiseKey(pubKey); err == nil {
-			pubHex, pubB64 = FormatNoiseKey(pk)
+		if pk, err := tunnel.ParseNoiseKey(pubKey); err == nil {
+			pubHex, pubB64 = tunnel.FormatNoiseKey(pk)
 		}
 	}
 	rawPub := pubB64

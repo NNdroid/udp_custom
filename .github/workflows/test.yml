@@ -94,15 +94,49 @@ jobs:
           go-version-file: go.mod
           check-latest: true
 
+      - name: Install Graphviz (pprof flamegraph renderer)
+        run: sudo apt-get install -y graphviz
+
       - name: Throughput benchmarks (Target x protocol)
-        run: go test -run XXX -bench 'BenchmarkTCPTarget_|BenchmarkUDPTarget_' -benchmem -benchtime=2s ./tunnel/ | tee benchmark.txt
+        run: >
+          go test -run XXX
+          -bench 'BenchmarkTCPTarget_|BenchmarkUDPTarget_'
+          -benchmem -benchtime=2s
+          -cpuprofile cpu-throughput.prof
+          ./tunnel/ | tee benchmark.txt
 
       - name: Micro benchmarks (codec, AEAD, replay filter)
-        run: go test -run XXX -bench 'BenchmarkFrame|BenchmarkNoise|BenchmarkReplayFilter' -benchmem -benchtime=2s ./tunnel/ | tee -a benchmark.txt
+        run: >
+          go test -run XXX
+          -bench 'BenchmarkFrame|BenchmarkNoise|BenchmarkReplayFilter'
+          -benchmem -benchtime=2s
+          -cpuprofile cpu.prof -memprofile mem.prof
+          ./tunnel/ | tee -a benchmark.txt
 
-      - name: Upload benchmark results
+      - name: Generate flamegraph SVGs
+        if: always()
+        run: |
+          if [ -f cpu.prof ]; then
+            go tool pprof -svg -output flamegraph-cpu.svg cpu.prof
+          fi
+          if [ -f mem.prof ]; then
+            go tool pprof -svg -output flamegraph-mem.svg mem.prof
+          fi
+          if [ -f cpu-throughput.prof ]; then
+            go tool pprof -svg -output flamegraph-throughput.svg cpu-throughput.prof
+          fi
+
+      - name: Upload benchmark & profiling artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: benchmarks-${{ github.sha }}
-          path: benchmark.txt
+          path: |
+            benchmark.txt
+            cpu.prof
+            mem.prof
+            cpu-throughput.prof
+            flamegraph-cpu.svg
+            flamegraph-mem.svg
+            flamegraph-throughput.svg
           retention-days: 30

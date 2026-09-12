@@ -206,7 +206,7 @@ func readUDPFrame(t *testing.T, conn net.Conn, timeout time.Duration) []byte {
 	return append([]byte(nil), buf[:n]...)
 }
 
-func sealTestDataFrame(t *testing.T, sid uint32, seq uint64, payload []byte, send *NoiseCipherState) []byte {
+func sealTestDataFrame(t *testing.T, sid uint32, seq uint64, payload []byte, send *AEADCipherState) []byte {
 	t.Helper()
 	wire := SealFrameAEAD(&UDPCFrame{
 		Magic: UDPC_MAGIC_DEFAULT, Version: UDPC_VERSION, Cmd: CMD_DATA,

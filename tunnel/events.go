@@ -16,30 +16,44 @@ type eventBus[T any] struct {
 	dropped uint64 // events discarded because the queue was full
 	stopped atomic.Bool
 	wg      sync.WaitGroup
+
+	handlerOnce sync.Once // guards the consumer goroutine spawn
+	handlerMu   sync.RWMutex
+	handler     func(T)
 }
 
 func newEventBus[T any](capacity int) *eventBus[T] {
 	return &eventBus[T]{ch: make(chan T, capacity), stop: make(chan struct{})}
 }
 
-// setHandler starts (once) the single consumer goroutine that hands events to
-// h. Calling it again just swaps h; nil stops delivery (events still drain).
+// setHandler starts the single consumer goroutine (exactly once) and swaps the
+// handler function. Calling setHandler again replaces the active handler
+// without spawning additional goroutines; nil stops delivery.
 func (b *eventBus[T]) setHandler(h func(T)) {
-	b.wg.Add(1)
-	go func() {
-		defer b.wg.Done()
-		for {
-			select {
-			case ev := <-b.ch:
-				if h == nil {
-					continue
+	b.handlerMu.Lock()
+	b.handler = h
+	b.handlerMu.Unlock()
+
+	b.handlerOnce.Do(func() {
+		b.wg.Add(1)
+		go func() {
+			defer b.wg.Done()
+			for {
+				select {
+				case ev := <-b.ch:
+					b.handlerMu.RLock()
+					fn := b.handler
+					b.handlerMu.RUnlock()
+					if fn == nil {
+						continue
+					}
+					safeEventCall(fn, ev)
+				case <-b.stop:
+					return
 				}
-				safeEventCall(h, ev)
-			case <-b.stop:
-				return
 			}
-		}
-	}()
+		}()
+	})
 }
 
 func (b *eventBus[T]) emit(ev T) {

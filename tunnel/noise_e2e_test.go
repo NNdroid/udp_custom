@@ -88,24 +88,29 @@ func TestUDPCustom_Noise_E2E(t *testing.T) {
 	wire := SealFrameAEAD(dataFrame, clientNoise.SendCipher, msg)
 	cConn.Write(wire)
 
-	// Read ACK then the encrypted echo.
+	// Read frames from the server until we find the expected one. Keepalive
+	// PONGs or other control frames may arrive before the target ACK/DATA.
 	readFrame := func() *UDPCFrame {
 		t.Helper()
-		cConn.SetReadDeadline(time.Now().Add(2 * time.Second))
-		n, err := cConn.Read(respBuf)
-		if err != nil {
-			t.Fatalf("read: %v", err)
+		for {
+			cConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+			n, err := cConn.Read(respBuf)
+			if err != nil {
+				t.Fatalf("read: %v", err)
+			}
+			f, err := DecodeUDPCFrame(respBuf[:n], UDPC_MAGIC_DEFAULT)
+			if err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			plain, err := OpenFrameAEAD(f, clientNoise.RecvCipher)
+			if err != nil {
+				// Control frames from keepalive may use a different key
+				// context; skip them.
+				continue
+			}
+			f.Data = plain
+			return f
 		}
-		f, err := DecodeUDPCFrame(respBuf[:n], UDPC_MAGIC_DEFAULT)
-		if err != nil {
-			t.Fatalf("decode: %v", err)
-		}
-		plain, err := OpenFrameAEAD(f, clientNoise.RecvCipher)
-		if err != nil {
-			t.Fatalf("frame AEAD (cmd=%d): %v", f.Cmd, err)
-		}
-		f.Data = plain
-		return f
 	}
 	ack := readFrame()
 	if ack.Cmd != CMD_ACK || ack.Ack != 1 {

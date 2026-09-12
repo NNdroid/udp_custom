@@ -12,7 +12,8 @@
     "passwords": "Required non-empty list of pre-shared keys (PSKs); protocol v2 has no unauthenticated mode (aliases: token, psk)",
     "magic": "4-byte protocol magic header string (default: UDPC)",
     "privkey": "Noise Curve25519 static private key (generate with 'udp_custom gen-keys'). Sessions are ChaCha20-Poly1305 encrypted with the PSK even when empty; adding 'privkey' upgrades them to forward-secret Noise_NK keys (client must set matching 'pubkey').",
-    "log_level": "Logging verbosity: debug, info, warn, error"
+    "log_level": "Logging verbosity: debug, info, warn, error",
+    "max_pkt": "Largest v2 record (40-byte header + payload + 16-byte tag) this server puts on the wire, i.e. the UDP payload size. 0/absent = 1450, which produces a 1478-byte IPv4 datagram and assumes a 1500-byte path MTU. Lower it when the server sits behind a link with a smaller MTU (1420 is typical of WireGuard and similar tunnels), where IPv4 fragments are dropped and large frames stall while small ones keep working: 1200 survives any path with MTU >= 1248, 548 never fragments on IPv4. Values above 1450 are clamped. Lowering it on one side alone is always safe; the peer never needs reconfiguring."
   },
   "mode": "server",
   "listen": ":36712",
@@ -30,6 +31,7 @@
     "secret_psk_token_2"
   ],
   "receive_sockets": 4,
+  "max_pkt": 1450,
   "magic": "UDPC",
   "privkey": "",
   "log_level": "info"

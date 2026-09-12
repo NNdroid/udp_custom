@@ -75,6 +75,25 @@ type Config struct {
 	// SendWindow caps the number of DATA frames in flight awaiting an ACK
 	// before the target read loop blocks (backpressure). 0 = 256.
 	SendWindow int `json:"send_window"`
+
+	// MaxPkt is the largest v2 record (40-byte header + payload + 16-byte
+	// tag) this end puts on the wire, i.e. the UDP payload size. 0 or absent
+	// = 1450, which produces a 1478-byte IPv4 datagram and therefore assumes
+	// a 1500-byte path MTU. Lower it when the path runs through a tunnel with
+	// a smaller MTU (1420 is typical), where IPv4 fragments get dropped and
+	// large frames stall while small ones keep working: 1200 survives any
+	// path with an MTU >= 1248, 548 never fragments on IPv4. Values above
+	// 1450 are clamped — a bigger frame would be truncated by the peer.
+	MaxPkt int `json:"max_pkt"`
+
+	// MtuProbe enables automatic path probing (default true): the client
+	// converges on the largest record the path can carry right after the
+	// handshake and publishes it to the server, so neither end has to be
+	// configured for a narrow path. Set false only to pin MaxPkt verbatim
+	// (debugging, or a known and stable path MTU). Probing an old peer finds
+	// no answer and falls back to MaxPkt, so the default is safe during a
+	// mixed-version rollout.
+	MtuProbe *bool `json:"mtu_probe"`
 }
 
 func (c *Config) UnmarshalJSON(data []byte) error {
@@ -200,6 +219,8 @@ func runClientMode(cfg *Config, magicStr, lvl string, sendWindow int) {
 		Sockets:    cfg.Sockets,
 		Paths:      cfg.Paths,
 		SendWindow: sendWindow,
+		MaxPkt:     cfg.MaxPkt,
+		MtuProbe:   cfg.MtuProbe,
 	}
 
 	// Optional Noise_NK encryption, keyed by the server's static public key.
@@ -292,6 +313,8 @@ func runFromConfig(path string) {
 		PortRange:      cfg.PortRange,
 		AllowedTargets: cfg.AllowedTargets,
 		ReceiveSockets: cfg.ReceiveSockets,
+		MaxPkt:         cfg.MaxPkt,
+		MtuProbe:       cfg.MtuProbe,
 	}
 
 	srv, err := tunnel.NewServer(srvCfg)

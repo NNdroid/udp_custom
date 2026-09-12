@@ -64,6 +64,31 @@ type ClientConfig struct {
 	Paths      int // distinct remote ports to randomly pick from the range (<=0 = spread over the whole range per packet)
 	SendWindow int // frames in flight before backpressure (0 = 256)
 
+	// MaxPkt is the largest v2 RECORD this client puts on the wire: 40-byte
+	// header + payload + 16-byte authentication tag (the UDP payload size).
+	// 0 = 1450, the historical value. See ServerConfig.MaxPkt for the full
+	// rationale; in short: 1450 assumes a 1500-byte path MTU, and on a
+	// narrower path (1420 tunnels, for instance) the resulting IPv4 fragments
+	// are routinely dropped, which stalls large frames while small ones keep
+	// working. Lower it when the client's uplink has a smaller MTU. It only
+	// ever shrinks below the ceiling, so the server never needs to be
+	// reconfigured to accept a smaller frame.
+	//
+	// With MtuProbe enabled (the default) this value is the probe CEILING and
+	// the fallback when the probe finds no answer — not a value the operator
+	// has to get right.
+	MaxPkt int `json:"max_pkt"`
+
+	// MtuProbe enables automatic path probing: after the handshake (and
+	// before any DATA is encoded) the client walks a descending ladder of
+	// record sizes and converges on the largest one the path can carry, then
+	// publishes it to the server with a commit record. nil (field absent) =
+	// enabled. Set false to pin MaxPkt verbatim — for debugging, or when the
+	// path MTU is known and stable. Probing an OLD server silently finds no
+	// answer and falls back to MaxPkt, so the default is safe during a mixed
+	// -version rollout (it just costs the ladder walk on the first session).
+	MtuProbe *bool `json:"-"`
+
 	// Logger receives diagnostic output. When nil, the LogLevel string decides
 	// verbosity on the standard logger; an injected Logger wins over LogLevel
 	// entirely. Embedders wanting silence pass Nop.
@@ -78,6 +103,7 @@ type ClientConfig struct {
 type Client struct {
 	cfg    ClientConfig
 	magic  uint32
+	maxPkt int    // largest record we put on the wire (see ClientConfig.MaxPkt)
 	logger Logger // never nil after NewClient (tests may build bare literals)
 
 	dialer *SpreadDialer
@@ -92,6 +118,10 @@ type Client struct {
 	// to establish concurrently without sharing a global handshake lock.
 	ackMu       sync.Mutex
 	pendingAcks map[[clientNonceSize]byte]*pendingHandshake
+
+	// probeCache memoizes the MTU probe result for the server's path, so only
+	// the first session (or the first after the TTL) pays for the ladder walk.
+	probeCache *mtuProbeCache
 
 	// events delivers ClientEvent notifications to the embedder's handler on
 	// a dedicated goroutine (never on the receive path). nil bus = no events.
@@ -197,10 +227,16 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	logger := resolveLogger(cfg.Logger, cfg.LogLevel)
+	maxPkt := resolveMaxPkt(cfg.MaxPkt, logger)
+	logger.Infof("📏 [mtu] %s", describeMaxPkt(maxPkt))
+
 	return &Client{
 		cfg:         cfg,
 		magic:       cfg.Magic,
-		logger:      resolveLogger(cfg.Logger, cfg.LogLevel),
+		logger:      logger,
+		maxPkt:      maxPkt,
+		probeCache:  &mtuProbeCache{},
 		dialer:      dialer,
 		events:      newEventBus[ClientEvent](128),
 		pendingAcks: make(map[[clientNonceSize]byte]*pendingHandshake),
@@ -228,6 +264,15 @@ func (c *Client) logError(format string, args ...any) {
 		c.logger.Errorf(format, args...)
 	}
 }
+
+// maxPayload is the largest plaintext payload one DATA record may carry. A
+// Client built as a bare literal (maxPkt 0) falls back to the ceiling instead
+// of yielding a negative buffer size.
+func (c *Client) maxPayload() int { return effectivePayloadCap(c.maxPkt) }
+
+// maxPayload is the session's frame budget: the MTU probe converged it before
+// the pump started and it never changes for the session's lifetime.
+func (s *clientSession) maxPayload() int { return effectivePayloadCap(s.sendCap) }
 
 // Start blocks: it serves local applications until Close is called. This is
 // the CLI-facing mode; embedders that want single connections use DialTunnel.
@@ -376,13 +421,20 @@ func (c *Client) DialTunnel(ctx context.Context, opts DialOptions) (net.Conn, er
 		return newTunnelSession(appConn, r.sess), nil
 	case <-ctx.Done():
 		// The handshake may still be in flight; it cleans up after itself, and
-		// once it lands, closing both pipe ends tears any session down.
+		// once it lands, closing both pipe ends tears any session down. A
+		// bounded wait prevents the goroutine from leaking if the handshake
+		// path ever stops honouring the cancelled context.
 		go func() {
-			r := <-done
-			appConn.Close()
-			sessionConn.Close()
-			if r.err == nil && r.sess != nil {
-				r.sess.close()
+			select {
+			case r := <-done:
+				appConn.Close()
+				sessionConn.Close()
+				if r.err == nil && r.sess != nil {
+					r.sess.close()
+				}
+			case <-time.After(30 * time.Second):
+				appConn.Close()
+				sessionConn.Close()
 			}
 		}()
 		return nil, ctx.Err()
@@ -593,6 +645,18 @@ func (c *Client) dispatch(frame *UDPCFrame) {
 			SessionID: sess.sid, Data: append([]byte(nil), frame.Data...),
 		}
 		sess.sendControl(response, c.dialer.Send)
+	case CMD_MTU_PROBE_REPLY:
+		// frame.Data borrows the pooled decrypt buffer, which goes back to the
+		// pool when dispatch returns — the prober outlives this call, so hand
+		// it a copy. The channel is per-probe and buffered: a late or
+		// duplicate echo is dropped instead of blocking the receive loop.
+		if ch := sess.probeReply.Load(); ch != nil {
+			echo := append([]byte(nil), frame.Data...)
+			select {
+			case *ch <- echo:
+			default:
+			}
+		}
 	}
 }
 
@@ -631,15 +695,21 @@ func (c *Client) establish(ctx context.Context, target string, conn net.Conn) (*
 	}
 	sess.unackedCond = sync.NewCond(&sess.unackedMu)
 	c.sessions.Store(sid, sess)
+
+	// Converge the frame budget BEFORE any pump starts: a DATA frame encoded
+	// above the path's capability can never be re-chunked on retransmission,
+	// so the very first large write must already use the probed size.
+	c.convergeFrameBudget(ctx, sess)
+
 	c.logInfo("[Client] [Session 0x%08X] ✅ Tunnel established", sid)
 	c.events.emit(ClientEvent{Kind: TunnelEstablished, Session: sid, Detail: granted})
 
 	go func() {
 		defer c.sessions.Delete(sid)
-		defer conn.Close()
 		c.logDebug("[Client] [Session 0x%08X] pump loop exiting", sid)
 		sess.localToRemote()
 		sess.close()
+		// conn is closed inside sess.close(); no separate Close needed.
 	}()
 	go sess.retransmitLoop()
 	go sess.keepAliveLoop()
@@ -822,6 +892,19 @@ type clientSession struct {
 
 	rttEst *rttEstimator
 
+	// sendCap is the largest record this session may put on the wire: the MTU
+	// probe converges it right after the handshake and it never changes again
+	// (a retransmission reuses its exact encoded bytes, so the cap cannot be
+	// lowered under an in-flight frame). Zero = the ceiling (bare-literal
+	// sessions in tests).
+	sendCap int
+
+	// probeReply receives the COPY of an MTU probe echo handed over by
+	// dispatch. Written atomically by the probe goroutine (probeOnce) and read
+	// by the receive-loop goroutine (dispatch); safe because the pointer swap
+	// is ordered: Store before send, Load before deliver.
+	probeReply atomic.Pointer[chan []byte]
+
 	lastActive time.Time
 	lastSent   time.Time
 	mu         sync.Mutex
@@ -883,7 +966,7 @@ func (s *clientSession) localToRemote() {
 	// A short read deadline keeps a half-closed connection from pinning the
 	// session forever; a timeout is the marker for "no data right now". The
 	// deadline is refreshed at most once per second (see recvLoop).
-	buf := make([]byte, UDPC_MAX_DATA)
+	buf := make([]byte, s.maxPayload())
 	var deadline time.Time
 	for {
 		if s.isClosed() {
@@ -922,15 +1005,15 @@ func (s *clientSession) sendData(payload []byte) error {
 	if s.isClosed() {
 		return fmt.Errorf("session closed")
 	}
-	// A payload over UDPC_MAX_DATA cannot fit one frame: the AEAD seal would
-	// return nil and this method would previously fail with an opaque
+	// A payload over the frame budget cannot fit one record: the AEAD seal
+	// would return nil and this method would then fail with an opaque
 	// "failed to seal" AFTER a partial write had already been counted by the
 	// caller. Fail fast with an actionable error instead; the CLI pump never
-	// exceeds the budget (it reads at most UDPC_MAX_DATA), but library users
-	// writing arbitrary-sized buffers hit this constantly.
-	if len(payload) > UDPC_MAX_DATA {
-		return fmt.Errorf("payload of %d bytes exceeds UDPC_MAX_DATA (%d): chunk writes to %d bytes or smaller",
-			len(payload), UDPC_MAX_DATA, UDPC_MAX_DATA)
+	// exceeds the budget (it reads at most the frame budget), but library
+	// users writing arbitrary-sized buffers hit this constantly.
+	if cap := s.maxPayload(); len(payload) > cap {
+		return fmt.Errorf("payload of %d bytes exceeds the per-frame budget (%d with max_pkt=%d): chunk writes to %d bytes or smaller",
+			len(payload), cap, s.client.maxPkt, cap)
 	}
 
 	s.unackedMu.Lock()

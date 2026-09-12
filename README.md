@@ -133,6 +133,7 @@ Notes for embedders:
 | Packet-number exhaustion | 64-bit per-direction counters; the session dies before a nonce can repeat. Theoretical. |
 | Multi-threaded receive | ✅ Supported on Linux via `receive_sockets` (SO_REUSEPORT group, one read goroutine per socket, 4-tuple hash keeps per-session ordering). Other platforms are single-reader; `SO_REUSEPORT` on Windows/BSD has different semantics and is not attempted. |
 | origdst port mirroring | Linux only (`IP_RECVORIGDSTADDR`). On macOS, pf `rdr` state does the reply translation (see [Windows & macOS](#windows--macos-how-the-range-reaches-the-listen-port)); on Windows use single-port mode or the WSL2 + NetNat recipe. |
+| Path MTU discovery | ✅ **Automatic** (`mtu_probe`, default on): the client probes the path right after handshake and converges the frame budget before the first large write. On mixed-version rollouts the server must be upgraded first (older servers silently ignore `CMD_MTU_COMMIT` and fall back to the operator-set `max_pkt`). See [Automatic probing (`mtu_probe`)](#automatic-probing-mtu_probe-default-on). |
 
 ---
 
@@ -195,6 +196,83 @@ Keep `"mode": "client"` in the config.
 | `receive_sockets` | `int` | `1` | **Linux only.** Opens N UDP sockets sharing `listen` via `SO_REUSEPORT`, one read goroutine each — scales packet intake across cores. The kernel hashes the 4-tuple, so one client source socket always lands on the same receiver (per-session ordering preserved) while different clients spread across the group. 0/1 = single socket; non-Linux platforms clamp to 1 with a warning; hard cap 8. |
 | `sendsock_max` | `int` | `512` | Per-port reply-socket pool cap (LRU). One socket is bound per distinct origdst port so the kernel stamps the reply's source port correctly. Set it >= the size of `port_range`. |
 | `send_window` | `int` | `256` | Max DATA frames in flight awaiting an ACK. When the window is full the target read loop blocks (backpressure), bounding memory and the retransmit backlog for a slow or silent client. |
+| `max_pkt` | `int` | `1450` | Largest v2 record this end puts on the wire (40-byte header + payload + 16-byte tag), i.e. the UDP payload size. See [Frame size](#frame-size-max_pkt). |
+
+---
+
+## Frame size (`max_pkt`)
+
+A v2 record is `40 + PayloadLen + 16` bytes. How **large** that record may be is
+a deployment property, not a wire property: the path MTU decides it. The default
+`1450` produces a `1478`-byte IPv4 datagram (`1450 + 8` UDP `+ 20` IP) and
+therefore assumes a `1500`-byte path MTU. Every end logs its budget at startup:
+
+```text
+[INFO] 📏 [mtu] max_pkt=1450 payload=1394 -> IPv4 datagram 1478 B, IPv6 1498 B | 1500:ok 1492:ok 1420:over 1280:over 576:over
+```
+
+| Path MTU | `max_pkt=1450` | Symptom when it does not fit |
+| :--- | :--- | :--- |
+| 1500 (Ethernet) | ok, 22 bytes of headroom | — |
+| 1492 (PPPoE) | ok, 14 bytes of headroom | — |
+| 1420 (WireGuard and similar tunnels) | **over by 58** | fragmented in flight; IPv4 fragments are routinely dropped by CGNATs |
+| 1280 (IPv6 minimum) | **over** | IPv6 routers never fragment — the datagram is simply dropped |
+| 576 (IPv4 minimum) | **over by 902** | always fragmented |
+
+The failure mode is distinctive and easy to misdiagnose: **small frames work and
+large ones stall**. Worse, the ARQ cannot recover, because a retransmission must
+reuse the exact encoded bytes (same packet number, nonce, ciphertext and tag) —
+an oversized frame that is lost is resent oversized, forever, until the session
+gives up.
+
+Lower `max_pkt` when the path is narrower than 1500:
+
+| `max_pkt` | Payload | Survives |
+| :--- | :--- | :--- |
+| `1450` (default) | 1394 | any path with MTU >= 1478 |
+| `1200` | 1144 | any path with MTU >= 1228 (safe on the IPv6 minimum 1280) |
+| `548` | 492 | every IPv4 path, including the 576-byte minimum — never fragments |
+
+Two properties make this safe to roll out:
+
+1. **It only shrinks below the ceiling.** Receive buffers stay sized at `1450`,
+   so a peer that has *not* been reconfigured still receives every frame you
+   send. Lowering `max_pkt` on **one** side alone is always safe.
+2. **Values above `1450` are clamped with a warning** — a larger frame would be
+   silently truncated by the peer and then fail authentication.
+
+If the two ends disagree in the other direction (a peer configured larger than
+this end's buffer), the oversized datagram is now reported instead of vanishing:
+
+```text
+[WARN] [Recv] datagram from 1.2.3.4:51234 truncated at 1450 bytes (buffer 1450): the peer sends larger records than this end accepts — align max_pkt on both sides
+```
+
+There is **no handshake-level MTU field**: negotiation would break old peers
+(the SYN parser rejects trailing bytes). Instead the client probes the path
+after the handshake — see the next section.
+
+### Automatic probing (`mtu_probe`, default on)
+
+Right after the handshake — and before any DATA is encoded, because an
+in-flight oversized frame can never be re-chunked — the client walks a
+descending ladder of record sizes (`1450 → 1200 → 1000 → 800 → 548`) and sends
+an authenticated probe whose **payload length is the size under test**; the
+server echoes it byte for byte, so one round trip proves both directions. The
+converged size is published to the server with a commit record, which also
+releases the server's upstream pump (held until then, so no oversized frame is
+ever encoded against a narrow path).
+
+- Typical cost: one extra round trip on the first session (parallel with the
+  target dial), zero afterwards — the result is cached per server for 10
+  minutes and re-probed on reconnects.
+- A peer that does not implement probing (or `mtu_probe: false` on the server)
+  simply never answers: the client falls back to `max_pkt` after the ladder
+  walk, exactly today's behaviour. Safe during mixed-version rollouts, at the
+  cost of up to ~3s on the first session.
+- Set `mtu_probe: false` on the client to pin `max_pkt` verbatim.
+- The converged size is immutable for the session's lifetime; re-probing only
+  affects new sessions.
 
 ---
 

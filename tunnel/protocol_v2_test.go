@@ -181,7 +181,7 @@ func TestProtocolV2DirectionAndTranscriptKeySeparation(t *testing.T) {
 
 func TestProtocolV2EveryControlFrameIsAuthenticated(t *testing.T) {
 	key := [32]byte{4, 3, 2, 1}
-	cipher, err := newNoiseCipherState(key[:])
+	cipher, err := newAEADCipherState(key[:])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,11 +243,11 @@ func TestProtocolV2EveryControlFrameIsAuthenticated(t *testing.T) {
 
 func TestProtocolV2NoiseControlFrameUsesHeaderAAD(t *testing.T) {
 	key := bytes.Repeat([]byte{0x42}, 32)
-	sender, err := newNoiseCipherState(key)
+	sender, err := newAEADCipherState(key)
 	if err != nil {
 		t.Fatal(err)
 	}
-	receiver, err := newNoiseCipherState(key)
+	receiver, err := newAEADCipherState(key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -304,7 +304,7 @@ func TestProtocolV2ReplayedControlFrameCannotRefreshSession(t *testing.T) {
 
 func TestProtocolV2ClientRejectsForgedControlBeforeStateMutation(t *testing.T) {
 	recvKey := [32]byte{1, 3, 3, 7}
-	recvCipher, err := newNoiseCipherState(recvKey[:])
+	recvCipher, err := newAEADCipherState(recvKey[:])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -352,10 +352,10 @@ func TestProtocolV2ClientRejectsForgedControlBeforeStateMutation(t *testing.T) {
 	}
 }
 
-// mustCipher builds a NoiseCipherState from a raw key (test helper).
-func mustCipher(t *testing.T, key [32]byte) *NoiseCipherState {
+// mustCipher builds a AEADCipherState from a raw key (test helper).
+func mustCipher(t *testing.T, key [32]byte) *AEADCipherState {
 	t.Helper()
-	c, err := newNoiseCipherState(key[:])
+	c, err := newAEADCipherState(key[:])
 	if err != nil {
 		t.Fatal(err)
 	}

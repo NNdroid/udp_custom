@@ -27,6 +27,11 @@ type packetReader struct {
 	bufs   [][]byte    // recvBatch receive buffers, reused every call
 	oob    [][]byte    // linux: ancillary-data buffers (origdst); nil elsewhere
 	pkts   []udpPacket // result views into bufs
+
+	// truncLogAt throttles the "datagram larger than our buffer" warning: a
+	// truncated datagram is unauthenticated (any peer can trigger it), so the
+	// log rate must not be attacker controlled.
+	truncLogAt time.Time
 }
 
 // udpPacket is one received datagram: payload (borrowed), sender, and the
@@ -73,6 +78,13 @@ func (r *packetReader) next() ([]udpPacket, error) {
 			} else {
 				origPort = packetReaderOOBPort(r.oob[0][:oobn])
 			}
+			if msgFlags&msgTruncDataFlag != 0 {
+				// The peer sent more bytes than one record can hold. The tail
+				// is gone, so authentication can only fail — drop it here and
+				// say so, instead of reporting an opaque MAC failure.
+				r.warnTruncated(n, from)
+				return r.pkts[:0], nil
+			}
 		}
 	} else {
 		n, from, err = r.conn.ReadFromUDPAddrPort(r.bufs[0])
@@ -96,7 +108,11 @@ func (r *packetReader) next() ([]udpPacket, error) {
 				if msgFlags&msgTruncFlag != 0 {
 					origPort = 0
 				} else {
-					origPort = packetReaderOOBPort(r.oob[0][:oobn])
+					origPort = packetReaderOOBPort(r.oob[k][:oobn])
+				}
+				if msgFlags&msgTruncDataFlag != 0 {
+					r.warnTruncated(n, from)
+					continue // keep the slot for the next datagram
 				}
 			}
 		} else {
@@ -116,4 +132,21 @@ func (r *packetReader) next() ([]udpPacket, error) {
 		r.logger.Debugf("[Recv] burst drain: %d datagrams in one wakeup", k)
 	}
 	return r.pkts[:k], nil
+}
+
+// warnTruncated reports a datagram the kernel had to cut down to the receive
+// buffer — a peer sending records larger than this end's max_pkt. The bytes
+// are incomplete and unauthenticated, so this is the only signal an operator
+// gets; without it the packet simply fails MAC verification and vanishes.
+func (r *packetReader) warnTruncated(n int, from netip.AddrPort) {
+	if r.logger == nil {
+		return
+	}
+	now := time.Now()
+	if now.Sub(r.truncLogAt) < 5*time.Second {
+		return
+	}
+	r.truncLogAt = now
+	r.logger.Warnf("[Recv] datagram from %s truncated at %d bytes (buffer %d): the peer sends larger records than this end accepts — align max_pkt on both sides",
+		from, n, len(r.bufs[0]))
 }

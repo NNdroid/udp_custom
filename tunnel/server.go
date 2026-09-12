@@ -37,6 +37,34 @@ type ServerConfig struct {
 	SendSockMax int  `json:"sendsock_max"` // LRU cap for per-port reply sockets (0 = 512)
 	SendWindow  int  `json:"send_window"`  // max DATA frames in flight awaiting ACK (0 = 256)
 
+	// MaxPkt is the largest v2 RECORD this server puts on the wire: 40-byte
+	// header + payload + 16-byte authentication tag, i.e. the UDP payload
+	// size. 0 (or an absent field) = 1450, the historical value.
+	//
+	// Why it exists: 1450 produces a 1478-byte IPv4 datagram (1450 + 8 UDP +
+	// 20 IP) and therefore assumes a 1500-byte path MTU. On a link with a
+	// smaller MTU — 1420 is typical of WireGuard and similar tunnels — those
+	// datagrams are fragmented in flight and IPv4 fragments are routinely
+	// dropped by CGNATs, so small frames work while large ones stall. Lower
+	// it when the server sits behind such a path: 1200 survives every path
+	// with an MTU >= 1248, 548 never fragments on IPv4 at all.
+	//
+	// It may only shrink below the ceiling. Receive buffers keep the ceiling
+	// size, so lowering it on ONE side alone is always safe and never needs
+	// the peer to be reconfigured.
+	//
+	// With MtuProbe enabled (the default) this value is the probe ceiling and
+	// the fallback when no probe result arrives — not a value the operator
+	// has to get right.
+	MaxPkt int `json:"max_pkt"`
+
+	// MtuProbe enables answering the client's path probes (CMD_MTU_PROBE) and
+	// applying the converged size from CMD_MTU_COMMIT. nil (field absent) =
+	// enabled. Set false to make the server behave exactly as before probing
+	// existed: probes are dropped (clients fall back to their max_pkt) and
+	// the upstream pump starts ungated.
+	MtuProbe *bool `json:"-"`
+
 	// PortRange is the UDP port range the firewall DNATs onto ListenAddr. It
 	// is the single source of truth for the client port range: the server
 	// uses it at runtime to validate that every recovered original-destination
@@ -104,6 +132,7 @@ type Server struct {
 	conn           *net.UDPConn   // primary bound listener (also the fallback reply socket)
 	recvConns      []*net.UDPConn // SO_REUSEPORT receive group; recvConns[0] == conn
 	bindPort       int            // local port actually bound
+	maxPkt         int            // largest record we put on the wire (see ServerConfig.MaxPkt)
 	sockPool       *sendSockPool  // per-origdst-port reply sockets
 	origDstOK      bool           // IP_RECVORIGDSTADDR enabled & working
 	portRange      *PortRange     // configured client port range (DNAT target); nil = not set
@@ -169,6 +198,11 @@ func (s *Server) logWarn(format string, v ...interface{}) {
 func (s *Server) logError(format string, v ...interface{}) {
 	s.logger.Errorf(format, v...)
 }
+
+// maxPayload is the largest plaintext payload one DATA record may carry. A
+// Server built as a bare literal (maxPkt 0) falls back to the ceiling instead
+// of yielding a negative buffer size.
+func (s *Server) maxPayload() int { return effectivePayloadCap(s.maxPkt) }
 
 // ReplayFilter implements the per-direction 2048-packet sliding window used by
 // every established v2 frame. Packet number zero and packets older than the
@@ -300,6 +334,20 @@ type ServerSession struct {
 	recvSeq      uint64
 
 	rttEst *rttEstimator // adaptive RTO estimator (RFC 6298 + Karn's rule)
+
+	// maxPkt is this session's frame budget, set by the client's
+	// CMD_MTU_COMMIT after its path probe converges. Zero = no commit received
+	// yet, so the server's configured budget applies. It only ever shrinks the
+	// local value and never changes again once set.
+	maxPkt int
+
+	// mtuGate holds target->client traffic until the frame budget is known
+	// (commit received) or the client is clearly not probing (its first DATA
+	// arrived, or mtuCommitWait elapsed). Without the gate the server could
+	// encode an oversized frame in the pre-commit window and strand it: a
+	// retransmission reuses its exact encoded bytes and cannot be re-chunked.
+	mtuGate     chan struct{}
+	mtuGateOnce sync.Once
 
 	recvQueue map[uint64][]byte
 	recvMu    sync.Mutex
@@ -580,6 +628,12 @@ func newServer(cfg ServerConfig, dial TargetDialer, injected *net.UDPConn) (*Ser
 		}
 	}
 
+	// Record budget: how large a single v2 record may be on the wire. It
+	// only ever shrinks below the ceiling, so a peer that has not been
+	// reconfigured still receives everything we send.
+	maxPkt := resolveMaxPkt(cfg.MaxPkt, logger)
+	logger.Infof("📏 [mtu] %s", describeMaxPkt(maxPkt))
+
 	// Resolve the configured client port range (the firewall DNATs the whole
 	// range onto ListenAddr). This is the single source of truth used at
 	// runtime to validate incoming origdst ports and by the gen-* helpers as
@@ -599,6 +653,7 @@ func newServer(cfg ServerConfig, dial TargetDialer, injected *net.UDPConn) (*Ser
 		conn:         conn,
 		recvConns:    recvConns,
 		bindPort:     bindPort,
+		maxPkt:       maxPkt,
 		sockPool:     newSendSockPool(cfg.SendSockMax, func(format string, v ...interface{}) { logger.Warnf("[SockPool] "+format, v...) }),
 		origDstOK:    origDstOK,
 		portRange:    pr,
@@ -1011,6 +1066,7 @@ func (s *Server) handleHandshake(remoteAddr netip.AddrPort, frame *UDPCFrame, or
 		lastActive:    time.Now(),
 		closeChan:     make(chan struct{}),
 		rttEst:        newRTTEstimator(200*time.Millisecond, 200*time.Millisecond, 10*time.Second),
+		mtuGate:       make(chan struct{}),
 	}
 	sess.unackedCond = sync.NewCond(&sess.unackedMu)
 	s.sessions.Store(sid, sess)
@@ -1254,6 +1310,10 @@ func (sess *ServerSession) handleIncomingFrame(frame *UDPCFrame, remoteAddr neti
 		return false
 	}
 	if frame.Cmd == CMD_DATA {
+		// Client data proves the client is past its own probe phase (or never
+		// probed at all) — either way the frame budget question is settled for
+		// the target->client direction too.
+		sess.openMtuGate()
 		return sess.handleDataFromPath(frame, remoteAddr, origPort)
 	}
 
@@ -1278,8 +1338,49 @@ func (sess *ServerSession) handleIncomingFrame(frame *UDPCFrame, remoteAddr neti
 	case CMD_FIN:
 		sess.server.logInfo("[Session 0x%08X] Received FIN from client", sess.sessionID)
 		sess.Close()
+	case CMD_MTU_PROBE:
+		// Echo the probe byte for byte: the payload LENGTH is the size under
+		// test, and a successful round trip proves BOTH directions can carry
+		// it. The reply is a fresh authenticated record with its own packet
+		// number. Probing disabled = silent drop, the universal old-peer
+		// fallback contract.
+		if !mtuProbeEnabled(sess.server.cfg.MtuProbe) {
+			break
+		}
+		reply := &UDPCFrame{
+			Magic: sess.server.cfg.Magic, Version: UDPC_VERSION,
+			Cmd: CMD_MTU_PROBE_REPLY, SessionID: sess.sessionID,
+			Ack: sess.currentAck(), Data: append([]byte(nil), frame.Data...),
+		}
+		sess.sendControl(reply, func(data []byte) error { sess.sendToSession(data); return nil })
+	case CMD_MTU_COMMIT:
+		sess.applyMtuCommit(int(binary.BigEndian.Uint16(frame.Data)))
 	}
 	return true
+}
+
+// applyMtuCommit pins the session's frame budget to the size the client's
+// path probe converged on, releasing the upstream gate. The commit can only
+// shrink the local budget, and only the first one is honored — the client
+// sends a couple of identical copies back to back, so later ones are just
+// duplicates, and the budget is immutable once set.
+func (sess *ServerSession) applyMtuCommit(n int) {
+	sess.openMtuGate()
+	if sess.maxPkt > 0 {
+		return
+	}
+	if n < maxPktFloor {
+		n = maxPktFloor
+	}
+	if n > sess.server.maxPkt {
+		n = sess.server.maxPkt
+	}
+	if n == sess.server.maxPkt {
+		return // equals the configured budget: nothing to record
+	}
+	sess.maxPkt = n
+	sess.server.logInfo("[Session 0x%08X] 📏 [mtu] client committed %d-byte records (payload %d, configured %d)",
+		sess.sessionID, n, payloadCap(n), sess.server.maxPkt)
 }
 
 func (sess *ServerSession) sendPathChallenge(remoteAddr netip.AddrPort, origPort int) {
@@ -1566,10 +1667,10 @@ func (sess *ServerSession) sendData(payload []byte) error {
 	//
 	// Like the client side: oversized payloads fail fast with an actionable
 	// error instead of an opaque seal failure (the upstreamToUdpLoop reads at
-	// most UDPC_MAX_DATA, so this only guards custom dialers).
-	if len(payload) > UDPC_MAX_DATA {
-		return fmt.Errorf("payload of %d bytes exceeds UDPC_MAX_DATA (%d): chunk writes to %d bytes or smaller",
-			len(payload), UDPC_MAX_DATA, UDPC_MAX_DATA)
+	// most the frame budget, so this only guards custom dialers).
+	if budget := sess.maxPayload(); len(payload) > budget {
+		return fmt.Errorf("payload of %d bytes exceeds the per-frame budget (%d with max_pkt=%d): chunk writes to %d bytes or smaller",
+			len(payload), budget, sess.server.maxPkt, budget)
 	}
 	sess.unackedMu.Lock()
 	for len(sess.unacked) >= sess.server.sendWindow && atomic.LoadInt32(&sess.closed) == 0 {
@@ -1622,7 +1723,8 @@ func (sess *ServerSession) sendData(payload []byte) error {
 // chunk the next Read returns.
 func (sess *ServerSession) upstreamToUdpLoop() {
 	defer sess.Close()
-	buf := make([]byte, UDPC_MAX_DATA)
+	sess.awaitMtuGate()
+	buf := make([]byte, sess.server.maxPayload())
 	for {
 		if atomic.LoadInt32(&sess.closed) == 1 {
 			return
@@ -1636,7 +1738,75 @@ func (sess *ServerSession) upstreamToUdpLoop() {
 		}
 		if n > 0 {
 			sess.touch()
-			sess.sendData(buf[:n])
+			sess.forwardUpstream(buf[:n])
+		}
+	}
+}
+
+// awaitMtuGate blocks until the session's frame budget is known (the client's
+// commit record), the client proves it is not probing (its first DATA), or the
+// bounded wait expires. Without it the server could encode target data at the
+// configured budget in the pre-commit window and strand it on a narrow path.
+// Disabled probing skips the wait entirely — legacy behaviour.
+func (sess *ServerSession) awaitMtuGate() {
+	if sess.mtuGate == nil || !mtuProbeEnabled(sess.server.cfg.MtuProbe) {
+		return
+	}
+	select {
+	case <-sess.mtuGate:
+	case <-sess.closeChan:
+		return
+	case <-time.After(mtuCommitWait):
+		sess.server.logWarn("[Session 0x%08X] no mtu commit within %v: starting the target pump at max_pkt=%d",
+			sess.sessionID, mtuCommitWait, sess.server.maxPkt)
+	}
+	if atomic.LoadInt32(&sess.closed) == 1 {
+		sess.server.logDebug("[Session 0x%08X] closed while waiting for the mtu gate", sess.sessionID)
+	}
+}
+
+// openMtuGate releases the upstream pump exactly once.
+func (sess *ServerSession) openMtuGate() {
+	if sess.mtuGate == nil {
+		return
+	}
+	sess.mtuGateOnce.Do(func() { close(sess.mtuGate) })
+}
+
+// maxPayload is the session's frame budget: whatever the client committed,
+// capped by what this server is configured to send.
+func (sess *ServerSession) maxPayload() int {
+	budget := sess.server.maxPayload()
+	if sess.maxPkt > 0 {
+		if p := payloadCap(sess.maxPkt); p < budget {
+			budget = p
+		}
+	}
+	return budget
+}
+
+// forwardUpstream ships one target read into the tunnel under the session's
+// frame budget. A TCP target is a byte stream, so an oversized read is simply
+// split across records; a UDP datagram cannot be split without breaking its
+// end-to-end boundary, so an oversized one is dropped with a warning — on a
+// path that narrow it could not have been delivered intact anyway.
+func (sess *ServerSession) forwardUpstream(chunk []byte) {
+	if len(chunk) <= sess.maxPayload() {
+		_ = sess.sendData(chunk)
+		return
+	}
+	if sess.targetNetwork != "tcp" {
+		sess.server.logWarn("[Session 0x%08X] dropping %d-byte target datagram: exceeds the %d-byte frame budget (narrow path)",
+			sess.sessionID, len(chunk), sess.maxPayload())
+		return
+	}
+	for off := 0; off < len(chunk); off += sess.maxPayload() {
+		end := off + sess.maxPayload()
+		if end > len(chunk) {
+			end = len(chunk)
+		}
+		if err := sess.sendData(chunk[off:end]); err != nil {
+			return
 		}
 	}
 }

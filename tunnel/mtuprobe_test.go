@@ -74,8 +74,8 @@ func TestMtuLadderFor(t *testing.T) {
 type fakeProbeServer struct {
 	conn      *net.UDPConn
 	keys      *FrameKeys // SERVER-side ciphers: what a real server would seal with
-	maxRecord int        // largest record size it will echo; 0 = never answer
-	silence   bool       // drop everything (the old-peer fallback contract)
+	maxRecord atomic.Int32 // largest record size it will echo; 0 = never answer
+	silence   atomic.Bool  // drop everything (the old-peer fallback contract)
 
 	commitsMu sync.Mutex
 	commits   []int
@@ -130,7 +130,7 @@ func (f *fakeProbeServer) loop() {
 				f.commitsMu.Unlock()
 			}
 		case CMD_MTU_PROBE:
-			if f.silence || len(plain)+UDPC_HDR_SIZE+UDPC_TRAILER_SIZE > f.maxRecord {
+			if f.silence.Load() || len(plain)+UDPC_HDR_SIZE+UDPC_TRAILER_SIZE > int(f.maxRecord.Load()) {
 				continue // no answer: the size under test does not fit the path
 			}
 			reply := &UDPCFrame{
@@ -244,7 +244,7 @@ func TestProbePathConvergesOnLargestAnsweredSize(t *testing.T) {
 	withFastProbing(t)
 	pk := newProberKeyPair(t)
 	fake := newFakeProbeServer(t, pk.server)
-	fake.maxRecord = 1250 // 1450 must go unanswered, 1200 must succeed
+	fake.maxRecord.Store(1250) // 1450 must go unanswered, 1200 must succeed
 
 	_, sess := newProberRig(t, fake, pk)
 	if got := probePath(context.Background(), sess); got != 1200 {
@@ -256,7 +256,7 @@ func TestProbePathFallsBackWhenNothingIsAnswered(t *testing.T) {
 	withFastProbing(t)
 	pk := newProberKeyPair(t)
 	fake := newFakeProbeServer(t, pk.server)
-	fake.silence = true // the old-peer contract: unknown commands are dropped
+	fake.silence.Store(true) // the old-peer contract: unknown commands are dropped
 
 	_, sess := newProberRig(t, fake, pk)
 	if got := probePath(context.Background(), sess); got != 0 {
@@ -319,8 +319,8 @@ func TestUpstreamGateHoldsUntilCommit(t *testing.T) {
 	if !rig.deliverWireData(commit, rig.clientAddr) {
 		t.Fatal("commit frame rejected")
 	}
-	if rig.sess.maxPkt != commitSize {
-		t.Fatalf("session maxPkt = %d, want %d", rig.sess.maxPkt, commitSize)
+	if rig.sess.maxPkt.Load() != commitSize {
+		t.Fatalf("session maxPkt = %d, want %d", rig.sess.maxPkt.Load(), commitSize)
 	}
 
 	largest, total := 0, 0
@@ -350,7 +350,7 @@ func TestUpstreamGateHoldsUntilCommit(t *testing.T) {
 func TestUpstreamSplitsOversizedTcpChunks(t *testing.T) {
 	rig := newTestRig(t, false)
 	rig.sess.mtuGate = make(chan struct{})
-	rig.sess.maxPkt = 300 // as if a commit had arrived
+	rig.sess.maxPkt.Store(300) // as if a commit had arrived
 	rig.sess.openMtuGate()
 
 	go rig.sess.upstreamToUdpLoop()

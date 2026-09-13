@@ -339,7 +339,7 @@ type ServerSession struct {
 	// CMD_MTU_COMMIT after its path probe converges. Zero = no commit received
 	// yet, so the server's configured budget applies. It only ever shrinks the
 	// local value and never changes again once set.
-	maxPkt int
+	maxPkt atomic.Int32
 
 	// mtuGate holds target->client traffic until the frame budget is known
 	// (commit received) or the client is clearly not probing (its first DATA
@@ -1366,7 +1366,7 @@ func (sess *ServerSession) handleIncomingFrame(frame *UDPCFrame, remoteAddr neti
 // duplicates, and the budget is immutable once set.
 func (sess *ServerSession) applyMtuCommit(n int) {
 	sess.openMtuGate()
-	if sess.maxPkt > 0 {
+	if sess.maxPkt.Load() > 0 {
 		return
 	}
 	if n < maxPktFloor {
@@ -1378,7 +1378,7 @@ func (sess *ServerSession) applyMtuCommit(n int) {
 	if n == sess.server.maxPkt {
 		return // equals the configured budget: nothing to record
 	}
-	sess.maxPkt = n
+	sess.maxPkt.Store(int32(n))
 	sess.server.logInfo("[Session 0x%08X] 📏 [mtu] client committed %d-byte records (payload %d, configured %d)",
 		sess.sessionID, n, payloadCap(n), sess.server.maxPkt)
 }
@@ -1777,8 +1777,8 @@ func (sess *ServerSession) openMtuGate() {
 // capped by what this server is configured to send.
 func (sess *ServerSession) maxPayload() int {
 	budget := sess.server.maxPayload()
-	if sess.maxPkt > 0 {
-		if p := payloadCap(sess.maxPkt); p < budget {
+	if mp := int(sess.maxPkt.Load()); mp > 0 {
+		if p := payloadCap(mp); p < budget {
 			budget = p
 		}
 	}

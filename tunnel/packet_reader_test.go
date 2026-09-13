@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // truncCaptureLogger records Warnf calls so tests can assert on the MSG_TRUNC
@@ -134,6 +135,8 @@ func TestPacketReaderDrainSkipsTruncated(t *testing.T) {
 	good := []byte("drain-me")
 	truncSend(t, cli, r, good)
 	truncSend(t, cli, r, oversized())
+	// Give the kernel time to buffer both datagrams before next() drains.
+	time.Sleep(50 * time.Millisecond)
 
 	pkts, err := r.next()
 	if err != nil {
@@ -176,6 +179,8 @@ func TestPacketReaderDrainParsesOwnAncillarySlot(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		truncSend(t, cli, r, payload)
 	}
+	// Give the kernel time to buffer all three datagrams before next() drains.
+	time.Sleep(50 * time.Millisecond)
 
 	pkts, err := r.next()
 	if err != nil {

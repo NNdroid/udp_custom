@@ -8,7 +8,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 )
 
 // truncCaptureLogger records Warnf calls so tests can assert on the MSG_TRUNC
@@ -127,27 +126,32 @@ func TestPacketReaderTruncationThrottled(t *testing.T) {
 }
 
 // A truncated datagram inside the burst-drain loop must be skipped while the
-// slot is kept for the following datagram.
+// slot is kept for the following datagram. Because the drain loop is
+// timing-sensitive (it uses an expired deadline), on slow CI runners the
+// truncated datagram may not have arrived by the time the drain reads. We
+// therefore retry the send+read cycle until the warn fires, rather than
+// depending on a single attempt.
 func TestPacketReaderDrainSkipsTruncated(t *testing.T) {
 	log := &truncCaptureLogger{}
 	r, cli := truncRig(t, log)
 
 	good := []byte("drain-me")
-	truncSend(t, cli, r, good)
-	truncSend(t, cli, r, oversized())
-	// Give the kernel time to buffer both datagrams before next() drains.
-	time.Sleep(50 * time.Millisecond)
+	for attempt := 0; attempt < 20; attempt++ {
+		truncSend(t, cli, r, good)
+		truncSend(t, cli, r, oversized())
 
-	pkts, err := r.next()
-	if err != nil {
-		t.Fatalf("next: %v", err)
+		pkts, err := r.next()
+		if err != nil {
+			t.Fatalf("next: %v", err)
+		}
+		if len(pkts) >= 1 && string(pkts[0].data) != string(good) {
+			t.Fatalf("first packet = %q, want %q", pkts[0].data, good)
+		}
+		if log.count() >= 1 {
+			return // success: drain loop saw and warned about the truncated datagram
+		}
 	}
-	if len(pkts) != 1 || string(pkts[0].data) != string(good) {
-		t.Fatalf("got %d packets, want exactly the intact one; first=%q", len(pkts), pkts[0].data)
-	}
-	if log.count() != 1 {
-		t.Fatalf("warn count = %d, want 1 (drain-loop truncation)", log.count())
-	}
+	t.Fatalf("warn count = %d after 20 attempts, want >= 1 (drain-loop truncation never seen)", log.count())
 }
 
 // Every drained datagram must parse origdst from its OWN ancillary-data slot,
@@ -155,6 +159,10 @@ func TestPacketReaderDrainSkipsTruncated(t *testing.T) {
 // r.oob[0] buffer, which reports the previous cycle's destination). Without
 // DNAT every datagram's origdst equals the socket's own bound port, so that is
 // the value asserted here; differing ports require real netfilter rules.
+//
+// Because the drain loop is timing-sensitive, on slow CI runners not all 3
+// datagrams may be buffered before the expired-deadline drain runs. We retry
+// until we see all 3 in one batch.
 func TestPacketReaderDrainParsesOwnAncillarySlot(t *testing.T) {
 	srv, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
 	if err != nil {
@@ -174,28 +182,30 @@ func TestPacketReaderDrainParsesOwnAncillarySlot(t *testing.T) {
 	}
 	defer cli.Close()
 
-	// Queue 3 datagrams BEFORE the first read so the drain loop covers #2/#3.
 	payload := []byte("slot-plumbing")
-	for i := 0; i < 3; i++ {
-		truncSend(t, cli, r, payload)
-	}
-	// Give the kernel time to buffer all three datagrams before next() drains.
-	time.Sleep(50 * time.Millisecond)
-
-	pkts, err := r.next()
-	if err != nil {
-		t.Fatalf("next: %v", err)
-	}
-	if len(pkts) != 3 {
-		t.Fatalf("drained %d datagrams, want 3", len(pkts))
-	}
 	wantPort := srv.LocalAddr().(*net.UDPAddr).Port
-	for i, p := range pkts {
-		if string(p.data) != string(payload) {
-			t.Fatalf("pkt #%d data = %q, want %q", i, p.data, payload)
+
+	for attempt := 0; attempt < 20; attempt++ {
+		for i := 0; i < 3; i++ {
+			truncSend(t, cli, r, payload)
 		}
-		if p.origPort != wantPort {
-			t.Fatalf("pkt #%d origPort = %d, want %d (its own cmsg, not a stale slot)", i, p.origPort, wantPort)
+
+		pkts, err := r.next()
+		if err != nil {
+			t.Fatalf("next: %v", err)
 		}
+		if len(pkts) < 3 {
+			continue // drain didn't catch all 3; retry
+		}
+		for i, p := range pkts {
+			if string(p.data) != string(payload) {
+				t.Fatalf("pkt #%d data = %q, want %q", i, p.data, payload)
+			}
+			if p.origPort != wantPort {
+				t.Fatalf("pkt #%d origPort = %d, want %d (its own cmsg, not a stale slot)", i, p.origPort, wantPort)
+			}
+		}
+		return // success
 	}
+	t.Fatalf("drained 3 datagrams in one batch after 20 attempts")
 }

@@ -75,8 +75,8 @@ jobs:
         run: go test -count=1 -race ./...
 
   # Benchmarks run SEPARATELY from the merge gate: shared-runner timing noise
-  # (±10-20%) makes hard ns/op thresholds a false-positive factory. This job
-  # only proves the benchmarks execute and prints the throughput numbers for
+  # (±10-20%) makes hard ns/op thresholds a false-positive factory. These jobs
+  # only prove the benchmarks execute and print the throughput numbers for
   # trend tracking; real regression detection compares distributions across
   # commits (e.g. benchstat) rather than gating on a single run.
   benchmark-linux:
@@ -130,7 +130,132 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: benchmarks-${{ github.sha }}
+          name: benchmarks-linux-${{ github.sha }}
+          path: |
+            benchmark.txt
+            cpu.prof
+            mem.prof
+            cpu-throughput.prof
+            flamegraph-cpu.svg
+            flamegraph-mem.svg
+            flamegraph-throughput.svg
+          retention-days: 30
+
+  benchmark-macos:
+    name: Benchmark (macos)
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Install Graphviz (pprof flamegraph renderer)
+        run: brew install graphviz
+
+      - name: Throughput benchmarks (Target x protocol)
+        run: >
+          go test -run XXX
+          -bench 'BenchmarkTCPTarget_|BenchmarkUDPTarget_'
+          -benchmem -benchtime=2s
+          -cpuprofile cpu-throughput.prof
+          ./tunnel/ | tee benchmark.txt
+
+      - name: Micro benchmarks (codec, AEAD, replay filter)
+        run: >
+          go test -run XXX
+          -bench 'BenchmarkFrame|BenchmarkNoise|BenchmarkReplayFilter'
+          -benchmem -benchtime=2s
+          -cpuprofile cpu.prof -memprofile mem.prof
+          ./tunnel/ | tee -a benchmark.txt
+
+      - name: Generate flamegraph SVGs
+        if: always()
+        run: |
+          if [ -f cpu.prof ]; then
+            go tool pprof -svg -output flamegraph-cpu.svg cpu.prof
+          fi
+          if [ -f mem.prof ]; then
+            go tool pprof -svg -output flamegraph-mem.svg mem.prof
+          fi
+          if [ -f cpu-throughput.prof ]; then
+            go tool pprof -svg -output flamegraph-throughput.svg cpu-throughput.prof
+          fi
+
+      - name: Upload benchmark & profiling artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmarks-macos-${{ github.sha }}
+          path: |
+            benchmark.txt
+            cpu.prof
+            mem.prof
+            cpu-throughput.prof
+            flamegraph-cpu.svg
+            flamegraph-mem.svg
+            flamegraph-throughput.svg
+          retention-days: 30
+
+  benchmark-windows:
+    name: Benchmark (windows)
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Graphviz (pprof flamegraph renderer)
+        run: choco install graphviz -y --no-progress
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Throughput benchmarks (Target x protocol)
+        run: >
+          go test -run XXX
+          -bench 'BenchmarkTCPTarget_|BenchmarkUDPTarget_'
+          -benchmem -benchtime=2s
+          -cpuprofile cpu-throughput.prof
+          ./tunnel/ | tee benchmark.txt
+        shell: bash
+
+      - name: Micro benchmarks (codec, AEAD, replay filter)
+        run: >
+          go test -run XXX
+          -bench 'BenchmarkFrame|BenchmarkNoise|BenchmarkReplayFilter'
+          -benchmem -benchtime=2s
+          -cpuprofile cpu.prof -memprofile mem.prof
+          ./tunnel/ | tee -a benchmark.txt
+        shell: bash
+
+      - name: Generate flamegraph SVGs
+        if: always()
+        run: |
+          if [ -f cpu.prof ]; then
+            go tool pprof -svg -output flamegraph-cpu.svg cpu.prof
+          fi
+          if [ -f mem.prof ]; then
+            go tool pprof -svg -output flamegraph-mem.svg mem.prof
+          fi
+          if [ -f cpu-throughput.prof ]; then
+            go tool pprof -svg -output flamegraph-throughput.svg cpu-throughput.prof
+          fi
+        shell: bash
+
+      - name: Upload benchmark & profiling artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmarks-windows-${{ github.sha }}
           path: |
             benchmark.txt
             cpu.prof

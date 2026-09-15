@@ -6,17 +6,17 @@ import (
 	"testing"
 )
 
-func newTestCipherStates(t *testing.T) (send, recv *NoiseCipherState, key []byte) {
+func newTestCipherStates(t *testing.T) (send, recv *AEADCipherState, key []byte) {
 	t.Helper()
 	key = make([]byte, 32)
 	if _, err := rand.Read(key); err != nil {
 		t.Fatalf("rand key: %v", err)
 	}
-	send, err := newNoiseCipherState(key)
+	send, err := newAEADCipherState(key)
 	if err != nil {
 		t.Fatalf("cipher state: %v", err)
 	}
-	recv, err = newNoiseCipherState(key)
+	recv, err = newAEADCipherState(key)
 	if err != nil {
 		t.Fatalf("cipher state: %v", err)
 	}
@@ -113,10 +113,10 @@ func TestNoiseKeySeparation(t *testing.T) {
 	rand.Read(kC2S)
 	rand.Read(kS2C)
 
-	clientSend, _ := newNoiseCipherState(kC2S)
-	serverRecv, _ := newNoiseCipherState(kC2S)
-	serverSend, _ := newNoiseCipherState(kS2C)
-	clientRecv, _ := newNoiseCipherState(kS2C)
+	clientSend, _ := newAEADCipherState(kC2S)
+	serverRecv, _ := newAEADCipherState(kC2S)
+	serverSend, _ := newAEADCipherState(kS2C)
+	clientRecv, _ := newAEADCipherState(kS2C)
 
 	ct := clientSend.Encrypt(1, []byte("c2s"), nil)
 	if got, err := serverRecv.Decrypt(1, ct, nil); err != nil || string(got) != "c2s" {

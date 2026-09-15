@@ -19,3 +19,9 @@ func newPacketReaderOOB(n int) [][]byte {
 // msgTruncFlag is syscall.MSG_CTRUNC — kept here (platform file) because the
 // Windows syscall package does not define it and packet_reader is shared.
 const msgTruncFlag = syscall.MSG_CTRUNC
+
+// msgTruncDataFlag is MSG_TRUNC: set in the recvmsg flags when the DATAGRAM
+// itself did not fit the buffer (as opposed to its control data). It means
+// the peer sent a record larger than this end's frame budget, so the tail is
+// gone and authentication can only fail — see packetReader.warnTruncated.
+const msgTruncDataFlag = syscall.MSG_TRUNC

@@ -18,8 +18,9 @@ import (
 //
 // The client→target direction preserves boundaries (each DATA frame becomes one
 // TCP write), but the target→client direction does not: the server reads the
-// target socket in UDPC_MAX_PKT-sized chunks and ships each chunk as its own
-// DATA frame, so a reply may arrive split or coalesced regardless of how it was
+// target socket in one-record-sized chunks (see ServerConfig.MaxPkt) and ships
+// each chunk as its own DATA frame, so a reply may arrive split or coalesced
+// regardless of how it was
 // written. TCP itself never preserves write boundaries either, so there is
 // nothing the server could do to fix this — framing is an application concern.
 //

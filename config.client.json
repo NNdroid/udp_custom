@@ -11,7 +11,8 @@
     "sockets": "Local UDP sockets for n:n client-side spreading (1 = single local socket, packets still spread across the remote port range). The client opens this many local sockets and spreads across the remote port range, producing up to sockets x range independent NAT mappings. 32 matches the recommended server-side path count.",
     "paths": "Number of DISTINCT remote ports the client randomly picks from the server's port range for the whole session (the client is the source of truth; the server mirrors each back via origdst). 0 = spread every packet across the ENTIRE range (original behaviour). 32 pins a fixed 32-port subset, which bounds the server's per-port reply-socket pool and the number of independent NAT mappings. Must be <= the size of the server's port_range.",
     "send_window": "Max DATA frames in flight before backpressure (0 = 256)",
-    "log_level": "Logging verbosity: debug, info, warn, error"
+    "log_level": "Logging verbosity: debug, info, warn, error",
+    "max_pkt": "Largest v2 record (40-byte header + payload + 16-byte tag) this client puts on the wire, i.e. the UDP payload size. 0/absent = 1450, which produces a 1478-byte IPv4 datagram and assumes a 1500-byte path MTU. Lower it when the uplink has a smaller MTU (1420 tunnels, PPPoE plus a tunnel, ...), where IPv4 fragments are dropped and large frames stall while small ones keep working: 1200 survives any path with MTU >= 1248, 548 never fragments on IPv4. Values above 1450 are clamped. Lowering it here alone is safe; the server accepts a smaller frame without reconfiguration."
   },
   "mode": "client",
   "listen": "127.0.0.1:1080",
@@ -25,5 +26,6 @@
   "sockets": 32,
   "paths": 32,
   "send_window": 256,
+  "max_pkt": 1450,
   "log_level": "info"
 }

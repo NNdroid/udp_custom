@@ -26,11 +26,11 @@ type testRig struct {
 	targetBu bytes.Buffer
 
 	// Client-side mirrors of the session cipher pair (non-nil when noise is
-	// on). NoiseCipherState is stateless (nonce = PacketNo), so the
+	// on). AEADCipherState is stateless (nonce = PacketNo), so the
 	// session and the test client safely share the same key material via
 	// separate state objects.
-	clientSend *NoiseCipherState // encrypts what the session's RecvCipher opens
-	clientRecv *NoiseCipherState // opens what the session's SendCipher seals
+	clientSend *AEADCipherState // encrypts what the session's RecvCipher opens
+	clientRecv *AEADCipherState // opens what the session's SendCipher seals
 	clientKeys *FrameKeys
 }
 

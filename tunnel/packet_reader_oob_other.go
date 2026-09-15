@@ -9,3 +9,7 @@ func newPacketReaderOOB(n int) [][]byte { return nil }
 // msgTruncFlag is unused outside Linux (the reader has no OOB buffers there);
 // it exists so the shared packet reader compiles on every platform.
 const msgTruncFlag = 0
+
+// msgTruncDataFlag is unused outside Linux: those platforms take the plain
+// read path, which cannot report truncation.
+const msgTruncDataFlag = 0

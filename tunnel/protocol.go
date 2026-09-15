@@ -30,6 +30,17 @@ const (
 	CMD_PATH_CHALLENGE = uint8(0x08)
 	CMD_PATH_RESPONSE  = uint8(0x09)
 
+	// Transport-probing records (see MTU_PROBE_DESIGN.md). They let the two
+	// ends converge on the largest record the current path can carry BEFORE
+	// the first DATA frame is encoded: a retransmission must reuse its exact
+	// encoded bytes, so an oversized frame can never be re-chunked. Old peers
+	// reject these command numbers in decode (before authentication) and drop
+	// them silently, which is the fallback contract: probing then times out
+	// and both ends keep their configured max_pkt.
+	CMD_MTU_PROBE       = uint8(0x0A)
+	CMD_MTU_PROBE_REPLY = uint8(0x0B)
+	CMD_MTU_COMMIT      = uint8(0x0C)
+
 	// Magic(4)+Version(1)+Cmd(1)+Flags(2)+SessionID(4)+PacketNo(8)+
 	// Seq(8)+Ack(8)+Window(2)+PayloadLen(2), followed by payload and a fixed
 	// 16-byte authentication tag.
@@ -57,6 +68,13 @@ const (
 	// TargetMaxLen bounds a requested/granted endpoint string. Generous: even
 	// "tcp://very-long-hostname.example.internal:65535" is far below it.
 	TargetMaxLen = 255
+
+	// MTU-probe shapes. A probe payload is probeID[8] zero-padded to the size
+	// under test, so its LENGTH is the information being probed; the reply
+	// echoes it byte for byte. A commit carries the converged record size as
+	// one big-endian uint16.
+	mtuProbeIDSize = 8
+	mtuCommitSize  = 2
 )
 
 // UDPCFrame represents a single protocol packet frame.
@@ -150,7 +168,7 @@ func putFireAndForgetBuf(wire []byte) {
 // sealControlFrameAEAD seals a control frame (ACK/PING/PONG/FIN or a small
 // path-validation token, PacketNo already assigned) into a pooled buffer. The
 // returned slice is only valid until putFireAndForgetBuf is called with it.
-func sealControlFrameAEAD(f *UDPCFrame, c *NoiseCipherState) []byte {
+func sealControlFrameAEAD(f *UDPCFrame, c *AEADCipherState) []byte {
 	wire := getFireAndForgetBuf()
 	wire = wire[:UDPC_HDR_SIZE+len(f.Data)+UDPC_TRAILER_SIZE]
 	n := sealFrameAEADInto(wire, f, c, f.Data)
@@ -213,8 +231,8 @@ func VerifyFrameAuth(wire []byte, key *[32]byte) error {
 // material (PSK-derived vs forward-secret) — a PSK leak never enables
 // forgery, but unlike Noise it does expose past traffic.
 type FrameKeys struct {
-	Send *NoiseCipherState
-	Recv *NoiseCipherState
+	Send *AEADCipherState
+	Recv *AEADCipherState
 }
 
 type PSKHandshakeKeys struct {
@@ -274,11 +292,11 @@ func DerivePSKSessionKeys(psk string, clientNonce [clientNonceSize]byte, serverN
 // ClientFrameCiphers builds the client-side FrameKeys: the client seals with
 // C2S and opens with S2C.
 func (k PSKSessionKeys) ClientFrameCiphers() (*FrameKeys, error) {
-	send, err := newNoiseCipherState(k.C2S[:])
+	send, err := newAEADCipherState(k.C2S[:])
 	if err != nil {
 		return nil, err
 	}
-	recv, err := newNoiseCipherState(k.S2C[:])
+	recv, err := newAEADCipherState(k.S2C[:])
 	if err != nil {
 		return nil, err
 	}
@@ -288,11 +306,11 @@ func (k PSKSessionKeys) ClientFrameCiphers() (*FrameKeys, error) {
 // ServerFrameCiphers builds the server-side FrameKeys: the server seals with
 // S2C and opens with C2S.
 func (k PSKSessionKeys) ServerFrameCiphers() (*FrameKeys, error) {
-	send, err := newNoiseCipherState(k.S2C[:])
+	send, err := newAEADCipherState(k.S2C[:])
 	if err != nil {
 		return nil, err
 	}
-	recv, err := newNoiseCipherState(k.C2S[:])
+	recv, err := newAEADCipherState(k.C2S[:])
 	if err != nil {
 		return nil, err
 	}
@@ -375,7 +393,7 @@ func parseUDPCFrame(buf []byte, expectedMagic uint32, dst *UDPCFrame) error {
 }
 
 func validUDPCCommand(cmd uint8) bool {
-	return cmd >= CMD_HANDSHAKE_SYN && cmd <= CMD_PATH_RESPONSE
+	return cmd >= CMD_HANDSHAKE_SYN && cmd <= CMD_MTU_COMMIT
 }
 
 func validSessionFrameShape(frame *UDPCFrame) bool {
@@ -389,6 +407,10 @@ func validSessionFrameShape(frame *UDPCFrame) bool {
 		return frame.Seq == 0 && len(frame.Data) == 0
 	case CMD_PATH_CHALLENGE, CMD_PATH_RESPONSE:
 		return frame.Seq == 0 && len(frame.Data) == pathChallengeSize
+	case CMD_MTU_PROBE, CMD_MTU_PROBE_REPLY:
+		return frame.Seq == 0 && len(frame.Data) >= mtuProbeIDSize && len(frame.Data) <= mtuProbeMaxPayload
+	case CMD_MTU_COMMIT:
+		return frame.Seq == 0 && len(frame.Data) == mtuCommitSize
 	default:
 		return false
 	}

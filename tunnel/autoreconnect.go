@@ -82,13 +82,13 @@ func (a *AutoReconnect) ensure() (net.Conn, error) {
 			Detail:  "dialing a replacement session",
 		})
 	} else {
-		a.client.logDebug("[AutoReconnect] dialing first tunnel session")
+		a.client.logDebug("[AutoReconnect] 🔌 dialing first tunnel session")
 	}
 	a.mu.Unlock()
 
 	appConn, _, err := a.client.dialSession(a.ctx, a.opts)
 	if err != nil {
-		a.client.logWarn("[AutoReconnect] dial failed: %v", err)
+		a.client.logWarn("[AutoReconnect] ❌ dial failed: %v", err)
 		return nil, err
 	}
 

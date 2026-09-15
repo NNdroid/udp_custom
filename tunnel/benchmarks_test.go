@@ -12,11 +12,11 @@ var benchPayload = make([]byte, 1300)
 
 func init() { rand.Read(benchPayload) }
 
-func benchCipherState(b *testing.B) *NoiseCipherState {
+func benchCipherState(b *testing.B) *AEADCipherState {
 	b.Helper()
 	key := make([]byte, 32)
 	rand.Read(key)
-	s, err := newNoiseCipherState(key)
+	s, err := newAEADCipherState(key)
 	if err != nil {
 		b.Fatal(err)
 	}

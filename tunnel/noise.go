@@ -271,17 +271,19 @@ func (s *symmetricState) split() (k1, k2 []byte) {
 	return out[:32], out[32:]
 }
 
-// NoiseCipherState wraps one ChaCha20-Poly1305 transport key.
-type NoiseCipherState struct {
+// AEADCipherState wraps one ChaCha20-Poly1305 AEAD key. Used by both Noise
+// transport sessions and PSK sessions (the cipher is protocol-agnostic; only
+// the key-derivation path differs).
+type AEADCipherState struct {
 	aead cipher.AEAD
 }
 
-func newNoiseCipherState(key []byte) (*NoiseCipherState, error) {
+func newAEADCipherState(key []byte) (*AEADCipherState, error) {
 	aead, err := chacha20poly1305.New(key)
 	if err != nil {
 		return nil, err
 	}
-	return &NoiseCipherState{aead: aead}, nil
+	return &AEADCipherState{aead: aead}, nil
 }
 
 // packetNonce derives the 12-byte AEAD nonce from the 64-bit per-direction
@@ -300,12 +302,12 @@ func packetNonce(packetNo uint64) [12]byte {
 	return nonce
 }
 
-func (s *NoiseCipherState) Encrypt(packetNo uint64, plaintext, aad []byte) []byte {
+func (s *AEADCipherState) Encrypt(packetNo uint64, plaintext, aad []byte) []byte {
 	nonce := packetNonce(packetNo)
 	return s.aead.Seal(nil, nonce[:], plaintext, aad)
 }
 
-func (s *NoiseCipherState) Decrypt(packetNo uint64, ciphertext, aad []byte) ([]byte, error) {
+func (s *AEADCipherState) Decrypt(packetNo uint64, ciphertext, aad []byte) ([]byte, error) {
 	nonce := packetNonce(packetNo)
 	return s.aead.Open(nil, nonce[:], ciphertext, aad)
 }
@@ -314,7 +316,7 @@ func (s *NoiseCipherState) Decrypt(packetNo uint64, ciphertext, aad []byte) ([]b
 // payload has the same length as plaintext and Poly1305's 16-byte tag occupies
 // the protocol trailer. Empty control-frame payloads therefore cost exactly
 // one tag and no second HMAC pass.
-func SealFrameAEAD(f *UDPCFrame, c *NoiseCipherState, plaintext []byte) []byte {
+func SealFrameAEAD(f *UDPCFrame, c *AEADCipherState, plaintext []byte) []byte {
 	if f == nil || c == nil || len(plaintext) > int(^uint16(0)) {
 		return nil
 	}
@@ -330,7 +332,7 @@ func SealFrameAEAD(f *UDPCFrame, c *NoiseCipherState, plaintext []byte) []byte {
 // sealFrameAEADInto seals the record into the front of wire (which must have
 // at least UDPC_HDR_SIZE+len(plaintext)+Overhead capacity) and returns the
 // used length: header + ciphertext, with the Poly1305 tag as the trailer.
-func sealFrameAEADInto(wire []byte, f *UDPCFrame, c *NoiseCipherState, plaintext []byte) int {
+func sealFrameAEADInto(wire []byte, f *UDPCFrame, c *AEADCipherState, plaintext []byte) int {
 	header := wire[:UDPC_HDR_SIZE]
 	f.encodeHeaderInto(header, len(plaintext))
 	nonce := packetNonce(f.PacketNo)
@@ -340,14 +342,14 @@ func sealFrameAEADInto(wire []byte, f *UDPCFrame, c *NoiseCipherState, plaintext
 
 // OpenFrameAEAD authenticates the received header and opens payload plus the
 // trailer tag. It must run before any frame field mutates session state.
-func OpenFrameAEAD(f *UDPCFrame, c *NoiseCipherState) ([]byte, error) {
+func OpenFrameAEAD(f *UDPCFrame, c *AEADCipherState) ([]byte, error) {
 	return OpenFrameAEADInto(nil, f, c)
 }
 
 // OpenFrameAEADInto is OpenFrameAEAD with a caller-provided output buffer: the
 // plaintext is appended to dst, so a pooled buffer makes the receive path
 // allocation-free. The result is only valid until dst is recycled.
-func OpenFrameAEADInto(dst []byte, f *UDPCFrame, c *NoiseCipherState) ([]byte, error) {
+func OpenFrameAEADInto(dst []byte, f *UDPCFrame, c *AEADCipherState) ([]byte, error) {
 	if f == nil || c == nil || len(f.raw) < UDPC_HDR_SIZE+UDPC_TRAILER_SIZE {
 		return nil, errors.New("noise: invalid frame")
 	}
@@ -358,8 +360,8 @@ func OpenFrameAEADInto(dst []byte, f *UDPCFrame, c *NoiseCipherState) ([]byte, e
 
 // NoiseSession is the result of a completed handshake.
 type NoiseSession struct {
-	SendCipher *NoiseCipherState
-	RecvCipher *NoiseCipherState
+	SendCipher *AEADCipherState
+	RecvCipher *AEADCipherState
 
 	// HandshakeHash is the final handshake transcript hash h — the Noise
 	// channel-binding value. It can be logged or compared out of band to bind
@@ -368,11 +370,11 @@ type NoiseSession struct {
 }
 
 func newNoiseSession(sendKey, recvKey []byte, h [32]byte) (*NoiseSession, error) {
-	sendCipher, err := newNoiseCipherState(sendKey)
+	sendCipher, err := newAEADCipherState(sendKey)
 	if err != nil {
 		return nil, err
 	}
-	recvCipher, err := newNoiseCipherState(recvKey)
+	recvCipher, err := newAEADCipherState(recvKey)
 	if err != nil {
 		return nil, err
 	}

@@ -139,6 +139,13 @@ type Server struct {
 	decodeFailures  atomic.Uint64 // undecodable datagrams (junk/scans/mismatched peers)
 	macFailures     atomic.Uint64 // v2 authentication failures
 	replayDrops     atomic.Uint64 // authenticated session packets rejected by the replay window
+	transientReads  atomic.Uint64 // UDP read errors retried instead of killing the recv loop
+
+	// logLevel is resolved ONCE at construction. The hot paths consult it
+	// several times per datagram purely to decide whether a debug log is
+	// worth building; recomputing LogLevel() there would mean re-running
+	// strings.ToLower(TrimSpace(...)) on every packet for nothing.
+	logLevel int
 
 	cfg        ServerConfig
 	conn       *net.UDPConn   // primary bound listener (also the fallback reply socket)
@@ -663,6 +670,7 @@ func newServer(cfg ServerConfig, dial TargetDialer, injected *net.UDPConn) (*Ser
 		portRange:    pr,
 		closeChan:    make(chan struct{}),
 		logger:       logger,
+		logLevel:     resolveLogLevel(cfg),
 		dialTarget:   dial,
 		events:       newEventBus[SessionEvent](256),
 		synCache:     newSynCache(),
@@ -734,6 +742,13 @@ func (s *Server) Start() error {
 // origdst is enabled, so replies can be mirrored back from that port.
 func (s *Server) serveConn(conn *net.UDPConn) {
 	reader := newPacketReader(conn, s.logger)
+	// A transient read error (ENOBUFS under a burst, EINTR from a signal, a
+	// timeout racing Close) must NOT end this loop: this goroutine is the only
+	// thing pulling datagrams off the socket, and letting it die leaves the
+	// process alive but DEAF — far harder to diagnose than a crash. Retry with
+	// exponential backoff (1ms..1s); only a closed socket or an unknown error
+	// ends the loop.
+	var backoff time.Duration
 	for {
 		if atomic.LoadInt32(&s.closed) == 1 {
 			return
@@ -743,9 +758,22 @@ func (s *Server) serveConn(conn *net.UDPConn) {
 			if atomic.LoadInt32(&s.closed) == 1 {
 				return
 			}
+			if isRetryableUDPReadError(err) {
+				if backoff == 0 {
+					backoff = time.Millisecond
+				} else if backoff < time.Second {
+					backoff *= 2
+				}
+				if n := s.transientReads.Add(1); n == 1 || n%100 == 0 {
+					s.logWarn("UDP read: transient error, retrying (count=%d, backoff=%v): %v", n, backoff, err)
+				}
+				time.Sleep(backoff)
+				continue
+			}
 			s.logWarn("UDP read error: %v", err)
 			return
 		}
+		backoff = 0
 		for i := range pkts {
 			pkt := &pkts[i]
 			remoteAddr, origDstPort := pkt.from, pkt.origPort
@@ -2216,10 +2244,18 @@ func (s *Server) Close() {
 
 // loggerLevel reports the configured verbosity for debug-gating hot paths.
 // An injected Logger always receives everything (level 0); the level filter is
-// only applied inside resolveLogger for the default std logger.
+// only applied inside resolveLogger for the default std logger. The value is
+// resolved once at construction and cached — this sits on the per-datagram
+// path and must not re-parse the config string.
 func (s *Server) loggerLevel() int {
-	if s.cfg.Logger != nil {
+	return s.logLevel
+}
+
+// resolveLogLevel precomputes the effective verbosity for a ServerConfig:
+// an injected Logger receives everything (0), otherwise parse the string once.
+func resolveLogLevel(cfg ServerConfig) int {
+	if cfg.Logger != nil {
 		return 0
 	}
-	return LogLevel(s.cfg.LogLevel)
+	return LogLevel(cfg.LogLevel)
 }

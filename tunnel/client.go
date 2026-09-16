@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
-	"net/netip"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -525,44 +524,49 @@ func (c *Client) Close() {
 
 // --- receive path -------------------------------------------------------------
 
+// recvLoop runs a bare receive loop on one socket WITHOUT the supervisor.
+// Only tests drive it directly; production paths go through recvSocketLoop,
+// which rebuilds a failed socket. It logs instead of silently discarding a
+// fatal error so a stopped loop is never invisible.
 func (c *Client) recvLoop(conn *net.UDPConn) {
-	_ = c.recvFromSocket(conn)
+	if err := c.recvFromSocket(conn); err != nil && atomic.LoadInt32(&c.closed) != 1 {
+		c.logError("[Client] ❌ receive loop on %v stopped: %v", conn.LocalAddr(), err)
+	}
 }
 
 func (c *Client) recvFromSocket(conn *net.UDPConn) error {
-	buf := make([]byte, UDPC_MAX_PKT)
-	// The 1s read deadline exists solely so this loop can notice Close. It is
-	// refreshed only once per second at most — under load that is one
-	// SetReadDeadline syscall per second, not per packet.
-	var deadline time.Time
+	// Batched reception, the same component the server uses: block on the
+	// first datagram, then drain the burst (one poller wakeup + one deadline
+	// syscall per burst instead of per datagram). Client sockets never enable
+	// IP_RECVORIGDSTADDR, so the reader's OOB path simply observes no control
+	// data and every packet reports origPort 0 — harmless here.
+	//
+	// Close does not need a polling deadline: Client.Close closes the socket
+	// via dialer.Close, which unblocks the first (deadline-less) read.
+	reader := newPacketReader(conn, c.logger)
 	for {
-		select {
-		case <-c.closeChan:
-			return nil
-		default:
-		}
-		if now := time.Now(); !now.Before(deadline) {
-			deadline = now.Add(time.Second)
-			conn.SetReadDeadline(deadline)
-		}
-		n, remoteAddr, err := conn.ReadFromUDPAddrPort(buf)
+		pkts, err := reader.next()
 		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				continue
-			}
 			if atomic.LoadInt32(&c.closed) == 1 {
 				return nil
 			}
+			if isRetryableUDPReadError(err) {
+				time.Sleep(time.Millisecond)
+				continue
+			}
 			return err
 		}
-		if !c.dialer.acceptsRemote(netip.AddrPortFrom(remoteAddr.Addr().Unmap(), remoteAddr.Port())) {
-			continue
+		for i := range pkts {
+			pkt := &pkts[i]
+			if !c.dialer.acceptsRemote(pkt.from) {
+				continue
+			}
+			var frame UDPCFrame
+			if err := decodeUDPCFrame(pkt.data, c.magic, &frame); err != nil {
+				continue
+			}
+			c.dispatch(&frame)
 		}
-		var frame UDPCFrame
-		if err := decodeUDPCFrame(buf[:n], c.magic, &frame); err != nil {
-			continue
-		}
-		c.dispatch(&frame)
 	}
 }
 

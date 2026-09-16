@@ -387,6 +387,71 @@ func TestMultipathSession_RoutesReplyPerPath(t *testing.T) {
 	}
 }
 
+// getOrSkip gets a pooled socket for a previously-reserved ephemeral port,
+// skipping the test when the OS handed that port to someone else in the
+// release-to-rebind window (see freeUDPPorts). Failure while a retry shows the
+// port IS still bindable is a real bug and fails the test instead.
+func getOrSkip(t *testing.T, p *sendSockPool, port int) *pooledConn {
+	t.Helper()
+	pc, err := p.Get(port)
+	if err == nil {
+		return pc
+	}
+	if probe, perr := p.Get(port); perr == nil && probe.LocalAddr().(*net.UDPAddr).Port == port {
+		t.Fatalf("Get(%d): %v (port is bindable, so this is a real bug)", port, err)
+	}
+	t.Skipf("reserved port %d was stolen by the OS before the pool could bind it", port)
+	return nil
+}
+
+// TestSendSockPool_EvictionNeverClosesPinnedSocket locks the P0-2 contract:
+// a socket a caller is writing through must survive an overflow eviction. The
+// old list-based LRU could Close it mid-write; the write then fell back to the
+// main socket — the WRONG source port for a CGNAT, silently dropped replies.
+// It also locks the soft-overflow rule: with every entry pinned the pool is
+// allowed to exceed the limit until a later insert/unpin reclaims it.
+func TestSendSockPool_EvictionNeverClosesPinnedSocket(t *testing.T) {
+	ports := freeUDPPorts(t, 3)
+	p := newSendSockPool(1, nil) // deliberately tiny: every extra port overflows
+	defer p.Close()
+
+	listener, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("listener: %v", err)
+	}
+	defer listener.Close()
+
+	pcA := getOrSkip(t, p, ports[0])
+
+	// Simulate a write in flight through A, then overflow the pool with B.
+	pcA.refs.Add(1)
+	getOrSkip(t, p, ports[1])
+	// A is pinned and the brand-new B is insertion-pinned: the eviction scan
+	// has no reclaimable candidate, so the pool must keep BOTH (soft overflow).
+	if p.Len() != 2 {
+		t.Fatalf("soft overflow not honoured while pinned: Len=%d, want 2", p.Len())
+	}
+
+	// The pinned socket must still be writable — the old eviction could have
+	// closed it right here, which is the exact bug this test exists to catch.
+	if _, err := pcA.WriteToUDPAddrPort([]byte("still-alive"), listener.LocalAddr().(*net.UDPAddr).AddrPort()); err != nil {
+		t.Fatalf("write through pinned socket after overflow: %v (socket was closed mid-use)", err)
+	}
+	buf := make([]byte, 32)
+	_ = listener.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, _, err := listener.ReadFromUDP(buf); err != nil {
+		t.Fatalf("listener read: %v", err)
+	}
+
+	// Unpin A; the next insert reclaims the overflow (oldest first) without
+	// ever touching a pinned socket.
+	pcA.refs.Add(-1)
+	getOrSkip(t, p, ports[2])
+	if p.Len() > 1 {
+		t.Fatalf("pool did not reclaim overflow after unpin: Len=%d, want <= 1", p.Len())
+	}
+}
+
 func TestCmdOfEncoded(t *testing.T) {
 	frame := &UDPCFrame{
 		Magic: UDPC_MAGIC_DEFAULT,

@@ -198,10 +198,12 @@ func TestClientConcurrentDuplicateDeliveredOnce(t *testing.T) {
 		dialer: &SpreadDialer{closed: 1},
 	}
 	sess := &clientSession{
-		client: client, sid: 7, conn: conn, sendSeq: 1, recvSeq: 1,
+		client: client, sid: 7, conn: conn,
 		recvQueue: make(map[uint64][]byte), closeChan: make(chan struct{}),
 		lastActive: time.Now(),
 	}
+	sess.sendSeq.Store(1)
+	sess.recvSeq.Store(1)
 	frame := &UDPCFrame{Cmd: CMD_DATA, SessionID: 7, Seq: 1, Data: []byte("once")}
 
 	start := make(chan struct{})

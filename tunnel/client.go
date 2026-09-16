@@ -684,8 +684,6 @@ func (c *Client) establish(ctx context.Context, target string, conn net.Conn) (*
 
 		frameKeys:  frameKeys,
 		granted:    granted,
-		sendSeq:    1,
-		recvSeq:    1,
 		recvQueue:  make(map[uint64][]byte),
 		unacked:    make(map[uint64]*unackedPkt),
 		lastActive: time.Now(),
@@ -694,6 +692,11 @@ func (c *Client) establish(ctx context.Context, target string, conn net.Conn) (*
 		rttEst:     newRTTEstimator(200*time.Millisecond, 200*time.Millisecond, 10*time.Second),
 	}
 	sess.unackedCond = sync.NewCond(&sess.unackedMu)
+	// seq counters start at 1: sendSeq/recvSeq semantics are "next sequence
+	// number", and the first frame uses seq 1. sendPacketNo starts at 0
+	// (its first AddUint64 returns 1).
+	sess.sendSeq.Store(1)
+	sess.recvSeq.Store(1)
 	c.sessions.Store(sid, sess)
 
 	// Converge the frame budget BEFORE any pump starts: a DATA frame encoded
@@ -866,6 +869,15 @@ func (c *Client) handshake(ctx context.Context, target string) (uint32, *NoiseSe
 // --- session -------------------------------------------------------------------
 
 type clientSession struct {
+	// sendPacketNo/sendSeq/recvSeq are accessed with sync/atomic. atomic.Uint64
+	// carries an align64 so they stay 8-byte aligned on 32-bit arches (arm,
+	// 386) regardless of surrounding field layout — no "keep first" trick
+	// needed. Plain uint64 here would panic with "unaligned 64-bit atomic
+	// operation" on 32-bit targets.
+	sendPacketNo atomic.Uint64
+	sendSeq      atomic.Uint64
+	recvSeq      atomic.Uint64
+
 	client *Client
 	sid    uint32
 	conn   net.Conn // local application connection
@@ -878,9 +890,6 @@ type clientSession struct {
 	// the server's default target). Exposed through DialOptions.OnGranted.
 	granted string
 
-	sendPacketNo uint64
-	sendSeq      uint64
-	recvSeq      uint64
 	replayFilter ReplayFilter
 
 	recvQueue map[uint64][]byte
@@ -1025,7 +1034,7 @@ func (s *clientSession) sendData(payload []byte) error {
 		return fmt.Errorf("session closed")
 	}
 
-	seq := atomic.AddUint64(&s.sendSeq, 1) - 1
+	seq := s.sendSeq.Add(1) - 1
 	outFrame := &UDPCFrame{
 		Magic: s.client.magic, Version: UDPC_VERSION, Cmd: CMD_DATA,
 		SessionID: s.sid, Seq: seq, Ack: s.currentAck(), Data: payload,
@@ -1154,7 +1163,7 @@ func (s *clientSession) handleData(frame *UDPCFrame) bool {
 
 	payload := frame.Data
 
-	expected := atomic.LoadUint64(&s.recvSeq)
+	expected := s.recvSeq.Load()
 	if frame.Seq != expected {
 		if frame.Seq < expected {
 			// Already delivered: the server is retransmitting because it lost
@@ -1200,7 +1209,7 @@ func (s *clientSession) handleData(frame *UDPCFrame) bool {
 	}
 
 	if delivered > 0 {
-		atomic.StoreUint64(&s.recvSeq, expected+delivered)
+		s.recvSeq.Store(expected + delivered)
 		s.sendACK(expected + delivered - 1)
 	}
 	return true
@@ -1222,7 +1231,7 @@ func (s *clientSession) sendACK(ackSeq uint64) {
 // send must consume the bytes synchronously. Returns false when the session
 // lacks record protection or the packet-number space is exhausted.
 func (s *clientSession) sendControl(f *UDPCFrame, send func([]byte) error) bool {
-	f.PacketNo = atomic.AddUint64(&s.sendPacketNo, 1)
+	f.PacketNo = s.sendPacketNo.Add(1)
 	if f.PacketNo == 0 || s.frameKeys == nil {
 		return false
 	}
@@ -1238,7 +1247,7 @@ func (s *clientSession) sendControl(f *UDPCFrame, send func([]byte) error) bool 
 }
 
 func (s *clientSession) currentAck() uint64 {
-	if next := atomic.LoadUint64(&s.recvSeq); next > 0 {
+	if next := s.recvSeq.Load(); next > 0 {
 		return next - 1
 	}
 	return 0
@@ -1254,7 +1263,7 @@ func (s *clientSession) reackDuplicateData() {
 // ChaCha20-Poly1305 record (PSK-derived or Noise transport key — same format,
 // header as AAD, Poly1305 tag in the trailer).
 func (s *clientSession) encodeFrame(f *UDPCFrame) []byte {
-	f.PacketNo = atomic.AddUint64(&s.sendPacketNo, 1)
+	f.PacketNo = s.sendPacketNo.Add(1)
 	if f.PacketNo == 0 {
 		return nil
 	}

@@ -58,8 +58,8 @@ type SpreadDialer struct {
 	destMu     sync.RWMutex
 	pr         *PortRange
 	socks      []*spreadSocket
-	rr         uint64 // round-robin cursor over sockets
-	fixedPaths int    // chosen remote-port subset size; 0 = whole range
+	rr         atomic.Uint64 // round-robin cursor over sockets
+	fixedPaths int           // chosen remote-port subset size; 0 = whole range
 	closed     int32
 	closeOnce  sync.Once
 	listenUDP  UDPListenFunc
@@ -280,7 +280,7 @@ func (d *SpreadDialer) Next() (int, int) {
 	if len(d.socks) == 0 || atomic.LoadInt32(&d.closed) == 1 {
 		return -1, 0
 	}
-	idx := int(atomic.AddUint64(&d.rr, 1)-1) % len(d.socks)
+	idx := int(d.rr.Add(1)-1) % len(d.socks)
 	return idx, d.socks[idx].sel.Next()
 }
 

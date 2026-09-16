@@ -128,21 +128,32 @@ const synCacheTTL = 10 * time.Minute
 const synCacheMax = 4096
 
 type Server struct {
-	cfg            ServerConfig
-	conn           *net.UDPConn   // primary bound listener (also the fallback reply socket)
-	recvConns      []*net.UDPConn // SO_REUSEPORT receive group; recvConns[0] == conn
-	bindPort       int            // local port actually bound
-	maxPkt         int            // largest record we put on the wire (see ServerConfig.MaxPkt)
-	sockPool       *sendSockPool  // per-origdst-port reply sockets
-	origDstOK      bool           // IP_RECVORIGDSTADDR enabled & working
-	portRange      *PortRange     // configured client port range (DNAT target); nil = not set
-	outOfRangePkts uint64         // packets whose origdst port fell outside portRange
-	privKey        [32]byte
-	hasPrivKey     bool
-	sessions       sync.Map // uint32 -> *ServerSession
-	closed         int32
-	closeChan      chan struct{}
-	logger         Logger // never nil after NewServer
+	// Debug counters accessed with sync/atomic. atomic.Uint64 carries an
+	// align64, guaranteeing 8-byte alignment on 32-bit arches (arm, 386) —
+	// plain uint64 here would panic with "unaligned 64-bit atomic operation".
+	outOfRangePkts  atomic.Uint64 // packets whose origdst port fell outside portRange
+	origPortChanges atomic.Uint64 // times a session's mirrored reply port changed
+	sendViaPort     atomic.Uint64 // replies sent through a per-port socket
+	sendViaMain     atomic.Uint64 // replies that fell back to the main socket
+	queueFullDrops  atomic.Uint64 // reorder-buffer overflows
+	decodeFailures  atomic.Uint64 // undecodable datagrams (junk/scans/mismatched peers)
+	macFailures     atomic.Uint64 // v2 authentication failures
+	replayDrops     atomic.Uint64 // authenticated session packets rejected by the replay window
+
+	cfg        ServerConfig
+	conn       *net.UDPConn   // primary bound listener (also the fallback reply socket)
+	recvConns  []*net.UDPConn // SO_REUSEPORT receive group; recvConns[0] == conn
+	bindPort   int            // local port actually bound
+	maxPkt     int            // largest record we put on the wire (see ServerConfig.MaxPkt)
+	sockPool   *sendSockPool  // per-origdst-port reply sockets
+	origDstOK  bool           // IP_RECVORIGDSTADDR enabled & working
+	portRange  *PortRange     // configured client port range (DNAT target); nil = not set
+	privKey    [32]byte
+	hasPrivKey bool
+	sessions   sync.Map // uint32 -> *ServerSession
+	closed     int32
+	closeChan  chan struct{}
+	logger     Logger // never nil after NewServer
 
 	// dialTarget dials the backend for each session; defaultTargetDialer is
 	// used unless NewServerWithDialer supplies one.
@@ -164,15 +175,6 @@ type Server struct {
 	handshakeSem chan struct{}
 	sendWindow   int
 	maxRecvQueue int
-
-	// Debug counters (read with atomic; only ever used for logging).
-	origPortChanges uint64 // times a session's mirrored reply port changed
-	sendViaPort     uint64 // replies sent through a per-port socket
-	sendViaMain     uint64 // replies that fell back to the main socket
-	queueFullDrops  uint64 // reorder-buffer overflows
-	decodeFailures  uint64 // undecodable datagrams (junk/scans/mismatched peers)
-	macFailures     uint64 // v2 authentication failures
-	replayDrops     uint64 // authenticated session packets rejected by the replay window
 }
 
 func parseLogLevel(s string) int { return LogLevel(s) }
@@ -316,6 +318,12 @@ type unackedPkt struct {
 }
 
 type ServerSession struct {
+	// sendPacketNo/sendSeq/recvSeq accessed with sync/atomic; atomic.Uint64
+	// guarantees 8-byte alignment on 32-bit arches (arm, 386) via align64.
+	sendPacketNo atomic.Uint64
+	sendSeq      atomic.Uint64
+	recvSeq      atomic.Uint64
+
 	server        *Server
 	sessionID     uint32
 	raddr         netip.AddrPort
@@ -328,10 +336,6 @@ type ServerSession struct {
 	// frameKeys is used by PSK-only sessions. Noise sessions use their transport
 	// AEAD for both DATA and control records and leave this nil.
 	frameKeys *FrameKeys
-
-	sendPacketNo uint64
-	sendSeq      uint64
-	recvSeq      uint64
 
 	rttEst *rttEstimator // adaptive RTO estimator (RFC 6298 + Karn's rule)
 
@@ -752,7 +756,7 @@ func (s *Server) serveConn(conn *net.UDPConn) {
 			// and the reply would never reach the client. Count + warn (throttled)
 			// so an operator can catch a range/firewall mismatch early.
 			if s.portRange != nil && origDstPort > 0 && !s.portRange.Contains(origDstPort) {
-				if n := atomic.AddUint64(&s.outOfRangePkts, 1); n == 1 || n%1000 == 0 {
+				if n := s.outOfRangePkts.Add(1); n == 1 || n%1000 == 0 {
 					s.logWarn("⚠️ Packet from %s arrived on origdst port %d which is OUTSIDE the configured port_range %s — possible firewall/DNAT misconfiguration",
 						remoteAddr, origDstPort, s.portRange.String())
 				}
@@ -762,7 +766,7 @@ func (s *Server) serveConn(conn *net.UDPConn) {
 			if err := decodeUDPCFrame(pkt.data, s.cfg.Magic, &frame); err != nil {
 				// Invalid magic / version / structure. Counted so silent junk
 				// (port scans, misconfigured peers) is visible in Stats.
-				if n := atomic.AddUint64(&s.decodeFailures, 1); n == 1 || n%1000 == 0 {
+				if n := s.decodeFailures.Add(1); n == 1 || n%1000 == 0 {
 					s.logWarn("⚠️ Undecodable datagram from %s (%d bytes): %v (count=%d)", remoteAddr, len(pkt.data), err, n)
 				}
 				continue
@@ -828,7 +832,7 @@ func (sess *ServerSession) processIncomingFrame(frame *UDPCFrame, remoteAddr net
 		return false
 	}
 	if !sess.replayFilter.Accept(frame.PacketNo) {
-		atomic.AddUint64(&sess.server.replayDrops, 1)
+		sess.server.replayDrops.Add(1)
 		sess.server.emitSessionEvent(SessionEvent{
 			Kind:      SessionReplayDropped,
 			SessionID: sess.sessionID,
@@ -867,7 +871,7 @@ func (sess *ServerSession) verifyInboundFrame(frame *UDPCFrame, dst []byte, remo
 		err = errors.New("session has no record protection")
 	}
 	if err != nil {
-		if n := atomic.AddUint64(&sess.server.macFailures, 1); n == 1 || n%100 == 0 {
+		if n := sess.server.macFailures.Add(1); n == 1 || n%100 == 0 {
 			sess.server.logWarn("[Session 0x%08X] ⚠️ Frame authentication rejected cmd=0x%02X from %s: %v",
 				sess.sessionID, frame.Cmd, remoteAddr, err)
 			// Security event rides the SAME throttle as the warn so a flood
@@ -1059,8 +1063,6 @@ func (s *Server) handleHandshake(remoteAddr netip.AddrPort, frame *UDPCFrame, or
 		targetAddr:    targetHostPort,
 		upstream:      upstream,
 		frameKeys:     frameKeys,
-		sendSeq:       1,
-		recvSeq:       1,
 		recvQueue:     make(map[uint64][]byte),
 		unacked:       make(map[uint64]*unackedPkt),
 		lastActive:    time.Now(),
@@ -1069,6 +1071,10 @@ func (s *Server) handleHandshake(remoteAddr netip.AddrPort, frame *UDPCFrame, or
 		mtuGate:       make(chan struct{}),
 	}
 	sess.unackedCond = sync.NewCond(&sess.unackedMu)
+	// seq counters start at 1: first frame uses seq 1. sendPacketNo starts
+	// at 0 (its first AddUint64 returns 1).
+	sess.sendSeq.Store(1)
+	sess.recvSeq.Store(1)
 	s.sessions.Store(sid, sess)
 	sess.setPath(origPort, remoteAddr)
 
@@ -1130,7 +1136,7 @@ func (s *Server) replyFromOrigPort(origPort int, addr netip.AddrPort, data []byt
 		c, err := s.sockPool.Get(origPort)
 		if err == nil {
 			if n, werr := c.WriteToUDPAddrPort(data, addr); werr == nil {
-				atomic.AddUint64(&s.sendViaPort, 1)
+				s.sendViaPort.Add(1)
 				if s.loggerLevel() <= 0 {
 					s.logDebug("[Send] 📤 to=%s via=origPort:%d cmd=0x%02X len=%d", addr, origPort, cmd, n)
 				}
@@ -1145,7 +1151,7 @@ func (s *Server) replyFromOrigPort(origPort int, addr netip.AddrPort, data []byt
 	// Fallback to the main listening socket (correct behaviour only when the
 	// client connected to ListenAddr directly, i.e. no port spreading).
 	if n, werr := s.conn.WriteToUDPAddrPort(data, addr); werr == nil {
-		atomic.AddUint64(&s.sendViaMain, 1)
+		s.sendViaMain.Add(1)
 		if s.loggerLevel() <= 0 {
 			s.logDebug("[Send] 📤 to=%s via=main cmd=0x%02X len=%d", addr, cmd, n)
 		}
@@ -1283,7 +1289,7 @@ func (sess *ServerSession) setPath(origPort int, addr netip.AddrPort) {
 	sess.pathMu.Unlock()
 	old := atomic.SwapInt32(&sess.lastOrigPort, int32(origPort))
 	if old != int32(origPort) {
-		atomic.AddUint64(&sess.server.origPortChanges, 1)
+		sess.server.origPortChanges.Add(1)
 	}
 }
 
@@ -1441,7 +1447,7 @@ func (sess *ServerSession) acceptPathResponse(remoteAddr netip.AddrPort, data []
 // format, header as AAD, Poly1305 tag in the trailer). The buffer is freshly
 // allocated: only use for frames whose wire bytes are retained (DATA).
 func (sess *ServerSession) encodeFrame(f *UDPCFrame) []byte {
-	f.PacketNo = atomic.AddUint64(&sess.sendPacketNo, 1)
+	f.PacketNo = sess.sendPacketNo.Add(1)
 	if f.PacketNo == 0 {
 		return nil
 	}
@@ -1457,7 +1463,7 @@ func (sess *ServerSession) encodeFrame(f *UDPCFrame) []byte {
 // Returns false when the session lacks record protection or the packet-number
 // space is exhausted.
 func (sess *ServerSession) sendControl(f *UDPCFrame, send func([]byte) error) bool {
-	f.PacketNo = atomic.AddUint64(&sess.sendPacketNo, 1)
+	f.PacketNo = sess.sendPacketNo.Add(1)
 	if f.PacketNo == 0 || sess.frameKeys == nil {
 		return false
 	}
@@ -1471,7 +1477,7 @@ func (sess *ServerSession) sendControl(f *UDPCFrame, send func([]byte) error) bo
 }
 
 func (sess *ServerSession) currentAck() uint64 {
-	if next := atomic.LoadUint64(&sess.recvSeq); next > 0 {
+	if next := sess.recvSeq.Load(); next > 0 {
 		return next - 1
 	}
 	return 0
@@ -1525,7 +1531,7 @@ func (sess *ServerSession) handleDataFromPath(frame *UDPCFrame, remoteAddr netip
 		sess.handleAck(frame.Ack)
 	}
 
-	expected := atomic.LoadUint64(&sess.recvSeq)
+	expected := sess.recvSeq.Load()
 	if frame.Seq != expected {
 		if frame.Seq < expected {
 			// Already delivered. The peer is retransmitting because it never
@@ -1542,7 +1548,7 @@ func (sess *ServerSession) handleDataFromPath(frame *UDPCFrame, remoteAddr netip
 		accepted := true
 		if _, dup := sess.recvQueue[frame.Seq]; !dup {
 			if len(sess.recvQueue) >= sess.server.maxRecvQueue {
-				atomic.AddUint64(&sess.server.queueFullDrops, 1)
+				sess.server.queueFullDrops.Add(1)
 				accepted = false
 			} else {
 				sess.recvQueue[frame.Seq] = append([]byte(nil), payload...)
@@ -1598,7 +1604,7 @@ func (sess *ServerSession) handleDataFromPath(frame *UDPCFrame, remoteAddr netip
 		return true
 	}
 
-	atomic.StoreUint64(&sess.recvSeq, expected+delivered)
+	sess.recvSeq.Store(expected + delivered)
 
 	// Ack the highest contiguous sequence we have just delivered.
 	sess.sendCumulativeACK(expected + delivered - 1)
@@ -1681,7 +1687,7 @@ func (sess *ServerSession) sendData(payload []byte) error {
 		return fmt.Errorf("session closed")
 	}
 
-	seq := atomic.AddUint64(&sess.sendSeq, 1) - 1
+	seq := sess.sendSeq.Add(1) - 1
 
 	frame := &UDPCFrame{
 		Magic:      sess.server.cfg.Magic,
@@ -2138,13 +2144,13 @@ func (s *Server) cleanupLoop() {
 				s.origDstOK,
 				s.portRange != nil,
 				s.sockPool.Len(),
-				atomic.LoadUint64(&s.sendViaPort),
-				atomic.LoadUint64(&s.sendViaMain),
-				atomic.LoadUint64(&s.origPortChanges),
-				atomic.LoadUint64(&s.queueFullDrops),
-				atomic.LoadUint64(&s.outOfRangePkts),
-				atomic.LoadUint64(&s.macFailures),
-				atomic.LoadUint64(&s.replayDrops))
+				s.sendViaPort.Load(),
+				s.sendViaMain.Load(),
+				s.origPortChanges.Load(),
+				s.queueFullDrops.Load(),
+				s.outOfRangePkts.Load(),
+				s.macFailures.Load(),
+				s.replayDrops.Load())
 		}
 	}
 }
@@ -2174,14 +2180,14 @@ func (s *Server) Stats() ServerStats {
 		ReceiveSockets:  len(s.recvConns),
 		OrigDstOK:       s.origDstOK,
 		SockPoolSize:    s.sockPool.Len(),
-		SendViaPort:     atomic.LoadUint64(&s.sendViaPort),
-		SendViaMain:     atomic.LoadUint64(&s.sendViaMain),
-		OrigPortChanges: atomic.LoadUint64(&s.origPortChanges),
-		QueueFullDrops:  atomic.LoadUint64(&s.queueFullDrops),
-		OutOfRangePkts:  atomic.LoadUint64(&s.outOfRangePkts),
-		AuthFailures:    atomic.LoadUint64(&s.macFailures),
-		DecodeFailures:  atomic.LoadUint64(&s.decodeFailures),
-		ReplayDrops:     atomic.LoadUint64(&s.replayDrops),
+		SendViaPort:     s.sendViaPort.Load(),
+		SendViaMain:     s.sendViaMain.Load(),
+		OrigPortChanges: s.origPortChanges.Load(),
+		QueueFullDrops:  s.queueFullDrops.Load(),
+		OutOfRangePkts:  s.outOfRangePkts.Load(),
+		AuthFailures:    s.macFailures.Load(),
+		DecodeFailures:  s.decodeFailures.Load(),
+		ReplayDrops:     s.replayDrops.Load(),
 	}
 	s.sessions.Range(func(_, _ interface{}) bool {
 		st.Sessions++

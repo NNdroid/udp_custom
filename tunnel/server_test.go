@@ -7,7 +7,6 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -105,14 +104,14 @@ func newTestRig(t *testing.T, withNoise bool) *testRig {
 		targetNetwork: "tcp",
 		targetAddr:    "127.0.0.1:1",
 		upstream:      targetCli,
-		sendSeq:       1,
-		recvSeq:       1,
 		recvQueue:     make(map[uint64][]byte),
 		unacked:       make(map[uint64]*unackedPkt),
 		lastActive:    time.Now(),
 		closeChan:     make(chan struct{}),
 		rttEst:        newRTTEstimator(200*time.Millisecond, 200*time.Millisecond, 10*time.Second),
 	}
+	sess.sendSeq.Store(1)
+	sess.recvSeq.Store(1)
 	sess.unackedCond = sync.NewCond(&sess.unackedMu)
 	if withNoise {
 		// The session holds the record ciphers regardless of mode; Noise only
@@ -482,7 +481,7 @@ func TestHandleDataDecryptFailureStallsThenHeals(t *testing.T) {
 		t.Fatalf("corrupt frame must not reach the target (got %d bytes)", n)
 	}
 	rig.expectNoFrame(150 * time.Millisecond)
-	if got := atomic.LoadUint64(&rig.sess.recvSeq); got != 1 {
+	if got := rig.sess.recvSeq.Load(); got != 1 {
 		t.Fatalf("recvSeq must stay 1, got %d", got)
 	}
 

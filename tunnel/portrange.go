@@ -258,7 +258,7 @@ func (pr *PortRange) String() string {
 type PortSelector struct {
 	pr   *PortRange
 	mode SelectorMode
-	rr   uint64
+	rr   atomic.Uint64
 	rng  *rand.Rand
 	mu   sync.Mutex
 }
@@ -273,7 +273,7 @@ func NewPortSelector(pr *PortRange, mode SelectorMode) *PortSelector {
 	}
 }
 
-var fallbackSeed uint64
+var fallbackSeed atomic.Uint64
 
 func randomSeed() int64 {
 	var seed [8]byte
@@ -282,7 +282,7 @@ func randomSeed() int64 {
 	}
 	// Preserve availability if the OS RNG fails while ensuring concurrently
 	// created selectors do not all receive the same zero seed.
-	return time.Now().UnixNano() ^ int64(atomic.AddUint64(&fallbackSeed, 1))
+	return time.Now().UnixNano() ^ int64(fallbackSeed.Add(1))
 }
 
 // Next returns the destination port for the next outgoing packet. It is cheap
@@ -297,7 +297,7 @@ func (s *PortSelector) Next() int {
 		return 0
 	}
 	if s.mode == SelectorRoundRobin {
-		i := atomic.AddUint64(&s.rr, 1) - 1
+		i := s.rr.Add(1) - 1
 		return s.pr.PortAt(int(i % uint64(s.pr.total)))
 	}
 	s.mu.Lock()

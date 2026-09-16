@@ -73,14 +73,14 @@ func TestMtuLadderFor(t *testing.T) {
 // commits, exercising the client prober over a real loopback socket.
 type fakeProbeServer struct {
 	conn      *net.UDPConn
-	keys      *FrameKeys // SERVER-side ciphers: what a real server would seal with
+	keys      *FrameKeys   // SERVER-side ciphers: what a real server would seal with
 	maxRecord atomic.Int32 // largest record size it will echo; 0 = never answer
 	silence   atomic.Bool  // drop everything (the old-peer fallback contract)
 
 	commitsMu sync.Mutex
 	commits   []int
 
-	sendPacket uint64
+	sendPacket atomic.Uint64
 }
 
 func newFakeProbeServer(t *testing.T, keys *FrameKeys) *fakeProbeServer {
@@ -137,7 +137,7 @@ func (f *fakeProbeServer) loop() {
 				Magic: UDPC_MAGIC_DEFAULT, Version: UDPC_VERSION, Cmd: CMD_MTU_PROBE_REPLY,
 				SessionID: frame.SessionID, Data: append([]byte(nil), plain...),
 			}
-			reply.PacketNo = atomic.AddUint64(&f.sendPacket, 1)
+			reply.PacketNo = f.sendPacket.Add(1)
 			wire := SealFrameAEAD(reply, f.keys.Send, reply.Data)
 			if _, err := f.conn.WriteToUDPAddrPort(wire, from); err != nil {
 				return
@@ -221,7 +221,6 @@ func withFastProbing(t *testing.T) {
 	mtuProbeTimeout, mtuProbeAttempts = 50*time.Millisecond, 1
 	t.Cleanup(func() { mtuProbeTimeout, mtuProbeAttempts = oldTimeout, oldAttempts })
 }
-
 
 // waitForCommit polls until the fake server observed the expected commit.
 func (f *fakeProbeServer) waitForCommit(want int, timeout time.Duration) []int {

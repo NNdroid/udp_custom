@@ -13,7 +13,7 @@ import (
 type eventBus[T any] struct {
 	ch      chan T
 	stop    chan struct{}
-	dropped uint64 // events discarded because the queue was full
+	dropped atomic.Uint64 // events discarded because the queue was full
 	stopped atomic.Bool
 	wg      sync.WaitGroup
 
@@ -63,11 +63,11 @@ func (b *eventBus[T]) emit(ev T) {
 	select {
 	case b.ch <- ev:
 	default:
-		atomic.AddUint64(&b.dropped, 1)
+		b.dropped.Add(1)
 	}
 }
 
-func (b *eventBus[T]) droppedCount() uint64 { return atomic.LoadUint64(&b.dropped) }
+func (b *eventBus[T]) droppedCount() uint64 { return b.dropped.Load() }
 
 func (b *eventBus[T]) close() {
 	b.stopped.Store(true)

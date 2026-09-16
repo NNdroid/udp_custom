@@ -316,10 +316,11 @@ func TestProtocolV2ClientRejectsForgedControlBeforeStateMutation(t *testing.T) {
 	}
 	sess := &clientSession{
 		client: client, sid: 77, frameKeys: &FrameKeys{Recv: recvCipher},
-		recvSeq: 1, recvQueue: make(map[uint64][]byte),
+		recvQueue:  make(map[uint64][]byte),
 		unacked:    map[uint64]*unackedPkt{1: {sentTime: time.Now(), firstSent: time.Now()}},
 		lastActive: time.Now(), closeChan: make(chan struct{}),
 	}
+	sess.recvSeq.Store(1)
 	sess.unackedCond = sync.NewCond(&sess.unackedMu)
 	client.sessions.Store(sess.sid, sess)
 

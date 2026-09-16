@@ -115,7 +115,7 @@ type fakeClient struct {
 	noise     *NoiseSession
 	frameKeys *FrameKeys
 	seq       uint64
-	packetNo  uint64
+	packetNo  atomic.Uint64
 	recvSeq   uint64 // next in-order server DATA seq expected by readData
 }
 
@@ -181,11 +181,11 @@ func (c *fakeClient) handshakeWith(noiseMsg1 []byte, nk *ClientNK) {
 func (c *fakeClient) send(payload []byte) uint64 {
 	c.t.Helper()
 	c.seq++
-	c.packetNo++
+	c.packetNo.Add(1)
 	seq := c.seq
 	frame := &UDPCFrame{
 		Magic: UDPC_MAGIC_DEFAULT, Version: UDPC_VERSION, Cmd: CMD_DATA,
-		SessionID: c.sid, PacketNo: c.packetNo, Seq: seq, Data: payload,
+		SessionID: c.sid, PacketNo: c.packetNo.Load(), Seq: seq, Data: payload,
 	}
 	wire := SealFrameAEAD(frame, c.frameKeys.Send, payload)
 	if _, err := c.conn.WriteToUDP(wire, c.server); err != nil {
@@ -220,7 +220,7 @@ func (c *fakeClient) readData(timeout time.Duration) (uint64, []byte) {
 			if f.Seq < c.recvSeq {
 				ack := &UDPCFrame{
 					Magic: UDPC_MAGIC_DEFAULT, Version: UDPC_VERSION, Cmd: CMD_ACK,
-					SessionID: c.sid, PacketNo: atomic.AddUint64(&c.packetNo, 1),
+					SessionID: c.sid, PacketNo: c.packetNo.Add(1),
 					Ack: f.Seq,
 				}
 				wire := SealFrameAEAD(ack, c.frameKeys.Send, nil)
@@ -623,7 +623,7 @@ func BenchmarkTwoClientsOneServer(b *testing.B) {
 		conn     *net.UDPConn
 		sid      uint32
 		seq      uint64
-		packetNo uint64
+		packetNo atomic.Uint64
 		keys     *FrameKeys
 	}
 	dials := make([]*client, 2)
@@ -663,9 +663,9 @@ func BenchmarkTwoClientsOneServer(b *testing.B) {
 			buf := make([]byte, 2048)
 			for i := 0; i < perClient; i++ {
 				c.seq++
-				c.packetNo++
+				c.packetNo.Add(1)
 				wire := SealFrameAEAD(&UDPCFrame{Magic: UDPC_MAGIC_DEFAULT, Version: UDPC_VERSION,
-					Cmd: CMD_DATA, SessionID: c.sid, PacketNo: c.packetNo, Seq: c.seq, Data: msg}, c.keys.Send, msg)
+					Cmd: CMD_DATA, SessionID: c.sid, PacketNo: c.packetNo.Load(), Seq: c.seq, Data: msg}, c.keys.Send, msg)
 				c.conn.WriteToUDP(wire, saddr)
 				for {
 					c.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -686,10 +686,10 @@ func BenchmarkTwoClientsOneServer(b *testing.B) {
 						// Release the server's bounded send window; without this
 						// benchmark eventually stalls after 256 responses and only
 						// measures retransmission timeouts.
-						c.packetNo++
+						c.packetNo.Add(1)
 						ack := SealFrameAEAD(&UDPCFrame{
 							Magic: UDPC_MAGIC_DEFAULT, Version: UDPC_VERSION, Cmd: CMD_ACK,
-							SessionID: c.sid, PacketNo: c.packetNo, Ack: f.Seq,
+							SessionID: c.sid, PacketNo: c.packetNo.Load(), Ack: f.Seq,
 						}, c.keys.Send, nil)
 						if _, err := c.conn.WriteToUDP(ack, saddr); err != nil {
 							atomic.AddInt32(&failed, 1)

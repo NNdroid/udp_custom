@@ -36,9 +36,10 @@ curl -fsSL https://raw.githubusercontent.com/NNdroid/udp_custom/master/scripts/i
 
 ### 3. Pin a Release Version (Optional)
 Leave `APP_VERSION` unset to install the latest release. To install a specific
-raw-binary release, supply its tag (`v1.0.yyyyMMdd-<7-character-git-hash>`):
+raw-binary release, supply its tag
+(`v1.0.yyyyMMdd.<commit-count>-<7-character-git-hash>`):
 ```bash
-curl -fsSL https://raw.githubusercontent.com/NNdroid/udp_custom/master/scripts/install.sh | sudo env APP_VERSION=v1.0.20260904-1a2b3c4 bash -s install server
+curl -fsSL https://raw.githubusercontent.com/NNdroid/udp_custom/master/scripts/install.sh | sudo env APP_VERSION=v1.0.20260904.123-1a2b3c4 bash -s install server
 ```
 
 ### 4. Upgrade / Uninstall

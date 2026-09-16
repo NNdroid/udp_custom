@@ -15,7 +15,7 @@ import (
 	"github.com/NNdroid/udp_custom/tunnel"
 )
 
-var Version = "1.2.0"
+var Version = "v1.0.0-dev"
 
 type Config struct {
 	// Mode selects what this binary does: "server" (default, also when absent)

@@ -1,8 +1,10 @@
 name: Release
 
-# Pushing v1.0.yyyyMMdd-<current-commit-short-sha> creates a
-# GitHub Release. A manual run creates no Release; it uploads one Actions
-# artifact instead.
+# Pushing a tag v1.0.* creates a GitHub Release. The release version string is
+# derived from git metadata (scripts/version.sh):
+#   v1.0.yyyyMMdd.<commit-count>-<short-sha>
+# so the same rule is used for local builds and CI. A manual run creates no
+# Release; it uploads one Actions artifact instead.
 on:
   push:
     tags:
@@ -30,16 +32,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          short_sha=$(git rev-parse --short=7 HEAD)
+          # Auto-generate the version from git metadata (same rule as local builds).
+          derived="$(bash "${GITHUB_WORKSPACE}/scripts/version.sh")"
 
           if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
-            version="${GITHUB_REF_NAME}"
-            if ! [[ "${version}" =~ ^v1.0.[0-9]{8}-${short_sha}$ ]]; then
-              echo "Tag must be v1.0 + yyyyMMdd-${short_sha} (the short hash of the tagged commit)." >&2
+            # The pushed tag IS the release version; it must follow the rule
+            # (v1.0.yyyyMMdd.<commit-count>-<7-char-sha>), i.e. what
+            # "git tag $(scripts/version.sh)" produces.
+            tag="${GITHUB_REF_NAME}"
+            if ! [[ "${tag}" =~ ^v1\.0\.[0-9]{8}\.[0-9]+-[0-9a-f]{7}$ ]]; then
+              echo "Tag must be v1.0.yyyyMMdd.<commit-count>-<7-char-sha>." >&2
+              echo "Create it with:  git tag \$(scripts/version.sh) && git push --tags" >&2
               exit 1
             fi
+            version="${tag}"
           else
-            version="v1.0.197121date -u +%Y%m%d)-"
+            # Manual dispatch: use the git-derived version (no release is created).
+            version="${derived}"
           fi
 
           echo "version=${version}" >> "${GITHUB_OUTPUT}"

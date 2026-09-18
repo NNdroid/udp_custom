@@ -18,6 +18,14 @@ import (
 )
 
 // Parameters MUST stay in sync with app.fjj.stun.util.ShareCryptoUtils (Stun Android / TV client).
+//
+// Security note: the key is PBKDF2(numeric PIN, salt, 10000, SHA-256). A 6-digit
+// PIN is ~20 bits of entropy, so ANYONE who observes a stun:// URI can recover
+// the embedded profile — including the tunnel PSK — by brute-forcing 10^6 PINs
+// offline in seconds. The URI and its PIN must therefore travel over channels
+// as trusted as the PSK itself (never paste both into the same public chat).
+// The iteration count and PIN length cannot be raised unilaterally: the Android
+// client hard-codes the same parameters.
 const (
 	shareSaltLen    = 16
 	shareIvLen      = 12

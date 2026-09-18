@@ -56,7 +56,7 @@ func truncRig(t *testing.T, log Logger) (*packetReader, *net.UDPConn) {
 		t.Fatalf("client listen: %v", err)
 	}
 	t.Cleanup(func() { cli.Close() })
-	return newPacketReader(srv, log), cli
+	return newPacketReader(srv, log, true), cli
 }
 
 func truncSend(t *testing.T, cli *net.UDPConn, r *packetReader, payload []byte) {
@@ -178,7 +178,7 @@ func TestPacketReaderDrainParsesOwnAncillarySlot(t *testing.T) {
 		t.Skipf("IP_RECVORIGDSTADDR unavailable: %v", err)
 	}
 
-	r := newPacketReader(srv, nil)
+	r := newPacketReader(srv, nil, false)
 	cli, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
 	if err != nil {
 		t.Fatalf("client listen: %v", err)

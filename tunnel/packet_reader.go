@@ -23,7 +23,8 @@ import (
 // captures most of the win portably.
 type packetReader struct {
 	conn   *net.UDPConn
-	logger Logger      // may be nil; burst-drain visibility
+	logger Logger      // may be nil; truncation diagnostics (warn level)
+	debug  bool        // gates the per-burst drain trace (debug level)
 	bufs   [][]byte    // recvBatch receive buffers, reused every call
 	oob    [][]byte    // linux: ancillary-data buffers (origdst); nil elsewhere
 	pkts   []udpPacket // result views into bufs
@@ -44,8 +45,8 @@ type udpPacket struct {
 
 const recvBatch = 16
 
-func newPacketReader(conn *net.UDPConn, logger Logger) *packetReader {
-	r := &packetReader{conn: conn, logger: logger}
+func newPacketReader(conn *net.UDPConn, logger Logger, debug bool) *packetReader {
+	r := &packetReader{conn: conn, logger: logger, debug: debug}
 	for i := 0; i < recvBatch; i++ {
 		buf := make([]byte, UDPC_MAX_PKT)
 		r.bufs = append(r.bufs, buf)
@@ -98,10 +99,11 @@ func (r *packetReader) next() ([]udpPacket, error) {
 
 	// Drain the socket: an already-expired deadline makes every further read
 	// return immediately (data or timeout), so up to recvBatch-1 extra
-	// datagrams are pulled with zero poller wakeups.
+	// datagrams are pulled with zero poller wakeups. The deadline is set once
+	// — an expired deadline stays expired, and successful reads do not clear it.
 	drain := time.Now().Add(-time.Millisecond)
+	r.conn.SetReadDeadline(drain)
 	for ; k < recvBatch; k++ {
-		r.conn.SetReadDeadline(drain)
 		if r.oob != nil {
 			n, oobn, msgFlags, from, err = r.conn.ReadMsgUDPAddrPort(r.bufs[k], r.oob[k])
 			if err == nil {
@@ -112,7 +114,11 @@ func (r *packetReader) next() ([]udpPacket, error) {
 				}
 				if msgFlags&msgTruncDataFlag != 0 {
 					r.warnTruncated(n, from)
-					continue // keep the slot for the next datagram
+					// The slot still holds the PREVIOUS batch's packet — reuse
+					// it for the next datagram instead of shipping the stale
+					// view to the caller (k-- cancels this loop step).
+					k--
+					continue
 				}
 			}
 		} else {
@@ -127,8 +133,10 @@ func (r *packetReader) next() ([]udpPacket, error) {
 	// Restore blocking behaviour for the next cycle's first read.
 	r.conn.SetReadDeadline(time.Time{})
 	// Burst visibility: one poller wakeup yielding k>1 datagrams proves the
-	// drain loop is amortizing syscalls under load.
-	if r.logger != nil && k > 1 {
+	// drain loop is amortizing syscalls under load. Gated on a precomputed
+	// debug flag: a hot-path Debugf must not pay for variadic boxing (or a
+	// global log mutex) when debug output is off.
+	if r.debug && k > 1 {
 		r.logger.Debugf("[Recv] 🌊 burst drain: %d datagrams in one wakeup", k)
 	}
 	return r.pkts[:k], nil

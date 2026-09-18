@@ -141,7 +141,7 @@ func TestNoiseSameIPControlAllowsPortRebinding(t *testing.T) {
 	if rig.sess.getRemoteAddr() != rebound {
 		t.Fatalf("remote address = %v, want %v", rig.sess.getRemoteAddr(), rebound)
 	}
-	if got := rig.sess.pathAddrs[45679]; got != rebound {
+	if got := rig.sess.pathAddrs[45679].addr; got != rebound {
 		t.Fatalf("rebound path = %v, want %v", got, rebound)
 	}
 }

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -67,8 +66,12 @@ func GenerateUDPCustomURI(host, port, password, magic, pubKey, remark, pin strin
 	profJSON, _ := json.Marshal(prof)
 	stunURI, usedPin, err := encryptStunURI(profJSON, pin)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to encrypt share URI (%v); falling back to plaintext stun://.\n", err)
-		stunURI = "stun://" + base64.StdEncoding.EncodeToString(profJSON)
+		// Never label a cleartext URI as "encrypted": the profile embeds the
+		// tunnel PSK, so a mislabeled fallback silently leaks it to anyone who
+		// scans the QR. Fail loudly instead of printing a poisoned share link.
+		fmt.Fprintf(os.Stderr, "Error: failed to encrypt the share URI (%v); refusing to print the profile as plaintext under an encrypted label.\n", err)
+		fmt.Fprintf(os.Stderr, "Share the [2] Direct Protocol URI instead, or retry with a different PIN.\n")
+		return ""
 	}
 
 	// 2. Direct Protocol URI (plaintext, for non-Stun clients)

@@ -109,10 +109,23 @@ type ServerConfig struct {
 // unacked map and the retransmit backlog for a stalled client.
 const defaultSendWindow = 256
 
+// targetWriteTimeout bounds each delivery run to the backend. Without it a
+// backend that stops reading fills its TCP receive window and blocks writeToTarget
+// indefinitely — freezing the whole receive socket (no ACKs, no PONGs, no new
+// handshakes for any session multiplexed onto it).
+const targetWriteTimeout = 30 * time.Second
+
 const (
 	pathChallengeTTL  = 5 * time.Second
 	maxPathChallenges = 8
 )
+
+// pathEntry is one known reply path: the client's public (post-NAT) address
+// seen on a pre-DNAT destination port, and when the mapping was last written.
+type pathEntry struct {
+	addr   netip.AddrPort
+	usedAt time.Time
+}
 
 type pathChallenge struct {
 	token   [pathChallengeSize]byte
@@ -203,6 +216,25 @@ func (s *Server) logInfo(format string, v ...interface{}) {
 func (s *Server) logWarn(format string, v ...interface{}) {
 	s.logger.Warnf(format, v...)
 }
+
+// warnWeakPSKs flags short shared secrets without echoing them: the v2
+// handshake lets anyone who captures one SYN verify PSK guesses offline (the
+// SYN MAC covers only public wire data), so PSK entropy is the whole game for
+// PSK-only sessions.
+func warnWeakPSKs(logger Logger, psks []string) {
+	weak := 0
+	for _, psk := range psks {
+		if len(psk) < minPSKEntropyBytes {
+			weak++
+		}
+	}
+	if weak > 0 {
+		logger.Warnf("⚠️ %d of %d configured PSK(s) are shorter than %d bytes — a captured handshake allows OFFLINE guessing; use a long random secret (e.g. 32+ bytes)", weak, len(psks), minPSKEntropyBytes)
+	}
+}
+
+// minPSKEntropyBytes is the length below which a PSK is flagged at startup.
+const minPSKEntropyBytes = 16
 
 func (s *Server) logError(format string, v ...interface{}) {
 	s.logger.Errorf(format, v...)
@@ -365,6 +397,10 @@ type ServerSession struct {
 
 	unacked   map[uint64]*unackedPkt
 	unackedMu sync.Mutex
+	// lowestOutstanding is the smallest Seq possibly still in unacked, so
+	// cumulative ACKs delete a forward run instead of scanning the whole map.
+	// Guarded by unackedMu.
+	lowestOutstanding uint64
 	// unackedCond is broadcast when frames are ACKed (window space freed) and
 	// when the session closes, waking senders parked on the send window.
 	unackedCond *sync.Cond
@@ -378,8 +414,9 @@ type ServerSession struct {
 	// port the client last contacted — the key to traversing a CGNAT.
 	lastOrigPort int32
 	// pathAddrs maps each server-side port this session has been seen on to
-	// the client's public (post-NAT) address for that path.
-	pathAddrs map[int]netip.AddrPort
+	// the client's public (post-NAT) address for that path, plus when the
+	// mapping was last written (drives least-recently-used eviction).
+	pathAddrs map[int]pathEntry
 	pathMu    sync.RWMutex
 
 	challengeMu    sync.Mutex
@@ -724,6 +761,7 @@ func (s *Server) Start() error {
 	netType, target := parseTargetNetworkAndAddr(s.cfg.TargetAddr)
 	s.logInfo("UDP server: %s -> Target [%s] %s (origdst=%v)", s.conn.LocalAddr(), netType, target, s.origDstOK)
 	s.logInfo("Protocol v2 authentication enabled with %d valid PSK(s)", len(s.cfg.Passwords))
+	warnWeakPSKs(s.logger, s.cfg.Passwords)
 
 	go s.cleanupLoop()
 
@@ -741,7 +779,7 @@ func (s *Server) Start() error {
 // recovers the client's pre-DNAT destination port via IP_RECVORIGDSTADDR when
 // origdst is enabled, so replies can be mirrored back from that port.
 func (s *Server) serveConn(conn *net.UDPConn) {
-	reader := newPacketReader(conn, s.logger)
+	reader := newPacketReader(conn, s.logger, s.loggerLevel() <= 0)
 	// A transient read error (ENOBUFS under a burst, EINTR from a signal, a
 	// timeout racing Close) must NOT end this loop: this goroutine is the only
 	// thing pulling datagrams off the socket, and letting it die leaves the
@@ -1086,7 +1124,7 @@ func (s *Server) handleHandshake(remoteAddr netip.AddrPort, frame *UDPCFrame, or
 		sessionID:     sid,
 		raddr:         remoteAddr,
 		lastOrigPort:  int32(origPort),
-		pathAddrs:     make(map[int]netip.AddrPort),
+		pathAddrs:     make(map[int]pathEntry),
 		targetNetwork: targetNet,
 		targetAddr:    targetHostPort,
 		upstream:      upstream,
@@ -1198,12 +1236,15 @@ func (sess *ServerSession) sendToSession(data []byte) {
 	localPort := int(atomic.LoadInt32(&sess.lastOrigPort))
 
 	sess.pathMu.RLock()
-	addr := sess.pathAddrs[localPort]
+	addr := sess.pathAddrs[localPort].addr
 	if !addr.IsValid() {
-		for p, a := range sess.pathAddrs {
-			if p > 0 {
-				localPort, addr = p, a
-				break
+		// lastOrigPort no longer maps (it was evicted or never set): fall back
+		// to the MOST RECENTLY USED known path rather than an arbitrary one.
+		var best time.Time
+		first := true
+		for p, pe := range sess.pathAddrs {
+			if p > 0 && (first || pe.usedAt.After(best)) {
+				localPort, addr, best, first = p, pe.addr, pe.usedAt, false
 			}
 		}
 	}
@@ -1297,7 +1338,7 @@ func (sess *ServerSession) setPath(origPort int, addr netip.AddrPort) {
 	}
 	if atomic.LoadInt32(&sess.lastOrigPort) == int32(origPort) {
 		sess.pathMu.RLock()
-		unchanged := sess.pathAddrs[origPort] == addr
+		unchanged := sess.pathAddrs[origPort].addr == addr
 		sess.pathMu.RUnlock()
 		if unchanged {
 			return
@@ -1305,15 +1346,23 @@ func (sess *ServerSession) setPath(origPort int, addr netip.AddrPort) {
 	}
 	sess.pathMu.Lock()
 	if sess.pathAddrs == nil {
-		sess.pathAddrs = make(map[int]netip.AddrPort)
+		sess.pathAddrs = make(map[int]pathEntry)
 	}
 	if _, exists := sess.pathAddrs[origPort]; !exists && len(sess.pathAddrs) >= sess.server.sockPool.limit {
-		for port := range sess.pathAddrs {
-			delete(sess.pathAddrs, port)
-			break
+		// Evict the LEAST RECENTLY USED path, never a random one: dropping the
+		// currently preferred path would make replies leave from the wrong
+		// source port through a CGNAT until the client's next packet heals it.
+		oldestPort := 0
+		var oldest time.Time
+		first := true
+		for port, pe := range sess.pathAddrs {
+			if first || pe.usedAt.Before(oldest) {
+				oldestPort, oldest, first = port, pe.usedAt, false
+			}
 		}
+		delete(sess.pathAddrs, oldestPort)
 	}
-	sess.pathAddrs[origPort] = addr
+	sess.pathAddrs[origPort] = pathEntry{addr: addr, usedAt: time.Now()}
 	sess.pathMu.Unlock()
 	old := atomic.SwapInt32(&sess.lastOrigPort, int32(origPort))
 	if old != int32(origPort) {
@@ -1477,6 +1526,12 @@ func (sess *ServerSession) acceptPathResponse(remoteAddr netip.AddrPort, data []
 func (sess *ServerSession) encodeFrame(f *UDPCFrame) []byte {
 	f.PacketNo = sess.sendPacketNo.Add(1)
 	if f.PacketNo == 0 {
+		// The 64-bit packet-number space is exhausted: reusing any value under
+		// the same session key would replay a nonce. The only safe move is to
+		// retire the session (unreachable in practice — ~584 years at 1G
+		// frames/s — but the failure must not be silent).
+		sess.server.logError("[Session 0x%08X] 💀 packet-number space exhausted; closing session", sess.sessionID)
+		sess.Close()
 		return nil
 	}
 	if sess.frameKeys == nil {
@@ -1492,7 +1547,12 @@ func (sess *ServerSession) encodeFrame(f *UDPCFrame) []byte {
 // space is exhausted.
 func (sess *ServerSession) sendControl(f *UDPCFrame, send func([]byte) error) bool {
 	f.PacketNo = sess.sendPacketNo.Add(1)
-	if f.PacketNo == 0 || sess.frameKeys == nil {
+	if f.PacketNo == 0 {
+		sess.server.logError("[Session 0x%08X] 💀 packet-number space exhausted; closing session", sess.sessionID)
+		sess.Close()
+		return false
+	}
+	if sess.frameKeys == nil {
 		return false
 	}
 	wire := sealControlFrameAEAD(f, sess.frameKeys.Send)
@@ -1523,7 +1583,7 @@ func (sess *ServerSession) sameRemoteIP(addr netip.AddrPort) bool {
 
 func (sess *ServerSession) handleAck(ackSeq uint64) {
 	sess.unackedMu.Lock()
-	if len(sess.unacked) == 0 {
+	if len(sess.unacked) == 0 || ackSeq < sess.lowestOutstanding {
 		sess.unackedMu.Unlock()
 		return
 	}
@@ -1536,10 +1596,28 @@ func (sess *ServerSession) handleAck(ackSeq uint64) {
 		// retransmitted; the RTT of a retransmitted one is not trustworthy.
 		sess.rttEst.Sample(time.Since(pkt.firstSent))
 	}
-	for seq := range sess.unacked {
-		if seq <= ackSeq {
-			delete(sess.unacked, seq)
+	// Seqs are handed out by a single atomic counter and every sent frame is
+	// inserted, so the map is the contiguous range [lowest..highest] (up to an
+	// insert racing this lock). Delete the ACKed prefix forward from the
+	// watermark instead of scanning all 256 slots per ACK.
+	for seq := sess.lowestOutstanding; seq <= ackSeq; seq++ {
+		delete(sess.unacked, seq)
+	}
+	if len(sess.unacked) == 0 {
+		sess.lowestOutstanding = ackSeq + 1
+	} else if _, ok := sess.unacked[ackSeq+1]; ok {
+		sess.lowestOutstanding = ackSeq + 1
+	} else {
+		// Hole below the expected watermark: an insert raced the lock (its Seq
+		// was allocated but not yet filed). Rescan for the true minimum —
+		// bounded by sendWindow and rare.
+		minSeq := uint64(^uint64(0))
+		for seq := range sess.unacked {
+			if seq < minSeq {
+				minSeq = seq
+			}
 		}
+		sess.lowestOutstanding = minSeq
 	}
 	sess.unackedMu.Unlock()
 	// Free send-window space; keep the broadcast outside the lock to avoid
@@ -1565,7 +1643,9 @@ func (sess *ServerSession) handleDataFromPath(frame *UDPCFrame, remoteAddr netip
 			// Already delivered. The peer is retransmitting because it never
 			// saw our ACK, so re-ACK (cumulative) instead of silently
 			// dropping — otherwise it would keep retrying until it gave up
-			// and tore the session down.
+			// and tore the session down. setPath here lets the re-ACK follow
+			// a NAT rebinding whose original ACK (and path update) was lost.
+			sess.setPath(origPort, remoteAddr)
 			sess.sendCumulativeACK(expected - 1)
 			return true
 		}
@@ -1598,8 +1678,13 @@ func (sess *ServerSession) handleDataFromPath(frame *UDPCFrame, remoteAddr netip
 	sess.touch()
 
 	// In-order delivery. Gather the contiguous run (this frame plus anything
-	// already buffered behind it) under the lock, then deliver
-	// OUTSIDE the lock so a slow target write cannot stall the receive path.
+	// already buffered behind it) and advance recvSeq UNDER the lock, then
+	// deliver OUTSIDE the lock so a slow target write cannot stall the receive
+	// path. Advancing under the lock is what makes the gather atomic against a
+	// duplicate arriving on a second receive socket: once recvSeq has moved,
+	// a retransmitted frame from inside the run takes the re-ACK branch
+	// instead of re-buffering itself into a slot the gather never revisits
+	// (which used to leak the slot until session close).
 	type pending struct {
 		seq     uint64
 		payload []byte
@@ -1616,26 +1701,26 @@ func (sess *ServerSession) handleDataFromPath(frame *UDPCFrame, remoteAddr netip
 		run = append(run, pending{seq: next, payload: raw})
 		next++
 	}
+	sess.recvSeq.Store(expected + uint64(len(run)))
 	sess.recvMu.Unlock()
 
-	delivered := uint64(0)
+	// Bound the delivery: a backend that stops reading must not freeze this
+	// receive socket (no ACKs, no PONGs, no new handshakes for every session
+	// multiplexed onto it). One deadline covers the whole run; the next
+	// delivery refreshes it.
+	if sess.upstream != nil {
+		_ = sess.upstream.SetWriteDeadline(time.Now().Add(targetWriteTimeout))
+	}
 	for _, p := range run {
 		if err := sess.writeToTarget(p.payload); err != nil {
 			sess.server.logWarn("[Session 0x%08X] ❌ target write failed: %v", sess.sessionID, err)
 			sess.Close()
 			return true
 		}
-		delivered++
 	}
-
-	if delivered == 0 {
-		return true
-	}
-
-	sess.recvSeq.Store(expected + delivered)
 
 	// Ack the highest contiguous sequence we have just delivered.
-	sess.sendCumulativeACK(expected + delivered - 1)
+	sess.sendCumulativeACK(expected + uint64(len(run)) - 1)
 	return true
 }
 
@@ -1735,6 +1820,9 @@ func (sess *ServerSession) sendData(payload []byte) error {
 
 	sess.unackedMu.Lock()
 	now := time.Now()
+	if len(sess.unacked) == 0 {
+		sess.lowestOutstanding = seq
+	}
 	sess.unacked[seq] = &unackedPkt{
 		wire:      encoded,
 		firstSent: now,
@@ -1758,7 +1846,12 @@ func (sess *ServerSession) sendData(payload []byte) error {
 func (sess *ServerSession) upstreamToUdpLoop() {
 	defer sess.Close()
 	sess.awaitMtuGate()
-	buf := make([]byte, sess.server.maxPayload())
+	// One byte more than the frame budget: a UDP datagram that fills the
+	// buffer exactly cannot be distinguished from a truncated one, but a
+	// datagram LARGER than the budget reports len(buf) — Read on a connected
+	// UDP socket truncates silently, and forwarding the cut-down bytes would
+	// corrupt the datagram's contents while preserving its boundary.
+	buf := make([]byte, sess.server.maxPayload()+1)
 	for {
 		if atomic.LoadInt32(&sess.closed) == 1 {
 			return
@@ -1769,6 +1862,11 @@ func (sess *ServerSession) upstreamToUdpLoop() {
 				sess.server.logWarn("[Session 0x%08X] ⚠️ Target TCP read error: %v", sess.sessionID, err)
 			}
 			return
+		}
+		if sess.targetNetwork == "udp" && n >= len(buf) {
+			sess.server.logWarn("[Session 0x%08X] 🗑️ dropping target datagram larger than the %d-byte frame budget (truncated read)",
+				sess.sessionID, sess.server.maxPayload())
+			continue
 		}
 		if n > 0 {
 			sess.touch()
@@ -1855,25 +1953,43 @@ func (sess *ServerSession) retransmitLoop() {
 			return
 		case <-ticker.C:
 			now := time.Now()
+			// Collect the frames due for retransmission and do all bookkeeping
+			// under the lock, then send OUTSIDE it: a sendto(2) (and a cold
+			// reply-socket bind) must not block handleAck or the send window —
+			// stalling the ACK path delays the very ACKs that would drain the
+			// backlog.
+			type dueRetransmit struct {
+				wire []byte
+				seq  uint64
+			}
+			due := make([]dueRetransmit, 0, 8)
+			maxedOut := false
 			sess.unackedMu.Lock()
 			for seq, pkt := range sess.unacked {
-				if now.Sub(pkt.sentTime) >= pkt.rto {
-					if pkt.retries >= 15 {
-						sess.server.logWarn("[Session 0x%08X] ⚠️ Max retries reached for Seq %d, closing session", sess.sessionID, seq)
-						sess.unackedMu.Unlock()
-						sess.Close()
-						return
-					}
-					pkt.retries++
-					pkt.sentTime = now
-					pkt.rto = time.Duration(float64(pkt.rto) * 1.5) // back off 1.5x from the adaptive RTO
-					if pkt.rto > sess.rttEst.maxRTT {
-						pkt.rto = sess.rttEst.maxRTT
-					}
-					sess.sendToSession(pkt.wire)
+				if now.Sub(pkt.sentTime) < pkt.rto {
+					continue
 				}
+				if pkt.retries >= 15 {
+					sess.server.logWarn("[Session 0x%08X] ⚠️ Max retries reached for Seq %d, closing session", sess.sessionID, seq)
+					maxedOut = true
+					break
+				}
+				pkt.retries++
+				pkt.sentTime = now
+				pkt.rto = time.Duration(float64(pkt.rto) * 1.5) // back off 1.5x from the adaptive RTO
+				if pkt.rto > sess.rttEst.maxRTT {
+					pkt.rto = sess.rttEst.maxRTT
+				}
+				due = append(due, dueRetransmit{wire: pkt.wire, seq: seq})
 			}
 			sess.unackedMu.Unlock()
+			if maxedOut {
+				sess.Close()
+				return
+			}
+			for _, d := range due {
+				sess.sendToSession(d.wire)
+			}
 		}
 	}
 }
@@ -2087,6 +2203,10 @@ type synLimiter struct {
 	burst   float64
 }
 
+// synLimiterMaxBuckets caps the per-source-IP bucket map. ~1024 spoofable
+// source IPs × ~150 B is negligible; the point is that the cap exists at all.
+const synLimiterMaxBuckets = 1024
+
 type synBucket struct {
 	tokens float64
 	last   time.Time
@@ -2107,17 +2227,26 @@ func newSynLimiter(ratePerSec, burst float64) *synLimiter {
 }
 
 // Allow consumes one token for ip. It never blocks.
+//
+// The bucket map is hard-capped: SYN handling runs before authentication, and
+// UDP source IPs are freely spoofable, so an attacker must not be able to grow
+// this map without bound. When the cap is reached, long-idle buckets are
+// pruned first; if churn keeps the map at the cap, NEW sources are denied
+// until space frees up (existing sources keep their budgets).
 func (l *synLimiter) Allow(ip string, now time.Time) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	b, ok := l.buckets[ip]
 	if !ok {
-		if len(l.buckets) >= 1024 {
+		if len(l.buckets) >= synLimiterMaxBuckets {
 			for k, ob := range l.buckets {
 				if now.Sub(ob.last) > time.Minute {
 					delete(l.buckets, k)
 				}
+			}
+			if len(l.buckets) >= synLimiterMaxBuckets {
+				return false // map still at cap: deny the unseen source
 			}
 		}
 		b = &synBucket{tokens: l.burst, last: now}

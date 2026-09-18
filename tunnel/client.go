@@ -105,6 +105,10 @@ type Client struct {
 	maxPkt int    // largest record we put on the wire (see ClientConfig.MaxPkt)
 	logger Logger // never nil after NewClient (tests may build bare literals)
 
+	// logLevel is resolved ONCE at construction (injected logger = 0 = debug
+	// on) so hot paths can gate debug work without parsing strings per packet.
+	logLevel int
+
 	dialer *SpreadDialer
 
 	sessions sync.Map // sessionID -> *clientSession
@@ -185,8 +189,21 @@ func (c *Client) SetEventHandler(h func(ClientEvent)) {
 func (c *Client) EventsDropped() uint64 { return c.events.droppedCount() }
 
 type pendingHandshake struct {
-	ackMAC [32]byte
-	ch     chan *UDPCFrame
+	// ackMACs holds the expected ACK authentication key derived from EACH
+	// configured PSK: the server answers with whichever PSK matched the SYN,
+	// so a client mid-rotation must accept any of its own list.
+	ackMACs [][32]byte
+	ch      chan *UDPCFrame
+}
+
+// verifyAck authenticates a raw ACK under any configured PSK.
+func (p *pendingHandshake) verifyAck(raw []byte) bool {
+	for i := range p.ackMACs {
+		if VerifyFrameAuth(raw, &p.ackMACs[i]) == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // DialOptions carries the per-tunnel parameters for Client.DialTunnel.
@@ -229,11 +246,21 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	logger := resolveLogger(cfg.Logger, cfg.LogLevel)
 	maxPkt := resolveMaxPkt(cfg.MaxPkt, logger)
 	logger.Infof("📏 [mtu] %s", describeMaxPkt(maxPkt))
+	warnWeakPSKs(logger, cfg.Passwords)
+
+	// Same rule as the server: an injected Logger receives everything (0 =
+	// debug on); otherwise parse the level string once. An empty level means
+	// the unfiltered StdLogger, which is also debug-on.
+	clientLogLevel := 0
+	if cfg.Logger == nil && cfg.LogLevel != "" {
+		clientLogLevel = LogLevel(cfg.LogLevel)
+	}
 
 	return &Client{
 		cfg:         cfg,
 		magic:       cfg.Magic,
 		logger:      logger,
+		logLevel:    clientLogLevel,
 		maxPkt:      maxPkt,
 		probeCache:  &mtuProbeCache{},
 		dialer:      dialer,
@@ -543,7 +570,7 @@ func (c *Client) recvFromSocket(conn *net.UDPConn) error {
 	//
 	// Close does not need a polling deadline: Client.Close closes the socket
 	// via dialer.Close, which unblocks the first (deadline-less) read.
-	reader := newPacketReader(conn, c.logger)
+	reader := newPacketReader(conn, c.logger, c.logLevel <= LogLevelDebug)
 	for {
 		pkts, err := reader.next()
 		if err != nil {
@@ -582,7 +609,7 @@ func (c *Client) dispatch(frame *UDPCFrame) {
 		c.ackMu.Unlock()
 		// Authenticate before enqueueing so a forged burst cannot occupy the
 		// bounded candidate queue and starve the genuine server response.
-		if pending != nil && VerifyFrameAuth(frame.raw, &pending.ackMAC) == nil {
+		if pending != nil && pending.verifyAck(frame.raw) {
 			owned := *frame
 			owned.raw = append([]byte(nil), frame.raw...)
 			owned.Data = owned.raw[UDPC_HDR_SIZE : UDPC_HDR_SIZE+len(frame.Data)]
@@ -798,7 +825,14 @@ func (c *Client) handshake(ctx context.Context, target string) (uint32, *NoiseSe
 		c.ackMu.Unlock()
 		return 0, nil, nil, "", ErrNonceCollision
 	}
-	c.pendingAcks[clientNonce] = &pendingHandshake{ackMAC: handshakeKeys.AckMAC, ch: ch}
+	// Precompute the expected ACK MAC under EVERY configured PSK: the server
+	// replies with whichever one matched the SYN, so PSK rotation on either
+	// side must not strand clients that list all valid passwords.
+	ackMACs := make([][32]byte, len(c.cfg.Passwords))
+	for i, psk := range c.cfg.Passwords {
+		ackMACs[i] = DerivePSKHandshakeKeys(psk, clientNonce).AckMAC
+	}
+	c.pendingAcks[clientNonce] = &pendingHandshake{ackMACs: ackMACs, ch: ch}
 	c.ackMu.Unlock()
 	defer func() {
 		c.ackMu.Lock()
@@ -818,8 +852,18 @@ func (c *Client) handshake(ctx context.Context, target string) (uint32, *NoiseSe
 			case ack := <-ch:
 				// An unauthenticated forged ACK is noise, not a terminal handshake
 				// error. Keep waiting for the genuine response until the deadline.
-				if err := VerifyFrameAuth(ack.raw, &handshakeKeys.AckMAC); err != nil {
-					c.logDebug("[Client] 🔍 ignored invalid handshake ACK: %v", err)
+				// Find which of OUR PSKs the server answered with (rotation
+				// support): the same PSK then derives the session keys.
+				matchedPSK := ""
+				for _, psk := range c.cfg.Passwords {
+					k := DerivePSKHandshakeKeys(psk, clientNonce)
+					if VerifyFrameAuth(ack.raw, &k.AckMAC) == nil {
+						matchedPSK = psk
+						break
+					}
+				}
+				if matchedPSK == "" {
+					c.logDebug("[Client] 🔍 ignored invalid handshake ACK: not authenticated under any configured PSK")
 					continue
 				}
 				granted, noiseMsg2, err := splitAckPayload(ack.Data, encrypted)
@@ -835,7 +879,7 @@ func (c *Client) handshake(ctx context.Context, target string) (uint32, *NoiseSe
 				var serverNonce [serverNonceSize]byte
 				copy(serverNonce[:], ack.Data[clientNonceSize:ackPayloadBase])
 				if !encrypted {
-					keys := DerivePSKSessionKeys(c.cfg.Passwords[0], clientNonce, serverNonce, ack.SessionID)
+					keys := DerivePSKSessionKeys(matchedPSK, clientNonce, serverNonce, ack.SessionID)
 					frameKeys, err := keys.ClientFrameCiphers()
 					if err != nil {
 						timer.Stop()
@@ -899,8 +943,20 @@ type clientSession struct {
 	recvQueue map[uint64][]byte
 	recvMu    sync.Mutex
 
+	// deliverMu serializes application writes across spread-socket receive
+	// loops so gathered runs reach the app in gather order. It is separate
+	// from recvMu ON PURPOSE: s.conn (a net.Pipe end) blocks in Write until
+	// the application reads, and the application may be blocked on send-window
+	// space that only handleAck — running on this same receive loop — can
+	// free. Delivering under recvMu deadlocks the session.
+	deliverMu sync.Mutex
+
 	unacked     map[uint64]*unackedPkt
 	unackedMu   sync.Mutex
+	// lowestOutstanding is the smallest Seq possibly still in unacked, so
+	// cumulative ACKs delete a forward run instead of scanning the whole map.
+	// Guarded by unackedMu.
+	lowestOutstanding uint64
 	unackedCond *sync.Cond
 
 	rttEst *rttEstimator
@@ -1051,6 +1107,9 @@ func (s *clientSession) sendData(payload []byte) error {
 	rto := s.rttEst.RTO()
 	s.unackedMu.Lock()
 	now := time.Now()
+	if len(s.unacked) == 0 {
+		s.lowestOutstanding = seq
+	}
 	s.unacked[seq] = &unackedPkt{
 		wire:      encoded,
 		firstSent: now,
@@ -1070,14 +1129,31 @@ func (s *clientSession) sendData(payload []byte) error {
 
 func (s *clientSession) handleAck(ackSeq uint64) {
 	s.unackedMu.Lock()
+	if len(s.unacked) == 0 || ackSeq < s.lowestOutstanding {
+		s.unackedMu.Unlock()
+		return
+	}
 	// Cumulative, mirroring the server: everything up to ackSeq is delivered.
 	if pkt, ok := s.unacked[ackSeq]; ok && pkt.retries == 0 {
 		s.rttEst.Sample(time.Since(pkt.firstSent))
 	}
-	for seq := range s.unacked {
-		if seq <= ackSeq {
-			delete(s.unacked, seq)
+	// Delete the ACKed prefix forward from the watermark (seqs are contiguous
+	// by construction — see the server-side comment for the hole fallback).
+	for seq := s.lowestOutstanding; seq <= ackSeq; seq++ {
+		delete(s.unacked, seq)
+	}
+	if len(s.unacked) == 0 {
+		s.lowestOutstanding = ackSeq + 1
+	} else if _, ok := s.unacked[ackSeq+1]; ok {
+		s.lowestOutstanding = ackSeq + 1
+	} else {
+		minSeq := uint64(^uint64(0))
+		for seq := range s.unacked {
+			if seq < minSeq {
+				minSeq = seq
+			}
 		}
+		s.lowestOutstanding = minSeq
 	}
 	s.unackedMu.Unlock()
 	if s.unackedCond != nil {
@@ -1094,6 +1170,15 @@ func (s *clientSession) retransmitLoop() {
 			return
 		case <-ticker.C:
 			now := time.Now()
+			// Collect due frames and do the bookkeeping under the lock, then
+			// send OUTSIDE it: the sendto must not block handleAck (receive
+			// path) or the send-window wait — a stalled socket would delay the
+			// very ACKs that drain this queue.
+			type dueRetransmit struct {
+				wire []byte
+			}
+			due := make([]dueRetransmit, 0, 8)
+			abandoned := false
 			s.unackedMu.Lock()
 			for seq, pkt := range s.unacked {
 				if now.Sub(pkt.sentTime) < pkt.rto {
@@ -1103,15 +1188,21 @@ func (s *clientSession) retransmitLoop() {
 				if pkt.retries > clientMaxRetries {
 					s.client.logWarn("[Client] [Session 0x%08X] ⏱️ Seq %d abandoned after %d retries",
 						s.sid, seq, pkt.retries)
-					s.unackedMu.Unlock()
-					s.closeWithReason("max retransmits exceeded")
-					return
+					abandoned = true
+					break
 				}
 				pkt.sentTime = now
 				pkt.rto = minDuration(pkt.rto*3/2, 10*time.Second)
-				_ = s.client.dialer.Send(pkt.wire)
+				due = append(due, dueRetransmit{wire: pkt.wire})
 			}
 			s.unackedMu.Unlock()
+			if abandoned {
+				s.closeWithReason("max retransmits exceeded")
+				return
+			}
+			for _, d := range due {
+				_ = s.client.dialer.Send(d.wire)
+			}
 
 			s.mu.Lock()
 			idle := now.Sub(s.lastActive)
@@ -1154,35 +1245,41 @@ func (s *clientSession) keepAliveLoop() {
 
 // handleData delivers server data to the local application, buffering
 // out-of-order frames and ACKing every frame it delivers.
+//
+// Lock ordering: recvMu (reorder state) is NEVER held across the application
+// write or the ACK send — both can block (net.Pipe back-pressure, sendto).
+// deliverMu keeps runs in order across spread-socket receive loops.
 func (s *clientSession) handleData(frame *UDPCFrame) bool {
 	if frame.Seq == 0 {
 		return true
 	}
 
-	// Several spread sockets have independent receive loops, so the complete
-	// reorder/decrypt/deliver transition must be serialized. This prevents two
-	// copies of the same expected sequence from both reaching the application.
-	s.recvMu.Lock()
-	defer s.recvMu.Unlock()
-
 	payload := frame.Data
 
+	// Several spread sockets have independent receive loops, so the reorder
+	// decision (queue manipulation + recvSeq advance) must be serialized: two
+	// copies of the same expected sequence must never both be gathered.
+	s.recvMu.Lock()
 	expected := s.recvSeq.Load()
 	if frame.Seq != expected {
 		if frame.Seq < expected {
 			// Already delivered: the server is retransmitting because it lost
 			// our ACK, so re-ACK instead of dropping it.
+			s.recvMu.Unlock()
 			s.sendACK(expected - 1)
 			return true
 		}
 		if _, dup := s.recvQueue[frame.Seq]; dup {
+			s.recvMu.Unlock()
 			return true
 		}
 		if len(s.recvQueue) >= 512 {
+			s.recvMu.Unlock()
 			return false
 		}
 		s.recvQueue[frame.Seq] = append([]byte(nil), payload...)
 		s.touch()
+		s.recvMu.Unlock()
 		return true
 	}
 	s.touch()
@@ -1202,20 +1299,28 @@ func (s *clientSession) handleData(frame *UDPCFrame) bool {
 		run = append(run, pending{seq: next, payload: raw})
 		next++
 	}
+	// Advance under the lock: once recvSeq has moved, a duplicate arriving on
+	// another receive loop takes the re-ACK branch instead of re-buffering
+	// itself into a slot this gather will never revisit.
+	s.recvSeq.Store(expected + uint64(len(run)))
+	s.recvMu.Unlock()
 
-	delivered := uint64(0)
+	// Deliver OUTSIDE recvMu (see deliverMu): the app write blocks until the
+	// application reads, and that must never stall ACK processing — which is
+	// what frees the send window the app itself may be waiting on.
+	s.deliverMu.Lock()
 	for _, p := range run {
 		if err := writeAll(s.conn, p.payload); err != nil {
+			s.deliverMu.Unlock()
 			s.closeWithReason("application write failed")
 			return true
 		}
-		delivered++
 	}
+	s.deliverMu.Unlock()
 
-	if delivered > 0 {
-		s.recvSeq.Store(expected + delivered)
-		s.sendACK(expected + delivered - 1)
-	}
+	// Ack the highest contiguous sequence delivered. Sent outside recvMu so a
+	// slow sendto cannot block the other spread sockets' intake.
+	s.sendACK(expected + uint64(len(run)) - 1)
 	return true
 }
 
@@ -1236,7 +1341,13 @@ func (s *clientSession) sendACK(ackSeq uint64) {
 // lacks record protection or the packet-number space is exhausted.
 func (s *clientSession) sendControl(f *UDPCFrame, send func([]byte) error) bool {
 	f.PacketNo = s.sendPacketNo.Add(1)
-	if f.PacketNo == 0 || s.frameKeys == nil {
+	if f.PacketNo == 0 {
+		// 64-bit packet-number space exhausted — retire the session rather
+		// than replay a nonce under the same key.
+		s.closeWithReason("packet-number space exhausted")
+		return false
+	}
+	if s.frameKeys == nil {
 		return false
 	}
 	wire := sealControlFrameAEAD(f, s.frameKeys.Send)
@@ -1269,6 +1380,7 @@ func (s *clientSession) reackDuplicateData() {
 func (s *clientSession) encodeFrame(f *UDPCFrame) []byte {
 	f.PacketNo = s.sendPacketNo.Add(1)
 	if f.PacketNo == 0 {
+		s.closeWithReason("packet-number space exhausted")
 		return nil
 	}
 	if s.frameKeys == nil {

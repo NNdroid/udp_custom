@@ -2,7 +2,6 @@ package tunnel
 
 import (
 	"net"
-	"net/netip"
 	"sync"
 	"testing"
 	"time"
@@ -287,7 +286,7 @@ func TestSendToSession_RepliesFromLastPath(t *testing.T) {
 		server:       srv,
 		sessionID:    1,
 		lastOrigPort: int32(pathPort),
-		pathAddrs:    map[int]netip.AddrPort{pathPort: client.LocalAddr().(*net.UDPAddr).AddrPort()},
+		pathAddrs:    map[int]pathEntry{pathPort: {addr: client.LocalAddr().(*net.UDPAddr).AddrPort(), usedAt: time.Now()}},
 	}
 	sess.sendToSession([]byte("via-path"))
 
@@ -342,7 +341,10 @@ func TestMultipathSession_RoutesReplyPerPath(t *testing.T) {
 		server:       srv,
 		sessionID:    1,
 		lastOrigPort: int32(p1),
-		pathAddrs:    map[int]netip.AddrPort{p1: client1.LocalAddr().(*net.UDPAddr).AddrPort(), p2: client2.LocalAddr().(*net.UDPAddr).AddrPort()},
+		pathAddrs: map[int]pathEntry{
+			p1: {addr: client1.LocalAddr().(*net.UDPAddr).AddrPort(), usedAt: time.Now()},
+			p2: {addr: client2.LocalAddr().(*net.UDPAddr).AddrPort(), usedAt: time.Now().Add(-time.Minute)},
+		},
 	}
 
 	// Pre-flight: the reserved ports may have been stolen by the OS in the

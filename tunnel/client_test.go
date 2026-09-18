@@ -442,7 +442,7 @@ func TestClientFiltersForgedHandshakeACKBeforeCandidateQueue(t *testing.T) {
 	client := &Client{
 		magic: UDPC_MAGIC_DEFAULT,
 		pendingAcks: map[[clientNonceSize]byte]*pendingHandshake{
-			nonce: {ackMAC: keys.AckMAC, ch: ch},
+			nonce: {ackMACs: [][32]byte{keys.AckMAC}, ch: ch},
 		},
 	}
 	payload := append(append([]byte(nil), nonce[:]...), make([]byte, serverNonceSize)...)

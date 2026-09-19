@@ -74,6 +74,41 @@ jobs:
       - name: Test with race detector
         run: go test -count=1 -race ./...
 
+  # 32-bit RUNTIME verification. Alignment bugs ("unaligned 64-bit atomic
+  # operation") panic only when a 64-bit atomic op runs on a 32-bit CPU —
+  # compiling or vetting for GOARCH=386/arm does NOT catch them (see commit
+  # 5a8796c: the panic surfaced on real 32-bit ARM hardware). qemu-user via
+  # binfmt executes the 386/arm test binaries on the amd64 runner; syscalls
+  # (loopback UDP/TCP) pass straight through to the host kernel, so the
+  # end-to-end network tests run unchanged. The race detector has no 32-bit
+  # backend, so these are plain runs — their value is the alignment coverage.
+  test-linux-32bit:
+    name: Test (linux, 386 + arm runtime)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Install qemu-user (execute 32-bit test binaries)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-user-static
+
+      - name: Vet (386 + arm, compile-time check)
+        run: |
+          GOARCH=386 go vet ./...
+          GOARCH=arm go vet ./...
+
+      - name: Test 386 (runtime under qemu)
+        run: GOARCH=386 go test -count=1 -timeout 20m ./...
+
+      - name: Test arm (runtime under qemu)
+        run: GOARCH=arm go test -count=1 -timeout 20m ./...
+
   # Benchmarks run SEPARATELY from the merge gate: shared-runner timing noise
   # (±10-20%) makes hard ns/op thresholds a false-positive factory. These jobs
   # only prove the benchmarks execute and print the throughput numbers for

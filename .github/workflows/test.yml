@@ -80,8 +80,14 @@ jobs:
   # 5a8796c: the panic surfaced on real 32-bit ARM hardware). qemu-user via
   # binfmt executes the 386/arm test binaries on the amd64 runner; syscalls
   # (loopback UDP/TCP) pass straight through to the host kernel, so the
-  # end-to-end network tests run unchanged. The race detector has no 32-bit
-  # backend, so these are plain runs — their value is the alignment coverage.
+  # end-to-end network tests run unchanged.
+  #
+  # The race detector deliberately has NO 32-bit backend (verified: "-race is
+  # not supported on linux/386") — TSan only ships for 64-bit targets. Race
+  # coverage therefore comes from the 64-bit jobs above: data races are
+  # scheduler-level bugs independent of word size, so the combination
+  # "64-bit -race green + 32-bit plain run green" is the full coverage.
+  # The value of THIS job is alignment + word-size + 32-bit-int coverage.
   test-linux-32bit:
     name: Test (linux, 386 + arm runtime)
     runs-on: ubuntu-latest
@@ -108,6 +114,70 @@ jobs:
 
       - name: Test arm (runtime under qemu)
         run: GOARCH=arm go test -count=1 -timeout 20m ./...
+
+  # 32-bit benchmarks under qemu: word-size + alignment coverage of the same
+  # hot-path suite the 64-bit benchmark jobs run. The numbers carry qemu
+  # emulation overhead AND 32-bit word size, so they are NOT comparable with
+  # the 64-bit runs — they exist for 32-bit-vs-32-bit regression tracking
+  # across commits (benchstat on this artifact series) and to prove the bench
+  # suite itself is 32-bit-safe. benchtime is halved (1s) because qemu roughly
+  # triples wall time. CPU/mem pprof is skipped here: SIGPROF-based sampling
+  # under qemu-user is unreliable and would produce misleading flamegraphs.
+  benchmark-32bit:
+    name: Benchmark (linux, 386 + arm)
+    runs-on: ubuntu-latest
+    # qemu timings are noisy; never block merges
+    continue-on-error: true
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Install qemu-user (execute 32-bit binaries)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-user-static
+
+      - name: Throughput benchmarks 386 (Target x protocol)
+        run: >
+          GOARCH=386 go test -run XXX
+          -bench 'BenchmarkTCPTarget_|BenchmarkUDPTarget_'
+          -benchmem -benchtime=1s
+          ./tunnel/ | tee benchmark-32bit.txt
+
+      - name: Micro benchmarks 386 (codec, AEAD, replay filter)
+        run: >
+          GOARCH=386 go test -run XXX
+          -bench 'BenchmarkFrame|BenchmarkNoise|BenchmarkReplayFilter'
+          -benchmem -benchtime=1s
+          ./tunnel/ | tee -a benchmark-32bit.txt
+
+      - name: Throughput benchmarks arm (Target x protocol)
+        run: >
+          GOARCH=arm go test -run XXX
+          -bench 'BenchmarkTCPTarget_|BenchmarkUDPTarget_'
+          -benchmem -benchtime=1s
+          ./tunnel/ | tee benchmark-32bit-arm.txt
+
+      - name: Micro benchmarks arm (codec, AEAD, replay filter)
+        run: >
+          GOARCH=arm go test -run XXX
+          -bench 'BenchmarkFrame|BenchmarkNoise|BenchmarkReplayFilter'
+          -benchmem -benchtime=1s
+          ./tunnel/ | tee -a benchmark-32bit-arm.txt
+
+      - name: Upload 32-bit benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmarks-32bit-${{ github.sha }}
+          path: |
+            benchmark-32bit.txt
+            benchmark-32bit-arm.txt
+          retention-days: 30
 
   # Benchmarks run SEPARATELY from the merge gate: shared-runner timing noise
   # (±10-20%) makes hard ns/op thresholds a false-positive factory. These jobs

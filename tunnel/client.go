@@ -38,7 +38,7 @@ const (
 	clientMaxHandshakeAttempts = 8
 	clientHandshakeBackoff     = 400 * time.Millisecond
 	clientKeepAliveInterval    = 15 * time.Second
-	clientRecvTimeout          = 75 * time.Second // > server's 60s idle cleanup
+	clientRecvTimeout          = 210 * time.Second // > server's 180s weak-network idle cleanup
 	clientMaxRetries           = 15
 	clientRetransmitInterval   = 50 * time.Millisecond
 )
@@ -951,13 +951,13 @@ type clientSession struct {
 	// free. Delivering under recvMu deadlocks the session.
 	deliverMu sync.Mutex
 
-	unacked     map[uint64]*unackedPkt
-	unackedMu   sync.Mutex
+	unacked   map[uint64]*unackedPkt
+	unackedMu sync.Mutex
 	// lowestOutstanding is the smallest Seq possibly still in unacked, so
 	// cumulative ACKs delete a forward run instead of scanning the whole map.
 	// Guarded by unackedMu.
 	lowestOutstanding uint64
-	unackedCond *sync.Cond
+	unackedCond       *sync.Cond
 
 	rttEst *rttEstimator
 
@@ -1230,12 +1230,17 @@ func (s *clientSession) keepAliveLoop() {
 			if sinceSend < clientKeepAliveInterval {
 				continue
 			}
-			ping := &UDPCFrame{
-				Magic: s.client.magic, Version: UDPC_VERSION, Cmd: CMD_PING,
-				SessionID: s.sid, Ack: s.currentAck(),
+			// Send a redundant pair over the spread dialer. Control records are
+			// intentionally not part of the DATA ARQ queue, so two independently
+			// routed PINGs sharply reduce false idle death during burst loss.
+			for i := 0; i < 2; i++ {
+				ping := &UDPCFrame{
+					Magic: s.client.magic, Version: UDPC_VERSION, Cmd: CMD_PING,
+					SessionID: s.sid, Ack: s.currentAck(),
+				}
+				s.sendControl(ping, s.client.dialer.Send)
+				s.client.logDebug("[Client] [Session 0x%08X] 💓 keepalive PING %d/2 sent (ack=%d)", s.sid, i+1, ping.Ack)
 			}
-			s.sendControl(ping, s.client.dialer.Send)
-			s.client.logDebug("[Client] [Session 0x%08X] 💓 keepalive PING sent (ack=%d)", s.sid, ping.Ack)
 			s.mu.Lock()
 			s.lastSent = time.Now()
 			s.mu.Unlock()

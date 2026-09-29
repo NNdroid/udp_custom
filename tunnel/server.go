@@ -65,6 +65,11 @@ type ServerConfig struct {
 	// the upstream pump starts ungated.
 	MtuProbe *bool `json:"-"`
 
+	// FEC enables negotiated adaptive Reed-Solomon forward error correction.
+	// nil = enabled; the server only activates it for clients that authenticated
+	// the corresponding handshake capability bit.
+	FEC *bool `json:"-"`
+
 	// PortRange is the UDP port range the firewall DNATs onto ListenAddr. It
 	// is the single source of truth for the client port range: the server
 	// uses it at runtime to validate that every recovered original-destination
@@ -377,6 +382,9 @@ type ServerSession struct {
 	frameKeys *FrameKeys
 
 	rttEst *rttEstimator // adaptive RTO estimator (RFC 6298 + Karn's rule)
+
+	fecSend *fecSender
+	fecRecv *fecReceiver
 
 	// maxPkt is this session's frame budget, set by the client's
 	// CMD_MTU_COMMIT after its path probe converges. Zero = no commit received
@@ -929,6 +937,9 @@ func (sess *ServerSession) processIncomingFrame(frame *UDPCFrame, remoteAddr net
 		}
 		return false
 	}
+	if sess.fecSend != nil && frame.Flags&FLAG_FEC_FEEDBACK != 0 {
+		sess.fecSend.observeRemoteBasisPoints(frame.WindowSize)
+	}
 	if !sess.handleIncomingFrame(frame, remoteAddr, origPort) {
 		// DATA rejection is temporary (full application queue or an IP path that
 		// is still being validated). Roll only DATA back so its byte-identical
@@ -1121,6 +1132,8 @@ func (s *Server) handleHandshake(remoteAddr netip.AddrPort, frame *UDPCFrame, or
 		return
 	}
 
+	fecNegotiated := fecEnabled(s.cfg.FEC) && frame.Flags&FLAG_FEC_CAPABLE != 0
+
 	// Record protection: Noise traffic uses the forward-secret transport keys;
 	// PSK-only traffic uses AEAD keys derived from the PSK + both nonces + SID
 	// (same wire format, but no forward secrecy).
@@ -1135,6 +1148,7 @@ func (s *Server) handleHandshake(remoteAddr netip.AddrPort, frame *UDPCFrame, or
 			return
 		}
 	}
+	frameKeys.fec = fecNegotiated
 
 	sess := &ServerSession{
 		server:        s,
@@ -1154,6 +1168,10 @@ func (s *Server) handleHandshake(remoteAddr netip.AddrPort, frame *UDPCFrame, or
 		mtuGate:       make(chan struct{}),
 	}
 	sess.unackedCond = sync.NewCond(&sess.unackedMu)
+	if frameKeys.fec {
+		sess.fecRecv = newFECReceiver()
+		sess.fecSend = newFECSender(sess.sendFECParity)
+	}
 	// seq counters start at 1: first frame uses seq 1. sendPacketNo starts
 	// at 0 (its first AddUint64 returns 1).
 	sess.sendSeq.Store(1)
@@ -1169,10 +1187,15 @@ func (s *Server) handleHandshake(remoteAddr netip.AddrPort, frame *UDPCFrame, or
 	ackData = append(ackData, serverNonce[:]...)
 	ackData = appendTargetTLV(ackData, requestedTarget)
 	ackData = append(ackData, noiseMsg2...)
+	ackFlags := uint16(0)
+	if fecNegotiated {
+		ackFlags |= FLAG_FEC_CAPABLE
+	}
 	ackFrame := &UDPCFrame{
 		Magic:      s.cfg.Magic,
 		Version:    UDPC_VERSION,
 		Cmd:        CMD_HANDSHAKE_ACK,
+		Flags:      ackFlags,
 		SessionID:  sid,
 		Seq:        0,
 		Ack:        0,
@@ -1185,6 +1208,9 @@ func (s *Server) handleHandshake(remoteAddr netip.AddrPort, frame *UDPCFrame, or
 	s.replyFromOrigPort(origPort, remoteAddr, ackEncoded)
 
 	s.logInfo("[Session 0x%08X] ✅ Established for %s -> Target [%s] %s", sid, remoteAddr, targetNet, targetHostPort)
+	if fecNegotiated {
+		s.logInfo("[Session 0x%08X] 🧩 adaptive Reed-Solomon FEC negotiated", sid)
+	}
 	if requestedTarget != "" {
 		s.logInfo("[Session 0x%08X] 🎯 Client-requested target honored: %s", sid, requestedTarget)
 	}
@@ -1414,6 +1440,9 @@ func (sess *ServerSession) handleIncomingFrame(frame *UDPCFrame, remoteAddr neti
 		// probed at all) — either way the frame budget question is settled for
 		// the target->client direction too.
 		sess.openMtuGate()
+		if sess.fecRecv != nil {
+			sess.deliverRecoveredFEC(sess.fecRecv.onData(frame.Seq, frame.Data), remoteAddr, origPort)
+		}
 		return sess.handleDataFromPath(frame, remoteAddr, origPort)
 	}
 
@@ -1435,6 +1464,10 @@ func (sess *ServerSession) handleIncomingFrame(frame *UDPCFrame, remoteAddr neti
 		}
 		sess.sendControl(pong, func(data []byte) error { sess.sendToSession(data); return nil })
 
+	case CMD_FEC:
+		if sess.fecRecv != nil {
+			sess.deliverRecoveredFEC(sess.fecRecv.onParityFrame(frame), remoteAddr, origPort)
+		}
 	case CMD_FIN:
 		sess.server.logInfo("[Session 0x%08X] 👋 Received FIN from client", sess.sessionID)
 		sess.Close()
@@ -1541,6 +1574,7 @@ func (sess *ServerSession) acceptPathResponse(remoteAddr netip.AddrPort, data []
 // format, header as AAD, Poly1305 tag in the trailer). The buffer is freshly
 // allocated: only use for frames whose wire bytes are retained (DATA).
 func (sess *ServerSession) encodeFrame(f *UDPCFrame) []byte {
+	sess.applyFECFeedback(f)
 	f.PacketNo = sess.sendPacketNo.Add(1)
 	if f.PacketNo == 0 {
 		// The 64-bit packet-number space is exhausted: reusing any value under
@@ -1563,6 +1597,7 @@ func (sess *ServerSession) encodeFrame(f *UDPCFrame) []byte {
 // Returns false when the session lacks record protection or the packet-number
 // space is exhausted.
 func (sess *ServerSession) sendControl(f *UDPCFrame, send func([]byte) error) bool {
+	sess.applyFECFeedback(f)
 	f.PacketNo = sess.sendPacketNo.Add(1)
 	if f.PacketNo == 0 {
 		sess.server.logError("[Session 0x%08X] 💀 packet-number space exhausted; closing session", sess.sessionID)
@@ -1579,6 +1614,40 @@ func (sess *ServerSession) sendControl(f *UDPCFrame, send func([]byte) error) bo
 	_ = send(wire)
 	putFireAndForgetBuf(wire)
 	return true
+}
+
+func (sess *ServerSession) applyFECFeedback(f *UDPCFrame) {
+	if f != nil && sess.fecRecv != nil {
+		f.Flags |= FLAG_FEC_FEEDBACK
+		f.WindowSize = sess.fecRecv.feedbackBasisPoints()
+	}
+}
+
+func (sess *ServerSession) sendFECParity(p fecParityShard) {
+	if atomic.LoadInt32(&sess.closed) == 1 || sess.fecSend == nil {
+		return
+	}
+	f := &UDPCFrame{
+		Magic: sess.server.cfg.Magic, Version: UDPC_VERSION, Cmd: CMD_FEC,
+		SessionID: sess.sessionID, Ack: sess.currentAck(),
+	}
+	if !p.applyToFrame(f) {
+		return
+	}
+	sess.sendControl(f, func(data []byte) error { sess.sendToSession(data); return nil })
+}
+
+func (sess *ServerSession) deliverRecoveredFEC(recovered []fecRecovered, remoteAddr netip.AddrPort, origPort int) {
+	for _, r := range recovered {
+		if r.Seq == 0 {
+			continue
+		}
+		f := &UDPCFrame{
+			Magic: sess.server.cfg.Magic, Version: UDPC_VERSION, Cmd: CMD_DATA,
+			SessionID: sess.sessionID, Seq: r.Seq, Data: r.Payload,
+		}
+		_ = sess.handleDataFromPath(f, remoteAddr, origPort)
+	}
 }
 
 func (sess *ServerSession) currentAck() uint64 {
@@ -1618,6 +1687,9 @@ func (sess *ServerSession) handleAck(ackSeq uint64) {
 	// insert racing this lock). Delete the ACKed prefix forward from the
 	// watermark instead of scanning all 256 slots per ACK.
 	for seq := sess.lowestOutstanding; seq <= ackSeq; seq++ {
+		if pkt, ok := sess.unacked[seq]; ok && sess.fecSend != nil {
+			sess.fecSend.observeAck(pkt.retries > 0)
+		}
 		delete(sess.unacked, seq)
 	}
 	if len(sess.unacked) == 0 {
@@ -1852,6 +1924,9 @@ func (sess *ServerSession) sendData(payload []byte) error {
 	// Server-initiated: reply on the most recently used path so the source
 	// port matches the port the client last contacted.
 	sess.sendToSession(encoded)
+	if sess.fecSend != nil {
+		sess.fecSend.add(seq, payload)
+	}
 	return nil
 }
 
@@ -1930,6 +2005,9 @@ func (sess *ServerSession) maxPayload() int {
 		if p := payloadCap(mp); p < budget {
 			budget = p
 		}
+	}
+	if sess.fecSend != nil {
+		budget = fecDataPayloadCap(budget)
 	}
 	return budget
 }
@@ -2014,6 +2092,9 @@ func (sess *ServerSession) retransmitLoop() {
 func (sess *ServerSession) Close() {
 	sess.closeOnce.Do(func() {
 		atomic.StoreInt32(&sess.closed, 1)
+		if sess.fecSend != nil {
+			sess.fecSend.close()
+		}
 		// Wake senders parked on the send window before anything else touches
 		// the mutex they are waiting on.
 		sess.unackedMu.Lock()

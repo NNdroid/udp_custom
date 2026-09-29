@@ -8,4 +8,9 @@ require (
 	golang.org/x/crypto v0.53.0
 )
 
-require golang.org/x/sys v0.46.0
+require (
+	github.com/klauspost/reedsolomon v1.14.2
+	golang.org/x/sys v0.46.0
+)
+
+require github.com/klauspost/cpuid/v2 v2.3.0 // indirect

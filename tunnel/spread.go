@@ -63,6 +63,11 @@ type SpreadDialer struct {
 	closed     int32
 	closeOnce  sync.Once
 	listenUDP  UDPListenFunc
+
+	// generation increments whenever a failed socket is replaced. Higher
+	// layers use it to invalidate path-dependent state (notably the MTU probe
+	// cache): a new local UDP socket can mean a new route/NAT mapping/path MTU.
+	generation atomic.Uint64
 }
 
 // UDPListenFunc lets an embedding application create the unconnected UDP
@@ -223,6 +228,11 @@ func resolveServerIP(host string) (net.IP, error) {
 // the whole configured range is spread per-packet (no fixed subset).
 func (d *SpreadDialer) Paths() int { return d.fixedPaths }
 
+// Generation reports how many local UDP socket replacements have completed.
+// A change means path-dependent observations made before it (for example an
+// MTU probe result) should be considered stale.
+func (d *SpreadDialer) Generation() uint64 { return d.generation.Load() }
+
 // pickPortsFromRange returns n distinct ports drawn uniformly at random from
 // pr. If n >= pr.Total() the whole range is returned. Uses a per-call RNG so
 // the spread is not predictable across sessions.
@@ -284,6 +294,61 @@ func (d *SpreadDialer) Next() (int, int) {
 	return idx, d.socks[idx].sel.Next()
 }
 
+// sendAtPort performs one datagram write and repairs a permanently failed
+// local socket in-place. The retry uses the SAME destination port: only the
+// local NAT mapping changes, while the authenticated session remains valid.
+// Transient congestion errors are returned without rebuilding the socket — ARQ
+// already retries those packets and socket churn would make a burst worse.
+func (d *SpreadDialer) sendAtPort(idx, port int, frame []byte) error {
+	if atomic.LoadInt32(&d.closed) == 1 {
+		return ErrNoRoute
+	}
+	if idx < 0 || idx >= len(d.socks) {
+		return fmt.Errorf("spread: socket index %d out of range (have %d)", idx, len(d.socks))
+	}
+
+	d.destMu.RLock()
+	serverAddr := d.serverAddr
+	d.destMu.RUnlock()
+	sock := d.socks[idx]
+	sock.mu.RLock()
+	failed := sock.conn
+	_, err := failed.WriteToUDPAddrPort(frame, netip.AddrPortFrom(serverAddr, uint16(port)))
+	sock.mu.RUnlock()
+	if err == nil || !shouldReopenUDPWriteError(err) {
+		return err
+	}
+	if atomic.LoadInt32(&d.closed) == 1 {
+		return ErrNoRoute
+	}
+
+	// Reopen coalesces concurrent read/write failures using the failed pointer:
+	// if the recv supervisor already replaced this slot, we simply receive the
+	// current socket and retry through it.
+	replacement, reopenErr := d.Reopen(idx, failed)
+	if reopenErr != nil {
+		return fmt.Errorf("spread: UDP write failed: %w; socket rebuild failed: %v", err, reopenErr)
+	}
+
+	// Reopen may also refresh a hostname, so read the destination again.
+	d.destMu.RLock()
+	serverAddr = d.serverAddr
+	d.destMu.RUnlock()
+	sock.mu.RLock()
+	current := sock.conn
+	if current == nil {
+		sock.mu.RUnlock()
+		return ErrNoRoute
+	}
+	// Prefer the socket currently published in the slot. It can differ from
+	// replacement only if another repair raced after ours; in that case the
+	// newest socket is the correct one to use.
+	_, retryErr := current.WriteToUDPAddrPort(frame, netip.AddrPortFrom(serverAddr, uint16(port)))
+	sock.mu.RUnlock()
+	_ = replacement // documents the coalescing result and keeps the call explicit
+	return retryErr
+}
+
 // SendAt writes a frame from a specific local socket to a freshly chosen
 // remote port.
 func (d *SpreadDialer) SendAt(idx int, frame []byte) error {
@@ -294,14 +359,7 @@ func (d *SpreadDialer) SendAt(idx int, frame []byte) error {
 		return fmt.Errorf("spread: socket index %d out of range (have %d)", idx, len(d.socks))
 	}
 	port := d.socks[idx].sel.Next()
-	d.destMu.RLock()
-	serverAddr := d.serverAddr
-	d.destMu.RUnlock()
-	sock := d.socks[idx]
-	sock.mu.RLock()
-	_, err := sock.conn.WriteToUDPAddrPort(frame, netip.AddrPortFrom(serverAddr, uint16(port)))
-	sock.mu.RUnlock()
-	return err
+	return d.sendAtPort(idx, port, frame)
 }
 
 // Send writes a frame using the round-robin socket and that socket's port
@@ -312,14 +370,7 @@ func (d *SpreadDialer) Send(frame []byte) error {
 	if idx < 0 {
 		return ErrNoRoute
 	}
-	d.destMu.RLock()
-	serverAddr := d.serverAddr
-	d.destMu.RUnlock()
-	sock := d.socks[idx]
-	sock.mu.RLock()
-	_, err := sock.conn.WriteToUDPAddrPort(frame, netip.AddrPortFrom(serverAddr, uint16(port)))
-	sock.mu.RUnlock()
-	return err
+	return d.sendAtPort(idx, port, frame)
 }
 
 // Conn returns the underlying socket at idx so the client can run its own
@@ -370,6 +421,7 @@ func (d *SpreadDialer) Reopen(idx int, failed *net.UDPConn) (*net.UDPConn, error
 	}
 	old := sock.conn
 	sock.conn = conn
+	d.generation.Add(1)
 	if old != nil {
 		_ = old.Close()
 	}

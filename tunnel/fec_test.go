@@ -151,7 +151,10 @@ func TestFECRemoteLossFeedbackRaisesParity(t *testing.T) {
 	})
 	defer sender.close()
 	sender.blocks = fecBootstrapBlocks
-	sender.observeRemoteBasisPoints(800) // 8% reported receive loss => 3 parity
+	// Remote reports are intentionally smoothed with alpha=0.25. The first 8%
+	// sample therefore becomes ~2%, which should raise a clean path from zero
+	// parity to one parity shard without overreacting to a single report.
+	sender.observeRemoteBasisPoints(800)
 
 	block := make([]fecSourceShard, fecDataShardsMax)
 	for i := range block {
@@ -161,7 +164,7 @@ func TestFECRemoteLossFeedbackRaisesParity(t *testing.T) {
 	mu.Lock()
 	got := count
 	mu.Unlock()
-	if got != 3 {
-		t.Fatalf("remote loss feedback emitted %d parity shards, want 3", got)
+	if got != 1 {
+		t.Fatalf("smoothed remote loss feedback emitted %d parity shards, want 1", got)
 	}
 }

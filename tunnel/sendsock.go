@@ -48,6 +48,12 @@ import (
 //     exceeds the limit — that is deliberate: exceeding a soft bound is always
 //     better than closing a socket mid-write. The overflow is reclaimed at the
 //     next insert or the next unpin-to-zero.
+//
+//   - Poisoned-socket repair: a permanent write failure invalidates that exact
+//     cached socket, re-binds the same source port, and retries the datagram
+//     once. Without this a dead cached descriptor was returned forever and the
+//     server repeatedly fell back to its main listening port; strict NAT/CGNAT
+//     then dropped every reply until the process was restarted.
 type sendSockPool struct {
 	limit int
 
@@ -59,7 +65,7 @@ type sendSockPool struct {
 	total   atomic.Int32 // number of entries currently in conns
 	clock   atomic.Int64 // monotonic recency stamp source; never reused, immune to coarse wall clocks
 	evictMu sync.Mutex   // serializes overflow-eviction scans only; never held on the hit path
-	bindMu  sync.Mutex   // serializes bind+publish on the cold path only; never held on the hit path
+	bindMu  sync.Mutex   // serializes bind/publish/repair on the cold path only; never held on healthy hits
 	closed  atomic.Bool
 	logf    func(format string, v ...interface{})
 }
@@ -72,12 +78,13 @@ type sendSockPool struct {
 const DefaultSendSockMax = 512
 
 // pooledConn is one cached UDP socket. It wraps the raw *net.UDPConn with the
-// two pieces of metadata the pool needs: a reference count pinning the socket
-// against eviction for the duration of each write, and a timestamped recency
-// stamp replacing the old list-based LRU order.
+// metadata the pool needs: its source port, a reference count pinning the
+// socket against normal LRU eviction for the duration of each write, and a
+// timestamped recency stamp replacing the old list-based LRU order.
 type pooledConn struct {
 	pool *sendSockPool
 	conn *net.UDPConn
+	port int
 
 	refs    atomic.Int32 // >0 while a WriteToUDPAddrPort through this socket is in flight
 	lastUse atomic.Int64 // pool clock stamp of the most recent Get; eviction reclaims the oldest
@@ -87,11 +94,7 @@ type pooledConn struct {
 // bound port need no knowledge of the pooling.
 func (pc *pooledConn) LocalAddr() net.Addr { return pc.conn.LocalAddr() }
 
-// WriteToUDPAddrPort pins the socket (refs++) for the duration of the write so
-// a concurrent overflow eviction can never close it underneath the caller
-// (P0-2). After the write the reference is dropped; if that uncovered an
-// overflow, the deferred reclamation runs right here.
-func (pc *pooledConn) WriteToUDPAddrPort(b []byte, addr netip.AddrPort) (int, error) {
+func (pc *pooledConn) writeOnce(b []byte, addr netip.AddrPort) (int, error) {
 	pc.refs.Add(1)
 	n, err := pc.conn.WriteToUDPAddrPort(b, addr)
 	remaining := pc.refs.Add(-1)
@@ -99,6 +102,19 @@ func (pc *pooledConn) WriteToUDPAddrPort(b []byte, addr netip.AddrPort) (int, er
 		pc.pool.reclaimOverflow()
 	}
 	return n, err
+}
+
+// WriteToUDPAddrPort pins the socket for the write. A transient send-pressure
+// error is returned to the caller (ARQ retries it). A permanent error repairs
+// the cached socket in-place and retries the SAME datagram once from the same
+// source port, preserving strict-NAT symmetry without requiring a process
+// restart.
+func (pc *pooledConn) WriteToUDPAddrPort(b []byte, addr netip.AddrPort) (int, error) {
+	n, err := pc.writeOnce(b, addr)
+	if err == nil || pc.pool == nil || !shouldReopenUDPWriteError(err) {
+		return n, err
+	}
+	return pc.pool.repairAndRetry(pc, b, addr, err)
 }
 
 func newSendSockPool(limit int, logf func(format string, v ...interface{})) *sendSockPool {
@@ -117,10 +133,7 @@ func newSendSockPool(limit int, logf func(format string, v ...interface{})) *sen
 func (p *sendSockPool) nextStamp() int64 { return p.clock.Add(1) }
 
 // Get returns the pooled socket bound to the given local port, creating it on
-// demand. It never returns a nil conn together with a nil error. The returned
-// *pooledConn is pointer-stable across cache hits; a write racing an eviction
-// can still observe a closed socket and surface the error — the send path
-// treats that exactly like any other write failure (fall back to main).
+// demand. It never returns a nil conn together with a nil error.
 func (p *sendSockPool) Get(port int) (*pooledConn, error) {
 	if port <= 0 || port > 65535 {
 		return nil, fmt.Errorf("invalid source port %d", port)
@@ -139,19 +152,17 @@ func (p *sendSockPool) Get(port int) (*pooledConn, error) {
 
 	// Slow path: this port is seen for the first time (or was evicted). The
 	// bind+publish pair runs under bindMu so two racers for the SAME port can
-	// never both bind: without it the loser gets EADDRINUSE while the winner
-	// is still between bind and publish, and a single re-check cannot close
-	// that window (observed as a flaky failure under -count=1 load). The
-	// mutex is NEVER taken on the cache-hit path — the per-datagram hot path
-	// stays lock-free (P0-1) — so it is only contended when several ports are
-	// bound for the first time at the same instant, an event that happens at
-	// most once per port per pool lifetime.
+	// never both bind.
 	p.bindMu.Lock()
 	if v, ok := p.conns.Load(port); ok { // racer published while we waited
 		p.bindMu.Unlock()
 		pc := v.(*pooledConn)
 		pc.lastUse.Store(p.nextStamp())
 		return pc, nil
+	}
+	if p.closed.Load() {
+		p.bindMu.Unlock()
+		return nil, fmt.Errorf("send socket pool is closed")
 	}
 	uc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: port})
 	if err != nil {
@@ -163,7 +174,7 @@ func (p *sendSockPool) Get(port int) (*pooledConn, error) {
 	}
 	_ = uc.SetWriteBuffer(socketBufferSize)
 
-	pc := &pooledConn{pool: p, conn: uc}
+	pc := &pooledConn{pool: p, conn: uc, port: port}
 	pc.lastUse.Store(p.nextStamp())
 	p.conns.Store(port, pc)
 	p.bindMu.Unlock()
@@ -175,13 +186,74 @@ func (p *sendSockPool) Get(port int) (*pooledConn, error) {
 	if int(n) > p.limit {
 		// Pin the brand-new socket while the overflow scan runs: with every
 		// older entry pinned it would otherwise be the ONLY unpinned candidate
-		// and evict itself before the caller ever writes through it — which
-		// would silently degrade this very reply to the main socket.
+		// and evict itself before the caller ever writes through it.
 		pc.refs.Add(1)
 		p.reclaimOverflow()
 		pc.refs.Add(-1)
 	}
 	return pc, nil
+}
+
+// repairAndRetry replaces a permanently failed cached socket and retries one
+// datagram. bindMu coalesces concurrent repair attempts for the same port. If
+// another goroutine already published a replacement, use that socket instead.
+func (p *sendSockPool) repairAndRetry(broken *pooledConn, b []byte, addr netip.AddrPort, cause error) (int, error) {
+	if broken == nil || broken.port <= 0 {
+		return 0, cause
+	}
+	if p.closed.Load() {
+		return 0, cause
+	}
+
+	p.bindMu.Lock()
+	if p.closed.Load() {
+		p.bindMu.Unlock()
+		return 0, cause
+	}
+	if v, ok := p.conns.Load(broken.port); ok && v != any(broken) {
+		replacement := v.(*pooledConn)
+		replacement.lastUse.Store(p.nextStamp())
+		p.bindMu.Unlock()
+		return replacement.WriteToUDPAddrPort(b, addr)
+	}
+
+	if actual, loaded := p.conns.LoadAndDelete(broken.port); loaded && actual == any(broken) {
+		p.total.Add(-1)
+	}
+	// A permanent write failure means this descriptor is no longer useful.
+	// Closing may make concurrent writers fail too; they converge here and use
+	// the single replacement published below.
+	_ = broken.conn.Close()
+
+	uc, bindErr := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: broken.port})
+	if bindErr != nil {
+		p.bindMu.Unlock()
+		if p.logf != nil {
+			p.logf("[SockPool] ❌ repair port=%d after write error (%v) failed: %v", broken.port, cause, bindErr)
+		}
+		return 0, fmt.Errorf("reply socket write failed: %w; rebind port %d failed: %v", cause, broken.port, bindErr)
+	}
+	_ = uc.SetWriteBuffer(socketBufferSize)
+	replacement := &pooledConn{pool: p, conn: uc, port: broken.port}
+	replacement.lastUse.Store(p.nextStamp())
+	p.conns.Store(broken.port, replacement)
+	ncached := p.total.Add(1)
+	p.bindMu.Unlock()
+
+	if p.logf != nil {
+		p.logf("[SockPool] 🔁 repaired port=%d after write failure (cached=%d/limit=%d)", broken.port, ncached, p.limit)
+	}
+	if int(ncached) > p.limit {
+		replacement.refs.Add(1)
+		p.reclaimOverflow()
+		replacement.refs.Add(-1)
+	}
+
+	n, retryErr := replacement.writeOnce(b, addr)
+	if retryErr != nil {
+		return n, fmt.Errorf("reply socket repaired after %v but retry failed: %w", cause, retryErr)
+	}
+	return n, nil
 }
 
 // reclaimOverflow evicts least-recently-used UNPINNED sockets until the pool
@@ -193,8 +265,6 @@ func (p *sendSockPool) reclaimOverflow() {
 	defer p.evictMu.Unlock()
 
 	for p.total.Load() > int32(p.limit) {
-		// Collect unpinned candidates. Eviction is rare (only on overflow),
-		// so the O(n) scan is fine next to the cost of getting this wrong.
 		type cand struct {
 			port int
 			pc   *pooledConn
@@ -215,17 +285,12 @@ func (p *sendSockPool) reclaimOverflow() {
 		})
 
 		victim := cands[0]
-		// Re-check refs immediately before removal: a writer may have pinned
-		// the entry between the scan and here. Closing then would still be
-		// SAFE (the write fails and the caller falls back to the main socket),
-		// but skipping keeps the good path deterministic. Bump the stamp so
-		// the next scan does not spin on the same pinned entry.
 		if victim.pc.refs.Load() != 0 {
 			victim.pc.lastUse.Store(p.nextStamp())
 			return
 		}
 		if actual, loaded := p.conns.LoadAndDelete(victim.port); !loaded || actual != any(victim.pc) {
-			return // someone else replaced it; nothing to do this round
+			return
 		}
 		p.total.Add(-1)
 		_ = victim.pc.conn.Close()

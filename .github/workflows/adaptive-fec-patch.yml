@@ -1,0 +1,160 @@
+name: Adaptive FEC integration
+
+on:
+  push:
+    branches:
+      - feature/adaptive-fec
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  integrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feature/adaptive-fec
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Wire FEC into protocol and data paths
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def patch(path, edits):
+              p = Path(path)
+              text = p.read_text()
+              for old, new in edits:
+                  n = text.count(old)
+                  if n != 1:
+                      raise SystemExit(f"{path}: expected one anchor, got {n}: {old[:100]!r}")
+                  text = text.replace(old, new, 1)
+              p.write_text(text)
+
+          patch("tunnel/protocol.go", [
+              ("\tCMD_MTU_COMMIT      = uint8(0x0C)\n",
+               "\tCMD_MTU_COMMIT      = uint8(0x0C)\n\tCMD_FEC             = uint8(0x0D)\n\n\t// FEC capability is negotiated inside the authenticated handshake header.\n\t// Loss feedback rides established records in WindowSize as basis points.\n\tFLAG_FEC_CAPABLE = uint16(1 << 0)\n\tFLAG_FEC_FEEDBACK = uint16(1 << 1)\n"),
+              ("type FrameKeys struct {\n\tSend *AEADCipherState\n\tRecv *AEADCipherState\n}\n",
+               "type FrameKeys struct {\n\tSend *AEADCipherState\n\tRecv *AEADCipherState\n\n\t// fec is set only when BOTH peers authenticated FLAG_FEC_CAPABLE during\n\t// the handshake. Keeping it on the derived session state avoids changing\n\t// the public handshake API while making mixed-version rollout safe.\n\tfec bool\n}\n"),
+              ("func validUDPCCommand(cmd uint8) bool {\n\treturn cmd >= CMD_HANDSHAKE_SYN && cmd <= CMD_MTU_COMMIT\n}\n",
+               "func validUDPCCommand(cmd uint8) bool {\n\treturn cmd >= CMD_HANDSHAKE_SYN && cmd <= CMD_FEC\n}\n"),
+              ("\tcase CMD_DATA:\n\t\treturn frame.Seq != 0\n\tcase CMD_ACK, CMD_PING, CMD_PONG, CMD_FIN:\n",
+               "\tcase CMD_DATA:\n\t\treturn frame.Seq != 0\n\tcase CMD_FEC:\n\t\t// Seq carries the FEC block's base DATA sequence; parity bytes live\n\t\t// in Data and the k/m/index tuple is packed into authenticated Flags.\n\t\treturn frame.Seq != 0 && len(frame.Data) >= fecLengthPrefixSize\n\tcase CMD_ACK, CMD_PING, CMD_PONG, CMD_FIN:\n"),
+          ])
+
+          patch("tunnel/client.go", [
+              ("\tMtuProbe *bool `json:\"-\"`\n\n\t// Logger receives diagnostic output.",
+               "\tMtuProbe *bool `json:\"-\"`\n\n\t// FEC enables negotiated adaptive Reed-Solomon forward error correction.\n\t// nil (field absent) = enabled. It is activated only when the server also\n\t// advertises support, so mixed-version deployments remain wire-compatible.\n\tFEC *bool `json:\"-\"`\n\n\t// Logger receives diagnostic output."),
+              ("func (s *clientSession) maxPayload() int { return effectivePayloadCap(s.sendCap) }\n",
+               "func (s *clientSession) maxPayload() int {\n\tcap := effectivePayloadCap(s.sendCap)\n\tif s.fecSend != nil {\n\t\treturn fecDataPayloadCap(cap)\n\t}\n\treturn cap\n}\n"),
+              ("\tsyn := SealFrameMAC(&UDPCFrame{\n\t\tMagic: c.magic, Version: UDPC_VERSION,\n\t\tCmd: CMD_HANDSHAKE_SYN, Data: payload,\n\t}, &handshakeKeys.SynMAC)\n",
+               "\tsynFlags := uint16(0)\n\tif fecEnabled(c.cfg.FEC) {\n\t\tsynFlags |= FLAG_FEC_CAPABLE\n\t}\n\tsyn := SealFrameMAC(&UDPCFrame{\n\t\tMagic: c.magic, Version: UDPC_VERSION, Flags: synFlags,\n\t\tCmd: CMD_HANDSHAKE_SYN, Data: payload,\n\t}, &handshakeKeys.SynMAC)\n"),
+              ("\t\t\t\t\tframeKeys, err := keys.ClientFrameCiphers()\n\t\t\t\t\tif err != nil {\n\t\t\t\t\t\ttimer.Stop()\n\t\t\t\t\t\treturn 0, nil, nil, \"\", fmt.Errorf(\"session cipher init: %w\", err)\n\t\t\t\t\t}\n\t\t\t\t\ttimer.Stop()\n\t\t\t\t\treturn ack.SessionID, nil, frameKeys, granted, nil\n",
+               "\t\t\t\t\tframeKeys, err := keys.ClientFrameCiphers()\n\t\t\t\t\tif err != nil {\n\t\t\t\t\t\ttimer.Stop()\n\t\t\t\t\t\treturn 0, nil, nil, \"\", fmt.Errorf(\"session cipher init: %w\", err)\n\t\t\t\t\t}\n\t\t\t\t\tframeKeys.fec = fecEnabled(c.cfg.FEC) && ack.Flags&FLAG_FEC_CAPABLE != 0\n\t\t\t\t\ttimer.Stop()\n\t\t\t\t\treturn ack.SessionID, nil, frameKeys, granted, nil\n"),
+              ("\t\t\t\tc.logInfo(\"[Client] 🔐 Noise_NK established (channel binding %x…)\", sess.HandshakeHash[:4])\n\t\t\t\ttimer.Stop()\n\t\t\t\treturn ack.SessionID, sess, &FrameKeys{Send: sess.SendCipher, Recv: sess.RecvCipher}, granted, nil\n",
+               "\t\t\t\tc.logInfo(\"[Client] 🔐 Noise_NK established (channel binding %x…)\", sess.HandshakeHash[:4])\n\t\t\t\tframeKeys := &FrameKeys{Send: sess.SendCipher, Recv: sess.RecvCipher}\n\t\t\t\tframeKeys.fec = fecEnabled(c.cfg.FEC) && ack.Flags&FLAG_FEC_CAPABLE != 0\n\t\t\t\ttimer.Stop()\n\t\t\t\treturn ack.SessionID, sess, frameKeys, granted, nil\n"),
+              ("\trttEst *rttEstimator\n\n\t// sendCap is the largest record this session may put on the wire:",
+               "\trttEst *rttEstimator\n\n\t// fecSend/fecRecv exist only after authenticated capability negotiation.\n\t// Parity is best-effort; the existing DATA retransmit queue remains the\n\t// reliability fallback when a block cannot be reconstructed.\n\tfecSend *fecSender\n\tfecRecv *fecReceiver\n\n\t// sendCap is the largest record this session may put on the wire:"),
+              ("\tsess.unackedCond = sync.NewCond(&sess.unackedMu)\n\t// seq counters start at 1:",
+               "\tsess.unackedCond = sync.NewCond(&sess.unackedMu)\n\tif frameKeys != nil && frameKeys.fec {\n\t\tsess.fecRecv = newFECReceiver()\n\t\tsess.fecSend = newFECSender(sess.sendFECParity)\n\t\tc.logInfo(\"[Client] [Session 0x%08X] 🧩 adaptive Reed-Solomon FEC negotiated\", sid)\n\t}\n\t// seq counters start at 1:"),
+              ("\t\tatomic.StoreInt32(&s.closed, 1)\n\t\ts.unackedMu.Lock()\n",
+               "\t\tatomic.StoreInt32(&s.closed, 1)\n\t\tif s.fecSend != nil {\n\t\t\ts.fecSend.close()\n\t\t}\n\t\ts.unackedMu.Lock()\n"),
+              ("\tif !sess.replayFilter.Accept(frame.PacketNo) {\n\t\tif frame.Cmd == CMD_DATA {\n\t\t\tsess.reackDuplicateData()\n\t\t}\n\t\treturn\n\t}\n\tif frame.Ack > 0 {\n",
+               "\tif !sess.replayFilter.Accept(frame.PacketNo) {\n\t\tif frame.Cmd == CMD_DATA {\n\t\t\tsess.reackDuplicateData()\n\t\t}\n\t\treturn\n\t}\n\tif sess.fecSend != nil && frame.Flags&FLAG_FEC_FEEDBACK != 0 {\n\t\tsess.fecSend.observeRemoteBasisPoints(frame.WindowSize)\n\t}\n\tif frame.Ack > 0 {\n"),
+              ("\tcase CMD_DATA:\n\t\tif !sess.handleData(frame) {\n\t\t\tsess.replayFilter.Remove(frame.PacketNo)\n\t\t}\n\tcase CMD_ACK:\n",
+               "\tcase CMD_DATA:\n\t\tif sess.fecRecv != nil {\n\t\t\tsess.deliverRecoveredFEC(sess.fecRecv.onData(frame.Seq, frame.Data))\n\t\t}\n\t\tif !sess.handleData(frame) {\n\t\t\tsess.replayFilter.Remove(frame.PacketNo)\n\t\t}\n\tcase CMD_FEC:\n\t\tsess.touch()\n\t\tif sess.fecRecv != nil {\n\t\t\tsess.deliverRecoveredFEC(sess.fecRecv.onParityFrame(frame))\n\t\t}\n\tcase CMD_ACK:\n"),
+              ("\t// UDP write failures during route transitions are equivalent to packet\n\t// loss. The retained frame will be retried by retransmitLoop; returning an\n\t// error here would tear down the session before that machinery can help.\n\tif err := s.client.dialer.Send(encoded); err != nil {\n\t\ts.client.logWarn(\"[Client] [Session 0x%08X] ⏳ initial DATA send deferred to retransmit loop: %v\", s.sid, err)\n\t}\n\treturn nil\n",
+               "\t// UDP write failures during route transitions are equivalent to packet\n\t// loss. The retained frame will be retried by retransmitLoop; returning an\n\t// error here would tear down the session before that machinery can help.\n\tif err := s.client.dialer.Send(encoded); err != nil {\n\t\ts.client.logWarn(\"[Client] [Session 0x%08X] ⏳ initial DATA send deferred to retransmit loop: %v\", s.sid, err)\n\t}\n\tif s.fecSend != nil {\n\t\ts.fecSend.add(seq, payload)\n\t}\n\treturn nil\n"),
+              ("\tfor seq := s.lowestOutstanding; seq <= ackSeq; seq++ {\n\t\tdelete(s.unacked, seq)\n\t}\n",
+               "\tfor seq := s.lowestOutstanding; seq <= ackSeq; seq++ {\n\t\tif pkt, ok := s.unacked[seq]; ok && s.fecSend != nil {\n\t\t\ts.fecSend.observeAck(pkt.retries > 0)\n\t\t}\n\t\tdelete(s.unacked, seq)\n\t}\n"),
+              ("func (s *clientSession) sendControl(f *UDPCFrame, send func([]byte) error) bool {\n\tf.PacketNo = s.sendPacketNo.Add(1)\n",
+               "func (s *clientSession) sendControl(f *UDPCFrame, send func([]byte) error) bool {\n\ts.applyFECFeedback(f)\n\tf.PacketNo = s.sendPacketNo.Add(1)\n"),
+              ("func (s *clientSession) encodeFrame(f *UDPCFrame) []byte {\n\tf.PacketNo = s.sendPacketNo.Add(1)\n",
+               "func (s *clientSession) encodeFrame(f *UDPCFrame) []byte {\n\ts.applyFECFeedback(f)\n\tf.PacketNo = s.sendPacketNo.Add(1)\n"),
+              ("\treturn SealFrameAEAD(f, s.frameKeys.Send, f.Data)\n}\n\nfunc minDuration",
+               "\treturn SealFrameAEAD(f, s.frameKeys.Send, f.Data)\n}\n\nfunc (s *clientSession) applyFECFeedback(f *UDPCFrame) {\n\tif f != nil && s.fecRecv != nil {\n\t\tf.Flags |= FLAG_FEC_FEEDBACK\n\t\tf.WindowSize = s.fecRecv.feedbackBasisPoints()\n\t}\n}\n\nfunc (s *clientSession) sendFECParity(p fecParityShard) {\n\tif s.isClosed() || s.fecSend == nil {\n\t\treturn\n\t}\n\tf := &UDPCFrame{\n\t\tMagic: s.client.magic, Version: UDPC_VERSION, Cmd: CMD_FEC,\n\t\tSessionID: s.sid, Ack: s.currentAck(),\n\t}\n\tif !p.applyToFrame(f) {\n\t\treturn\n\t}\n\ts.sendControl(f, s.client.dialer.Send)\n}\n\nfunc (s *clientSession) deliverRecoveredFEC(recovered []fecRecovered) {\n\tfor _, r := range recovered {\n\t\tif r.Seq == 0 {\n\t\t\tcontinue\n\t\t}\n\t\tf := &UDPCFrame{\n\t\t\tMagic: s.client.magic, Version: UDPC_VERSION, Cmd: CMD_DATA,\n\t\t\tSessionID: s.sid, Seq: r.Seq, Data: r.Payload,\n\t\t}\n\t\t_ = s.handleData(f)\n\t}\n}\n\nfunc minDuration"),
+          ])
+
+          patch("tunnel/server.go", [
+              ("\tMtuProbe *bool `json:\"-\"`\n\n\t// PortRange is the UDP port range",
+               "\tMtuProbe *bool `json:\"-\"`\n\n\t// FEC enables negotiated adaptive Reed-Solomon forward error correction.\n\t// nil = enabled; the server only activates it for clients that authenticated\n\t// the corresponding handshake capability bit.\n\tFEC *bool `json:\"-\"`\n\n\t// PortRange is the UDP port range"),
+              ("\trttEst *rttEstimator // adaptive RTO estimator (RFC 6298 + Karn's rule)\n\n\t// maxPkt is this session's frame budget",
+               "\trttEst *rttEstimator // adaptive RTO estimator (RFC 6298 + Karn's rule)\n\n\tfecSend *fecSender\n\tfecRecv *fecReceiver\n\n\t// maxPkt is this session's frame budget"),
+              ("\t// Record protection: Noise traffic uses the forward-secret transport keys;\n",
+               "\tfecNegotiated := fecEnabled(s.cfg.FEC) && frame.Flags&FLAG_FEC_CAPABLE != 0\n\n\t// Record protection: Noise traffic uses the forward-secret transport keys;\n"),
+              ("\t}\n\n\tsess := &ServerSession{\n\t\tserver:        s,\n",
+               "\t}\n\tframeKeys.fec = fecNegotiated\n\n\tsess := &ServerSession{\n\t\tserver:        s,\n"),
+              ("\tsess.unackedCond = sync.NewCond(&sess.unackedMu)\n\t// seq counters start at 1:",
+               "\tsess.unackedCond = sync.NewCond(&sess.unackedMu)\n\tif frameKeys.fec {\n\t\tsess.fecRecv = newFECReceiver()\n\t\tsess.fecSend = newFECSender(sess.sendFECParity)\n\t}\n\t// seq counters start at 1:"),
+              ("\tackFrame := &UDPCFrame{\n\t\tMagic:      s.cfg.Magic,\n\t\tVersion:    UDPC_VERSION,\n\t\tCmd:        CMD_HANDSHAKE_ACK,\n",
+               "\tackFlags := uint16(0)\n\tif fecNegotiated {\n\t\tackFlags |= FLAG_FEC_CAPABLE\n\t}\n\tackFrame := &UDPCFrame{\n\t\tMagic:      s.cfg.Magic,\n\t\tVersion:    UDPC_VERSION,\n\t\tCmd:        CMD_HANDSHAKE_ACK,\n\t\tFlags:      ackFlags,\n"),
+              ("\ts.logInfo(\"[Session 0x%08X] ✅ Established for %s -> Target [%s] %s\", sid, remoteAddr, targetNet, targetHostPort)\n",
+               "\ts.logInfo(\"[Session 0x%08X] ✅ Established for %s -> Target [%s] %s\", sid, remoteAddr, targetNet, targetHostPort)\n\tif fecNegotiated {\n\t\ts.logInfo(\"[Session 0x%08X] 🧩 adaptive Reed-Solomon FEC negotiated\", sid)\n\t}\n"),
+              ("\tif !sess.replayFilter.Accept(frame.PacketNo) {\n\t\tsess.server.replayDrops.Add(1)\n",
+               "\tif !sess.replayFilter.Accept(frame.PacketNo) {\n\t\tsess.server.replayDrops.Add(1)\n"),
+              ("\tif !sess.handleIncomingFrame(frame, remoteAddr, origPort) {\n",
+               "\tif sess.fecSend != nil && frame.Flags&FLAG_FEC_FEEDBACK != 0 {\n\t\tsess.fecSend.observeRemoteBasisPoints(frame.WindowSize)\n\t}\n\tif !sess.handleIncomingFrame(frame, remoteAddr, origPort) {\n"),
+              ("\tif frame.Cmd == CMD_DATA {\n\t\t// Client data proves the client is past its own probe phase (or never\n\t\t// probed at all) — either way the frame budget question is settled for\n\t\t// the target->client direction too.\n\t\tsess.openMtuGate()\n\t\treturn sess.handleDataFromPath(frame, remoteAddr, origPort)\n\t}\n",
+               "\tif frame.Cmd == CMD_DATA {\n\t\t// Client data proves the client is past its own probe phase (or never\n\t\t// probed at all) — either way the frame budget question is settled for\n\t\t// the target->client direction too.\n\t\tsess.openMtuGate()\n\t\tif sess.fecRecv != nil {\n\t\t\tsess.deliverRecoveredFEC(sess.fecRecv.onData(frame.Seq, frame.Data), remoteAddr, origPort)\n\t\t}\n\t\treturn sess.handleDataFromPath(frame, remoteAddr, origPort)\n\t}\n"),
+              ("\tcase CMD_FIN:\n\t\tsess.server.logInfo(\"[Session 0x%08X] 👋 Received FIN from client\", sess.sessionID)\n",
+               "\tcase CMD_FEC:\n\t\tif sess.fecRecv != nil {\n\t\t\tsess.deliverRecoveredFEC(sess.fecRecv.onParityFrame(frame), remoteAddr, origPort)\n\t\t}\n\tcase CMD_FIN:\n\t\tsess.server.logInfo(\"[Session 0x%08X] 👋 Received FIN from client\", sess.sessionID)\n"),
+              ("\tfor seq := sess.lowestOutstanding; seq <= ackSeq; seq++ {\n\t\tdelete(sess.unacked, seq)\n\t}\n",
+               "\tfor seq := sess.lowestOutstanding; seq <= ackSeq; seq++ {\n\t\tif pkt, ok := sess.unacked[seq]; ok && sess.fecSend != nil {\n\t\t\tsess.fecSend.observeAck(pkt.retries > 0)\n\t\t}\n\t\tdelete(sess.unacked, seq)\n\t}\n"),
+              ("\t// Server-initiated: reply on the most recently used path so the source\n\t// port matches the port the client last contacted.\n\tsess.sendToSession(encoded)\n\treturn nil\n",
+               "\t// Server-initiated: reply on the most recently used path so the source\n\t// port matches the port the client last contacted.\n\tsess.sendToSession(encoded)\n\tif sess.fecSend != nil {\n\t\tsess.fecSend.add(seq, payload)\n\t}\n\treturn nil\n"),
+              ("func (sess *ServerSession) sendControl(f *UDPCFrame, send func([]byte) error) bool {\n\tf.PacketNo = sess.sendPacketNo.Add(1)\n",
+               "func (sess *ServerSession) sendControl(f *UDPCFrame, send func([]byte) error) bool {\n\tsess.applyFECFeedback(f)\n\tf.PacketNo = sess.sendPacketNo.Add(1)\n"),
+              ("func (sess *ServerSession) encodeFrame(f *UDPCFrame) []byte {\n\tf.PacketNo = sess.sendPacketNo.Add(1)\n",
+               "func (sess *ServerSession) encodeFrame(f *UDPCFrame) []byte {\n\tsess.applyFECFeedback(f)\n\tf.PacketNo = sess.sendPacketNo.Add(1)\n"),
+              ("\tputFireAndForgetBuf(wire)\n\treturn true\n}\n\nfunc (sess *ServerSession) currentAck()",
+               "\tputFireAndForgetBuf(wire)\n\treturn true\n}\n\nfunc (sess *ServerSession) applyFECFeedback(f *UDPCFrame) {\n\tif f != nil && sess.fecRecv != nil {\n\t\tf.Flags |= FLAG_FEC_FEEDBACK\n\t\tf.WindowSize = sess.fecRecv.feedbackBasisPoints()\n\t}\n}\n\nfunc (sess *ServerSession) sendFECParity(p fecParityShard) {\n\tif atomic.LoadInt32(&sess.closed) == 1 || sess.fecSend == nil {\n\t\treturn\n\t}\n\tf := &UDPCFrame{\n\t\tMagic: sess.server.cfg.Magic, Version: UDPC_VERSION, Cmd: CMD_FEC,\n\t\tSessionID: sess.sessionID, Ack: sess.currentAck(),\n\t}\n\tif !p.applyToFrame(f) {\n\t\treturn\n\t}\n\tsess.sendControl(f, func(data []byte) error { sess.sendToSession(data); return nil })\n}\n\nfunc (sess *ServerSession) deliverRecoveredFEC(recovered []fecRecovered, remoteAddr netip.AddrPort, origPort int) {\n\tfor _, r := range recovered {\n\t\tif r.Seq == 0 {\n\t\t\tcontinue\n\t\t}\n\t\tf := &UDPCFrame{\n\t\t\tMagic: sess.server.cfg.Magic, Version: UDPC_VERSION, Cmd: CMD_DATA,\n\t\t\tSessionID: sess.sessionID, Seq: r.Seq, Data: r.Payload,\n\t\t}\n\t\t_ = sess.handleDataFromPath(f, remoteAddr, origPort)\n\t}\n}\n\nfunc (sess *ServerSession) currentAck()"),
+              ("func (sess *ServerSession) maxPayload() int {\n\tbudget := sess.server.maxPayload()\n",
+               "func (sess *ServerSession) maxPayload() int {\n\tbudget := sess.server.maxPayload()\n"),
+              ("\tif mp := int(sess.maxPkt.Load()); mp > 0 {\n\t\tif p := payloadCap(mp); p < budget {\n\t\t\tbudget = p\n\t\t}\n\t}\n\treturn budget\n}\n",
+               "\tif mp := int(sess.maxPkt.Load()); mp > 0 {\n\t\tif p := payloadCap(mp); p < budget {\n\t\t\tbudget = p\n\t\t}\n\t}\n\tif sess.fecSend != nil {\n\t\tbudget = fecDataPayloadCap(budget)\n\t}\n\treturn budget\n}\n"),
+              ("\tsess.closeOnce.Do(func() {\n\t\tatomic.StoreInt32(&sess.closed, 1)\n\t\t// Wake senders parked on the send window",
+               "\tsess.closeOnce.Do(func() {\n\t\tatomic.StoreInt32(&sess.closed, 1)\n\t\tif sess.fecSend != nil {\n\t\t\tsess.fecSend.close()\n\t\t}\n\t\t// Wake senders parked on the send window"),
+          ])
+
+          patch("main.go", [
+              ("\tMtuProbe *bool `json:\"mtu_probe\"`\n}\n",
+               "\tMtuProbe *bool `json:\"mtu_probe\"`\n\n\t// FEC enables adaptive Reed-Solomon FEC when both peers support it.\n\t// Absent = enabled; set false to keep pure ARQ behavior.\n\tFEC *bool `json:\"fec\"`\n}\n"),
+              ("\t\tMtuProbe:   cfg.MtuProbe,\n\t}\n",
+               "\t\tMtuProbe:   cfg.MtuProbe,\n\t\tFEC:        cfg.FEC,\n\t}\n"),
+              ("\t\tMtuProbe:       cfg.MtuProbe,\n\t}\n",
+               "\t\tMtuProbe:       cfg.MtuProbe,\n\t\tFEC:            cfg.FEC,\n\t}\n"),
+          ])
+          PY
+
+      - name: Add Reed-Solomon dependency
+        run: go get github.com/klauspost/reedsolomon@v1.14.2
+
+      - name: Format and tidy
+        run: |
+          gofmt -w tunnel/protocol.go tunnel/client.go tunnel/server.go tunnel/fec.go tunnel/fec_test.go main.go
+          go mod tidy
+
+      - name: Run full Go test suite
+        run: go test ./...
+
+      - name: Run FEC race tests
+        run: go test -race ./tunnel -run 'TestFEC'
+
+      - name: Commit verified integration
+        if: success()
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git rm .github/workflows/adaptive-fec-patch.yml
+          git add go.mod go.sum main.go tunnel/protocol.go tunnel/client.go tunnel/server.go tunnel/fec.go tunnel/fec_test.go
+          git commit -m 'feat: integrate adaptive Reed-Solomon FEC'
+          git push origin HEAD:feature/adaptive-fec

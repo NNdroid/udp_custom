@@ -11,27 +11,37 @@ import (
 )
 
 const (
-	fecWireVersion      = 1
 	fecDataShardsMax    = 8
 	fecParityShardsMax  = 4
-	fecParityHeaderSize = 14 // version+k+m+index+baseSeq+shardSize
 	fecLengthPrefixSize = 2
 	fecFlushDelay       = 15 * time.Millisecond
 	fecRecentDataLimit  = 64
 	fecMaxPendingBlocks = 16
 	fecBlockTTL         = 2 * time.Second
 	fecBootstrapBlocks  = 4
+
+	// CMD_FEC reuses authenticated header fields instead of spending payload
+	// bytes on metadata. Seq is the block's first DATA sequence; Flags packs
+	// k/m/parity-index. Bits 0..1 are reserved by protocol-wide FEC capability
+	// and loss-feedback flags.
+	fecDataShift   = 4
+	fecDataMask    = uint16(0x7 << fecDataShift) // k-1, 0..7 => 1..8
+	fecParityShift = 7
+	fecParityMask  = uint16(0x3 << fecParityShift) // m-1, 0..3 => 1..4
+	fecIndexShift  = 9
+	fecIndexMask   = uint16(0x3 << fecIndexShift) // parity index, 0..3
+	fecMetaMask    = fecDataMask | fecParityMask | fecIndexMask
 )
 
 // fecEnabled follows the same nil-means-enabled convention as MTU probing.
 func fecEnabled(v *bool) bool { return v == nil || *v }
 
-// fecDataPayloadCap reserves enough room for the parity record's metadata and
-// per-shard length prefix. A parity record is itself a normal authenticated
-// UDPC record, so this keeps every FEC datagram inside the already-converged
-// max_pkt budget and never relies on IP fragmentation.
+// fecDataPayloadCap reserves only the two-byte original-length prefix used by
+// Reed-Solomon data shards. All other FEC metadata lives in the authenticated
+// UDPC header, so adaptive FEC costs just two bytes of DATA payload capacity
+// and never pushes a parity datagram beyond the converged max_pkt budget.
 func fecDataPayloadCap(recordPayloadCap int) int {
-	cap := recordPayloadCap - fecParityHeaderSize - fecLengthPrefixSize
+	cap := recordPayloadCap - fecLengthPrefixSize
 	if cap < 1 {
 		return 1
 	}
@@ -138,54 +148,47 @@ type fecParityShard struct {
 	DataShards   int
 	ParityShards int
 	Index        int
-	ShardSize    int
 	Data         []byte
 }
 
-func (p fecParityShard) marshalBinary() []byte {
-	if p.BaseSeq == 0 || p.DataShards < 1 || p.DataShards > fecDataShardsMax ||
+// applyToFrame stores FEC block metadata in authenticated header fields. Data
+// is the raw parity shard and therefore exactly the RS shard size; no outer FEC
+// envelope is needed.
+func (p fecParityShard) applyToFrame(f *UDPCFrame) bool {
+	if f == nil || p.BaseSeq == 0 || p.DataShards < 1 || p.DataShards > fecDataShardsMax ||
 		p.ParityShards < 1 || p.ParityShards > fecParityShardsMax ||
-		p.Index < 0 || p.Index >= p.ParityShards || p.ShardSize < fecLengthPrefixSize ||
-		p.ShardSize > 0xffff || len(p.Data) != p.ShardSize {
-		return nil
+		p.Index < 0 || p.Index >= p.ParityShards || len(p.Data) < fecLengthPrefixSize ||
+		len(p.Data) > UDPC_MAX_DATA {
+		return false
 	}
-	out := make([]byte, fecParityHeaderSize+p.ShardSize)
-	out[0] = fecWireVersion
-	out[1] = byte(p.DataShards)
-	out[2] = byte(p.ParityShards)
-	out[3] = byte(p.Index)
-	binary.BigEndian.PutUint64(out[4:12], p.BaseSeq)
-	binary.BigEndian.PutUint16(out[12:14], uint16(p.ShardSize))
-	copy(out[fecParityHeaderSize:], p.Data)
-	return out
+	f.Seq = p.BaseSeq
+	f.Flags &^= fecMetaMask
+	f.Flags |= uint16(p.DataShards-1) << fecDataShift
+	f.Flags |= uint16(p.ParityShards-1) << fecParityShift
+	f.Flags |= uint16(p.Index) << fecIndexShift
+	f.Data = p.Data
+	return true
 }
 
-func parseFECParity(data []byte) (fecParityShard, error) {
-	if len(data) < fecParityHeaderSize+fecLengthPrefixSize {
-		return fecParityShard{}, fmt.Errorf("fec parity too short")
-	}
-	if data[0] != fecWireVersion {
-		return fecParityShard{}, fmt.Errorf("unsupported fec version %d", data[0])
+func parseFECParityFrame(frame *UDPCFrame) (fecParityShard, error) {
+	if frame == nil || frame.Cmd != CMD_FEC || frame.Seq == 0 || len(frame.Data) < fecLengthPrefixSize {
+		return fecParityShard{}, fmt.Errorf("invalid fec frame")
 	}
 	p := fecParityShard{
-		DataShards:   int(data[1]),
-		ParityShards: int(data[2]),
-		Index:        int(data[3]),
-		BaseSeq:      binary.BigEndian.Uint64(data[4:12]),
-		ShardSize:    int(binary.BigEndian.Uint16(data[12:14])),
+		BaseSeq:      frame.Seq,
+		DataShards:   int((frame.Flags&fecDataMask)>>fecDataShift) + 1,
+		ParityShards: int((frame.Flags&fecParityMask)>>fecParityShift) + 1,
+		Index:        int((frame.Flags & fecIndexMask) >> fecIndexShift),
+		Data:         append([]byte(nil), frame.Data...),
 	}
-	if p.BaseSeq == 0 || p.DataShards < 1 || p.DataShards > fecDataShardsMax ||
+	if p.DataShards < 1 || p.DataShards > fecDataShardsMax ||
 		p.ParityShards < 1 || p.ParityShards > fecParityShardsMax ||
-		p.Index < 0 || p.Index >= p.ParityShards || p.ShardSize < fecLengthPrefixSize {
-		return fecParityShard{}, fmt.Errorf("invalid fec parity metadata")
+		p.Index < 0 || p.Index >= p.ParityShards {
+		return fecParityShard{}, fmt.Errorf("invalid fec metadata")
 	}
 	if p.BaseSeq > ^uint64(0)-uint64(p.DataShards-1) {
 		return fecParityShard{}, fmt.Errorf("fec sequence range overflow")
 	}
-	if len(data) != fecParityHeaderSize+p.ShardSize {
-		return fecParityShard{}, fmt.Errorf("invalid fec parity shard length")
-	}
-	p.Data = append([]byte(nil), data[fecParityHeaderSize:]...)
 	return p, nil
 }
 
@@ -317,7 +320,7 @@ func (s *fecSender) emitBlock(block []fecSourceShard) {
 		}
 	}
 	shardSize := fecLengthPrefixSize + maxPayload
-	if shardSize < fecLengthPrefixSize {
+	if shardSize < fecLengthPrefixSize || shardSize > UDPC_MAX_DATA {
 		return
 	}
 
@@ -353,7 +356,6 @@ func (s *fecSender) emitBlock(block []fecSourceShard) {
 			DataShards:   dataShards,
 			ParityShards: parityShards,
 			Index:        i,
-			ShardSize:    shardSize,
 			Data:         parity,
 		})
 	}
@@ -447,8 +449,8 @@ func (r *fecReceiver) onData(seq uint64, payload []byte) []fecRecovered {
 	return out
 }
 
-func (r *fecReceiver) onParity(data []byte) []fecRecovered {
-	p, err := parseFECParity(data)
+func (r *fecReceiver) onParityFrame(frame *UDPCFrame) []fecRecovered {
+	p, err := parseFECParityFrame(frame)
 	if err != nil {
 		return nil
 	}
@@ -462,12 +464,12 @@ func (r *fecReceiver) onParity(data []byte) []fecRecovered {
 			baseSeq:      p.BaseSeq,
 			dataShards:   p.DataShards,
 			parityShards: p.ParityShards,
-			shardSize:    p.ShardSize,
+			shardSize:    len(p.Data),
 			parity:       make([][]byte, p.ParityShards),
 			updatedAt:    now,
 		}
 		r.blocks[p.BaseSeq] = block
-	} else if block.dataShards != p.DataShards || block.parityShards != p.ParityShards || block.shardSize != p.ShardSize {
+	} else if block.dataShards != p.DataShards || block.parityShards != p.ParityShards || block.shardSize != len(p.Data) {
 		return nil
 	}
 	block.updatedAt = now

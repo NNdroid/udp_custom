@@ -808,8 +808,25 @@ func (s *Server) serveConn(conn *net.UDPConn) {
 				time.Sleep(backoff)
 				continue
 			}
-			s.logWarn("UDP read error: %v", err)
-			return
+			// A non-close UDP read error must not permanently kill the only
+			// goroutine draining this socket. Network/interface transitions can
+			// surface platform-specific errors not covered by the errno allowlist;
+			// retry them with bounded backoff. Server.Close is the one intentional
+			// terminal read failure.
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			if backoff == 0 {
+				backoff = 10 * time.Millisecond
+			} else {
+				backoff *= 2
+				if backoff > time.Second {
+					backoff = time.Second
+				}
+			}
+			s.logWarn("UDP read error: %v; keeping receiver alive (backoff=%v)", err, backoff)
+			time.Sleep(backoff)
+			continue
 		}
 		backoff = 0
 		for i := range pkts {
@@ -2287,7 +2304,7 @@ func (s *Server) cleanupLoop() {
 				inactive := now.Sub(sess.lastActive)
 				sess.activeMu.Unlock()
 
-				if inactive > 60*time.Second {
+				if inactive > 180*time.Second {
 					s.logInfo("[Session 0x%08X] ⏱️ Inactive for %v, cleaning up", sess.sessionID, inactive)
 					sess.Close()
 				}

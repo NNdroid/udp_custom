@@ -33,31 +33,35 @@ func TestFECParityForLoss(t *testing.T) {
 func TestFECDataPayloadCapKeepsParityWithinRecordBudget(t *testing.T) {
 	for _, recordCap := range []int{1394, 1144, 492} {
 		dataCap := fecDataPayloadCap(recordCap)
-		if dataCap+fecLengthPrefixSize+fecParityHeaderSize > recordCap {
-			t.Fatalf("data cap %d cannot fit parity metadata in record payload cap %d", dataCap, recordCap)
+		// A parity shard is [2-byte original length | DATA payload | padding].
+		// The block metadata is carried by authenticated UDPC header fields.
+		if dataCap+fecLengthPrefixSize > recordCap {
+			t.Fatalf("data cap %d cannot fit parity shard in record payload cap %d", dataCap, recordCap)
 		}
 	}
 }
 
-func TestFECParityMarshalRoundTrip(t *testing.T) {
+func TestFECParityFrameMetadataRoundTrip(t *testing.T) {
 	want := fecParityShard{
 		BaseSeq:      41,
 		DataShards:   8,
 		ParityShards: 3,
 		Index:        2,
-		ShardSize:    7,
 		Data:         []byte("1234567"),
 	}
-	wire := want.marshalBinary()
-	if len(wire) == 0 {
-		t.Fatal("marshal returned empty payload")
+	frame := &UDPCFrame{Cmd: CMD_FEC, Flags: FLAG_FEC_FEEDBACK}
+	if !want.applyToFrame(frame) {
+		t.Fatal("applyToFrame rejected valid parity shard")
 	}
-	got, err := parseFECParity(wire)
+	if frame.Flags&FLAG_FEC_FEEDBACK == 0 {
+		t.Fatal("FEC metadata clobbered protocol-wide feedback flag")
+	}
+	got, err := parseFECParityFrame(frame)
 	if err != nil {
-		t.Fatalf("parseFECParity: %v", err)
+		t.Fatalf("parseFECParityFrame: %v", err)
 	}
 	if got.BaseSeq != want.BaseSeq || got.DataShards != want.DataShards || got.ParityShards != want.ParityShards ||
-		got.Index != want.Index || got.ShardSize != want.ShardSize || !bytes.Equal(got.Data, want.Data) {
+		got.Index != want.Index || !bytes.Equal(got.Data, want.Data) {
 		t.Fatalf("round trip mismatch: got %+v, want %+v", got, want)
 	}
 }
@@ -66,7 +70,7 @@ func TestFECRecoversTwoMissingDataShards(t *testing.T) {
 	var parity []fecParityShard
 	sender := newFECSender(func(p fecParityShard) { parity = append(parity, p) })
 	defer sender.close()
-	// 8%% estimated loss selects three parity shards, enough to reconstruct two
+	// 8% estimated loss selects three parity shards, enough to reconstruct two
 	// independently lost DATA records in the same block.
 	sender.adaptive.local.observeValue(0.08, 1)
 	sender.blocks = fecBootstrapBlocks
@@ -93,7 +97,11 @@ func TestFECRecoversTwoMissingDataShards(t *testing.T) {
 
 	recovered := make(map[uint64][]byte)
 	for _, p := range parity {
-		for _, r := range receiver.onParity(p.marshalBinary()) {
+		frame := &UDPCFrame{Cmd: CMD_FEC}
+		if !p.applyToFrame(frame) {
+			t.Fatal("failed to build parity frame")
+		}
+		for _, r := range receiver.onParityFrame(frame) {
 			recovered[r.Seq] = r.Payload
 		}
 	}
@@ -143,7 +151,7 @@ func TestFECRemoteLossFeedbackRaisesParity(t *testing.T) {
 	})
 	defer sender.close()
 	sender.blocks = fecBootstrapBlocks
-	sender.observeRemoteBasisPoints(800) // 8%% reported receive loss => 3 parity
+	sender.observeRemoteBasisPoints(800) // 8% reported receive loss => 3 parity
 
 	block := make([]fecSourceShard, fecDataShardsMax)
 	for i := range block {

@@ -1,0 +1,80 @@
+name: Apply weak UDP lifecycle hardening
+
+on:
+  push:
+    branches:
+      - fix/weak-udp-self-healing
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/weak-udp-self-healing
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Apply lifecycle hardening
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              s = p.read_text()
+              count = s.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected exactly one match, found {count}: {old[:120]!r}")
+              p.write_text(s.replace(old, new, 1))
+
+          replace_once(
+              "tunnel/client.go",
+              "clientRecvTimeout          = 75 * time.Second // > server's 60s idle cleanup",
+              "clientRecvTimeout          = 210 * time.Second // > server's 180s weak-network idle cleanup",
+          )
+
+          replace_once(
+              "tunnel/client.go",
+              '''\t\t\tping := &UDPCFrame{\n\t\t\t\tMagic: s.client.magic, Version: UDPC_VERSION, Cmd: CMD_PING,\n\t\t\t\tSessionID: s.sid, Ack: s.currentAck(),\n\t\t\t}\n\t\t\ts.sendControl(ping, s.client.dialer.Send)\n\t\t\ts.client.logDebug("[Client] [Session 0x%08X] 💓 keepalive PING sent (ack=%d)", s.sid, ping.Ack)\n\t\t\ts.mu.Lock()\n\t\t\ts.lastSent = time.Now()\n\t\t\ts.mu.Unlock()''',
+              '''\t\t\t// Send a redundant pair over the spread dialer. Control records are\n\t\t\t// intentionally not part of the DATA ARQ queue, so two independently\n\t\t\t// routed PINGs sharply reduce false idle death during burst loss.\n\t\t\tfor i := 0; i < 2; i++ {\n\t\t\t\tping := &UDPCFrame{\n\t\t\t\t\tMagic: s.client.magic, Version: UDPC_VERSION, Cmd: CMD_PING,\n\t\t\t\t\tSessionID: s.sid, Ack: s.currentAck(),\n\t\t\t\t}\n\t\t\t\ts.sendControl(ping, s.client.dialer.Send)\n\t\t\t\ts.client.logDebug("[Client] [Session 0x%08X] 💓 keepalive PING %d/2 sent (ack=%d)", s.sid, i+1, ping.Ack)\n\t\t\t}\n\t\t\ts.mu.Lock()\n\t\t\ts.lastSent = time.Now()\n\t\t\ts.mu.Unlock()''',
+          )
+
+          replace_once(
+              "tunnel/server.go",
+              "if inactive > 60*time.Second {",
+              "if inactive > 180*time.Second {",
+          )
+
+          replace_once(
+              "tunnel/server.go",
+              '''\t\t\ts.logWarn("UDP read error: %v", err)\n\t\t\treturn''',
+              '''\t\t\t// A non-close UDP read error must not permanently kill the only\n\t\t\t// goroutine draining this socket. Network/interface transitions can\n\t\t\t// surface platform-specific errors not covered by the errno allowlist;\n\t\t\t// retry them with bounded backoff. Server.Close is the one intentional\n\t\t\t// terminal read failure.\n\t\t\tif errors.Is(err, net.ErrClosed) {\n\t\t\t\treturn\n\t\t\t}\n\t\t\tif backoff == 0 {\n\t\t\t\tbackoff = 10 * time.Millisecond\n\t\t\t} else {\n\t\t\t\tbackoff *= 2\n\t\t\t\tif backoff > time.Second {\n\t\t\t\t\tbackoff = time.Second\n\t\t\t\t}\n\t\t\t}\n\t\t\ts.logWarn("UDP read error: %v; keeping receiver alive (backoff=%v)", err, backoff)\n\t\t\ttime.Sleep(backoff)\n\t\t\tcontinue''',
+          )
+          PY
+
+          gofmt -w tunnel/client.go tunnel/server.go
+
+      - name: Run full Go test suite
+        run: go test ./...
+
+      - name: Run race-focused recovery tests
+        run: go test -race ./tunnel -run 'TestSpreadDialerRepairsClosedSocketOnWrite|TestSendSockPoolRepairsPoisonedReplySocket|TestMtuProbeCacheInvalidatesOnSocketGenerationChange|TestConservativeMtuFallback'
+
+      - name: Commit verified patch and remove helper workflow
+        shell: bash
+        run: |
+          git rm .github/workflows/weaknet-self-heal-patch.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tunnel/client.go tunnel/server.go
+          git commit -m "fix: harden weak-network session liveness"
+          git push origin HEAD:fix/weak-udp-self-healing

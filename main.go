@@ -94,6 +94,10 @@ type Config struct {
 	// no answer and falls back to MaxPkt, so the default is safe during a
 	// mixed-version rollout.
 	MtuProbe *bool `json:"mtu_probe"`
+
+	// FEC enables adaptive Reed-Solomon FEC when both peers support it.
+	// Absent = enabled; set false to keep pure ARQ behavior.
+	FEC *bool `json:"fec"`
 }
 
 func (c *Config) UnmarshalJSON(data []byte) error {
@@ -221,6 +225,7 @@ func runClientMode(cfg *Config, magicStr, lvl string, sendWindow int) {
 		SendWindow: sendWindow,
 		MaxPkt:     cfg.MaxPkt,
 		MtuProbe:   cfg.MtuProbe,
+		FEC:        cfg.FEC,
 	}
 
 	// Optional Noise_NK encryption, keyed by the server's static public key.
@@ -315,6 +320,7 @@ func runFromConfig(path string) {
 		ReceiveSockets: cfg.ReceiveSockets,
 		MaxPkt:         cfg.MaxPkt,
 		MtuProbe:       cfg.MtuProbe,
+		FEC:            cfg.FEC,
 	}
 
 	srv, err := tunnel.NewServer(srvCfg)

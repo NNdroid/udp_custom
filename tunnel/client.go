@@ -88,6 +88,11 @@ type ClientConfig struct {
 	// -version rollout (it just costs the ladder walk on the first session).
 	MtuProbe *bool `json:"-"`
 
+	// FEC enables negotiated adaptive Reed-Solomon forward error correction.
+	// nil (field absent) = enabled. It is activated only when the server also
+	// advertises support, so mixed-version deployments remain wire-compatible.
+	FEC *bool `json:"-"`
+
 	// Logger receives diagnostic output. When nil, the LogLevel string decides
 	// verbosity on the standard logger; an injected Logger wins over LogLevel
 	// entirely. Embedders wanting silence pass Nop.
@@ -298,7 +303,13 @@ func (c *Client) maxPayload() int { return effectivePayloadCap(c.maxPkt) }
 
 // maxPayload is the session's frame budget: the MTU probe converged it before
 // the pump started and it never changes for the session's lifetime.
-func (s *clientSession) maxPayload() int { return effectivePayloadCap(s.sendCap) }
+func (s *clientSession) maxPayload() int {
+	cap := effectivePayloadCap(s.sendCap)
+	if s.fecSend != nil {
+		return fecDataPayloadCap(cap)
+	}
+	return cap
+}
 
 // Start blocks: it serves local applications until Close is called. This is
 // the CLI-facing mode; embedders that want single connections use DialTunnel.
@@ -651,13 +662,24 @@ func (c *Client) dispatch(frame *UDPCFrame) {
 		}
 		return
 	}
+	if sess.fecSend != nil && frame.Flags&FLAG_FEC_FEEDBACK != 0 {
+		sess.fecSend.observeRemoteBasisPoints(frame.WindowSize)
+	}
 	if frame.Ack > 0 {
 		sess.handleAck(frame.Ack)
 	}
 	switch frame.Cmd {
 	case CMD_DATA:
+		if sess.fecRecv != nil {
+			sess.deliverRecoveredFEC(sess.fecRecv.onData(frame.Seq, frame.Data))
+		}
 		if !sess.handleData(frame) {
 			sess.replayFilter.Remove(frame.PacketNo)
+		}
+	case CMD_FEC:
+		sess.touch()
+		if sess.fecRecv != nil {
+			sess.deliverRecoveredFEC(sess.fecRecv.onParityFrame(frame))
 		}
 	case CMD_ACK:
 		sess.touch()
@@ -723,6 +745,11 @@ func (c *Client) establish(ctx context.Context, target string, conn net.Conn) (*
 		rttEst:     newRTTEstimator(200*time.Millisecond, 200*time.Millisecond, 10*time.Second),
 	}
 	sess.unackedCond = sync.NewCond(&sess.unackedMu)
+	if frameKeys != nil && frameKeys.fec {
+		sess.fecRecv = newFECReceiver()
+		sess.fecSend = newFECSender(sess.sendFECParity)
+		c.logInfo("[Client] [Session 0x%08X] 🧩 adaptive Reed-Solomon FEC negotiated", sid)
+	}
 	// seq counters start at 1: sendSeq/recvSeq semantics are "next sequence
 	// number", and the first frame uses seq 1. sendPacketNo starts at 0
 	// (its first AddUint64 returns 1).
@@ -811,8 +838,12 @@ func (c *Client) handshake(ctx context.Context, target string) (uint32, *NoiseSe
 	payload = appendTargetTLV(payload, target)
 	payload = append(payload, msg1...)
 
+	synFlags := uint16(0)
+	if fecEnabled(c.cfg.FEC) {
+		synFlags |= FLAG_FEC_CAPABLE
+	}
 	syn := SealFrameMAC(&UDPCFrame{
-		Magic: c.magic, Version: UDPC_VERSION,
+		Magic: c.magic, Version: UDPC_VERSION, Flags: synFlags,
 		Cmd: CMD_HANDSHAKE_SYN, Data: payload,
 	}, &handshakeKeys.SynMAC)
 	if len(syn) == 0 {
@@ -885,6 +916,7 @@ func (c *Client) handshake(ctx context.Context, target string) (uint32, *NoiseSe
 						timer.Stop()
 						return 0, nil, nil, "", fmt.Errorf("session cipher init: %w", err)
 					}
+					frameKeys.fec = fecEnabled(c.cfg.FEC) && ack.Flags&FLAG_FEC_CAPABLE != 0
 					timer.Stop()
 					return ack.SessionID, nil, frameKeys, granted, nil
 				}
@@ -894,8 +926,10 @@ func (c *Client) handshake(ctx context.Context, target string) (uint32, *NoiseSe
 					return 0, nil, nil, "", fmt.Errorf("noise finish: %w", err)
 				}
 				c.logInfo("[Client] 🔐 Noise_NK established (channel binding %x…)", sess.HandshakeHash[:4])
+				frameKeys := &FrameKeys{Send: sess.SendCipher, Recv: sess.RecvCipher}
+				frameKeys.fec = fecEnabled(c.cfg.FEC) && ack.Flags&FLAG_FEC_CAPABLE != 0
 				timer.Stop()
-				return ack.SessionID, sess, &FrameKeys{Send: sess.SendCipher, Recv: sess.RecvCipher}, granted, nil
+				return ack.SessionID, sess, frameKeys, granted, nil
 			case <-timer.C:
 				c.logDebug("[Client] 🔄 Handshake attempt %d timed out, retrying", attempt)
 				if attempt < clientMaxHandshakeAttempts {
@@ -961,6 +995,12 @@ type clientSession struct {
 
 	rttEst *rttEstimator
 
+	// fecSend/fecRecv exist only after authenticated capability negotiation.
+	// Parity is best-effort; the existing DATA retransmit queue remains the
+	// reliability fallback when a block cannot be reconstructed.
+	fecSend *fecSender
+	fecRecv *fecReceiver
+
 	// sendCap is the largest record this session may put on the wire: the MTU
 	// probe converges it right after the handshake and it never changes again
 	// (a retransmission reuses its exact encoded bytes, so the cap cannot be
@@ -1012,6 +1052,9 @@ func (s *clientSession) closeWithReason(reason string) {
 func (s *clientSession) close() {
 	s.closeOnce.Do(func() {
 		atomic.StoreInt32(&s.closed, 1)
+		if s.fecSend != nil {
+			s.fecSend.close()
+		}
 		s.unackedMu.Lock()
 		if s.unackedCond != nil {
 			s.unackedCond.Broadcast()
@@ -1124,6 +1167,9 @@ func (s *clientSession) sendData(payload []byte) error {
 	if err := s.client.dialer.Send(encoded); err != nil {
 		s.client.logWarn("[Client] [Session 0x%08X] ⏳ initial DATA send deferred to retransmit loop: %v", s.sid, err)
 	}
+	if s.fecSend != nil {
+		s.fecSend.add(seq, payload)
+	}
 	return nil
 }
 
@@ -1140,6 +1186,9 @@ func (s *clientSession) handleAck(ackSeq uint64) {
 	// Delete the ACKed prefix forward from the watermark (seqs are contiguous
 	// by construction — see the server-side comment for the hole fallback).
 	for seq := s.lowestOutstanding; seq <= ackSeq; seq++ {
+		if pkt, ok := s.unacked[seq]; ok && s.fecSend != nil {
+			s.fecSend.observeAck(pkt.retries > 0)
+		}
 		delete(s.unacked, seq)
 	}
 	if len(s.unacked) == 0 {
@@ -1345,6 +1394,7 @@ func (s *clientSession) sendACK(ackSeq uint64) {
 // send must consume the bytes synchronously. Returns false when the session
 // lacks record protection or the packet-number space is exhausted.
 func (s *clientSession) sendControl(f *UDPCFrame, send func([]byte) error) bool {
+	s.applyFECFeedback(f)
 	f.PacketNo = s.sendPacketNo.Add(1)
 	if f.PacketNo == 0 {
 		// 64-bit packet-number space exhausted — retire the session rather
@@ -1383,6 +1433,7 @@ func (s *clientSession) reackDuplicateData() {
 // ChaCha20-Poly1305 record (PSK-derived or Noise transport key — same format,
 // header as AAD, Poly1305 tag in the trailer).
 func (s *clientSession) encodeFrame(f *UDPCFrame) []byte {
+	s.applyFECFeedback(f)
 	f.PacketNo = s.sendPacketNo.Add(1)
 	if f.PacketNo == 0 {
 		s.closeWithReason("packet-number space exhausted")
@@ -1392,6 +1443,40 @@ func (s *clientSession) encodeFrame(f *UDPCFrame) []byte {
 		return nil
 	}
 	return SealFrameAEAD(f, s.frameKeys.Send, f.Data)
+}
+
+func (s *clientSession) applyFECFeedback(f *UDPCFrame) {
+	if f != nil && s.fecRecv != nil {
+		f.Flags |= FLAG_FEC_FEEDBACK
+		f.WindowSize = s.fecRecv.feedbackBasisPoints()
+	}
+}
+
+func (s *clientSession) sendFECParity(p fecParityShard) {
+	if s.isClosed() || s.fecSend == nil {
+		return
+	}
+	f := &UDPCFrame{
+		Magic: s.client.magic, Version: UDPC_VERSION, Cmd: CMD_FEC,
+		SessionID: s.sid, Ack: s.currentAck(),
+	}
+	if !p.applyToFrame(f) {
+		return
+	}
+	s.sendControl(f, s.client.dialer.Send)
+}
+
+func (s *clientSession) deliverRecoveredFEC(recovered []fecRecovered) {
+	for _, r := range recovered {
+		if r.Seq == 0 {
+			continue
+		}
+		f := &UDPCFrame{
+			Magic: s.client.magic, Version: UDPC_VERSION, Cmd: CMD_DATA,
+			SessionID: s.sid, Seq: r.Seq, Data: r.Payload,
+		}
+		_ = s.handleData(f)
+	}
 }
 
 func minDuration(a, b time.Duration) time.Duration {

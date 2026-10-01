@@ -1,0 +1,58 @@
+name: Apply Linux receive batching
+
+on:
+  push:
+    branches:
+      - perf/throughput-pipeline
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-test:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: perf/throughput-pipeline
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Add matching x/net batch dependency
+        run: |
+          go get golang.org/x/net@v0.56.0
+          go mod tidy
+          gofmt -w tunnel/packet_reader.go tunnel/packet_reader_batch_linux.go tunnel/packet_reader_batch_other.go tunnel/packet_reader_batch_linux_test.go
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test Linux batch receive
+        run: go test -count=20 -run 'TestPacketReaderLinuxBatchDrain|TestPacketReader' ./tunnel/
+
+      - name: Test
+        run: go test -count=1 -timeout 15m ./...
+
+      - name: Race test
+        run: go test -count=1 -race -timeout 20m ./...
+
+      - name: Throughput and receive hot-path smoke
+        run: |
+          go test -run '^$' -bench 'Benchmark(TCP|UDP)Target_|BenchmarkFrame|BenchmarkNoise|BenchmarkReplayFilter' \
+            -benchmem -benchtime=1s -count=1 -timeout 20m ./tunnel/
+
+      - name: Commit validated implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/apply-linux-batch.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add go.mod go.sum tunnel/packet_reader.go tunnel/packet_reader_batch_linux.go tunnel/packet_reader_batch_other.go tunnel/packet_reader_batch_linux_test.go .github/workflows/apply-linux-batch.yml
+          git commit -m 'perf: batch Linux UDP receive drain with recvmmsg'
+          git push origin HEAD:perf/throughput-pipeline

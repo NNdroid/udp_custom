@@ -6,28 +6,25 @@ import (
 	"time"
 )
 
-// packetReader batches datagram reception on ONE UDP socket: next() blocks for
-// the first datagram, then drains up to recvBatch-1 more with an immediate
-// deadline until the socket is empty. Under load this amortizes one poller
-// wakeup and one deadline syscall across a whole burst instead of paying both
-// per datagram.
+// packetReader batches datagram reception on ONE UDP socket. Linux provides a
+// recvmmsg(2) backend (packet_reader_batch_linux.go), while other platforms and
+// kernels without recvmmsg support use nextDrain below. Both paths preserve the
+// same borrowed-buffer, truncation and original-destination semantics.
 //
 // The returned packets BORROW the reader's internal buffers — they are valid
 // only until the next next() call, so callers must process (or copy) them
 // before reading again. Serve paths already dispatch synchronously.
-//
-// A true recvmmsg(2) batch would shave the remaining per-datagram recvmsg
-// syscalls, but golang.org/x/sys does not export Recvmmsg/Mmsghdr on the
-// toolchain's dependency set and hand-rolled raw syscall numbers per
-// architecture are a maintenance hazard for a security tool. The drain loop
-// captures most of the win portably.
 type packetReader struct {
 	conn   *net.UDPConn
 	logger Logger      // may be nil; truncation diagnostics (warn level)
-	debug  bool        // gates the per-burst drain trace (debug level)
+	debug  bool        // gates the per-burst receive trace (debug level)
 	bufs   [][]byte    // recvBatch receive buffers, reused every call
 	oob    [][]byte    // linux: ancillary-data buffers (origdst); nil elsewhere
 	pkts   []udpPacket // result views into bufs
+
+	// batch contains platform-specific receive state. The concrete type is
+	// supplied by packet_reader_batch_{linux,other}.go.
+	batch packetReaderBatch
 
 	// truncLogAt throttles the "datagram larger than our buffer" warning: a
 	// truncated datagram is unauthenticated (any peer can trigger it), so the
@@ -53,15 +50,18 @@ func newPacketReader(conn *net.UDPConn, logger Logger, debug bool) *packetReader
 		r.pkts = append(r.pkts, udpPacket{})
 	}
 	r.oob = newPacketReaderOOB(recvBatch)
+	r.initPacketReaderBatch()
 	return r
 }
 
-// next returns 1..recvBatch received datagrams. A non-timeout error means the
-// socket is broken (closed) and the reader is done.
-func (r *packetReader) next() ([]udpPacket, error) {
+// nextDrain is the portable fallback. The first read blocks and then an expired
+// deadline drains up to recvBatch-1 more datagrams without another poller wait.
+// It still performs one recv syscall per datagram, which is why Linux prefers
+// recvmmsg(2), but it is retained for portability and as an ENOSYS fallback.
+func (r *packetReader) nextDrain() ([]udpPacket, error) {
 	// First read blocks: the deadline must be clear here (drain below leaves
 	// it set to the past, so clear it defensively every cycle).
-	r.conn.SetReadDeadline(time.Time{})
+	_ = r.conn.SetReadDeadline(time.Time{})
 
 	var (
 		n        int
@@ -102,8 +102,9 @@ func (r *packetReader) next() ([]udpPacket, error) {
 	// datagrams are pulled with zero poller wakeups. The deadline is set once
 	// — an expired deadline stays expired, and successful reads do not clear it.
 	drain := time.Now().Add(-time.Millisecond)
-	r.conn.SetReadDeadline(drain)
+	_ = r.conn.SetReadDeadline(drain)
 	for ; k < recvBatch; k++ {
+		origPort = 0
 		if r.oob != nil {
 			n, oobn, msgFlags, from, err = r.conn.ReadMsgUDPAddrPort(r.bufs[k], r.oob[k])
 			if err == nil {
@@ -131,12 +132,8 @@ func (r *packetReader) next() ([]udpPacket, error) {
 		r.pkts[k] = udpPacket{data: r.bufs[k][:n], from: from, origPort: origPort}
 	}
 	// Restore blocking behaviour for the next cycle's first read.
-	r.conn.SetReadDeadline(time.Time{})
-	// Burst visibility: one poller wakeup yielding k>1 datagrams proves the
-	// drain loop is amortizing syscalls under load. Gated on a precomputed
-	// debug flag: a hot-path Debugf must not pay for variadic boxing (or a
-	// global log mutex) when debug output is off.
-	if r.debug && k > 1 {
+	_ = r.conn.SetReadDeadline(time.Time{})
+	if r.debug && k > 1 && r.logger != nil {
 		r.logger.Debugf("[Recv] 🌊 burst drain: %d datagrams in one wakeup", k)
 	}
 	return r.pkts[:k], nil

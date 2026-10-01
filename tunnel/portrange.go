@@ -4,12 +4,10 @@ import (
 	crand "crypto/rand"
 	"encoding/binary"
 	"fmt"
-	"math/rand"
 	"net"
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -256,21 +254,29 @@ func (pr *PortRange) String() string {
 // "any port per packet" contract that defeats per-destination-port UDP
 // rate limiting.
 type PortSelector struct {
-	pr   *PortRange
-	mode SelectorMode
-	rr   atomic.Uint64
-	rng  *rand.Rand
-	mu   sync.Mutex
+	pr       *PortRange
+	mode     SelectorMode
+	rr       atomic.Uint64
+	rngState atomic.Uint64
 }
 
-// NewPortSelector creates a selector over pr. The RNG seed is drawn from
-// crypto/rand so the random spread does not start from a predictable sequence.
+// NewPortSelector creates a selector over pr. The PRNG state is seeded from
+// crypto/rand, but per-packet generation is deliberately lock-free: random
+// destination-port selection is traffic spreading, not a cryptographic use.
 func NewPortSelector(pr *PortRange, mode SelectorMode) *PortSelector {
-	return &PortSelector{
-		pr:   pr,
-		mode: mode,
-		rng:  rand.New(rand.NewSource(randomSeed())),
-	}
+	s := &PortSelector{pr: pr, mode: mode}
+	s.rngState.Store(uint64(randomSeed()))
+	return s
+}
+
+// nextRandom advances a SplitMix64 stream with one atomic add. SplitMix64 is
+// fast, has excellent bit diffusion for port spreading, and unlike math/rand
+// behind a mutex does not serialize every packet from concurrent sessions.
+func (s *PortSelector) nextRandom() uint64 {
+	z := s.rngState.Add(0x9e3779b97f4a7c15)
+	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+	z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+	return z ^ (z >> 31)
 }
 
 var fallbackSeed atomic.Uint64
@@ -300,9 +306,7 @@ func (s *PortSelector) Next() int {
 		i := s.rr.Add(1) - 1
 		return s.pr.PortAt(int(i % uint64(s.pr.total)))
 	}
-	s.mu.Lock()
-	idx := s.rng.Intn(s.pr.total)
-	s.mu.Unlock()
+	idx := int(s.nextRandom() % uint64(s.pr.total))
 	return s.pr.PortAt(idx)
 }
 

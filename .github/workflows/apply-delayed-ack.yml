@@ -1,0 +1,306 @@
+name: Apply delayed cumulative ACK
+
+on:
+  push:
+    branches:
+      - perf/throughput-pipeline
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-test:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: perf/throughput-pipeline
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Benchmark current ACK behavior
+        shell: bash
+        run: |
+          go test -run '^$' -bench 'Benchmark(TCP|UDP)Target_' -benchmem -benchtime=1s -count=5 -timeout 20m ./tunnel/ | tee /tmp/ack-base.txt
+
+      - name: Apply delayed cumulative ACK
+        shell: bash
+        run: |
+          cat > tunnel/delayed_ack.go <<'EOF'
+          package tunnel
+
+          import (
+          	"sync"
+          	"time"
+          )
+
+          const (
+          	delayedAckEvery    = 2
+          	delayedAckMaxDelay = time.Millisecond
+          )
+
+          // delayedAckState coalesces the normal in-order DATA ACK stream. Two
+          // delivered packets ACK immediately; a lone packet is ACKed within 1ms.
+          // Duplicate/recovery re-ACKs bypass this state and remain immediate.
+          // The timer is allocated at most once per session and then reset, so the
+          // optimization does not trade UDP syscalls for per-packet timer churn.
+          type delayedAckState struct {
+          	mu      sync.Mutex
+          	timer   *time.Timer
+          	pending uint64
+          	packets int
+          	send    func(uint64)
+          	closed  bool
+          }
+
+          func (d *delayedAckState) init(send func(uint64)) {
+          	d.mu.Lock()
+          	d.send = send
+          	d.closed = false
+          	d.mu.Unlock()
+          }
+
+          func (d *delayedAckState) queue(ackSeq uint64, delivered int) {
+          	if ackSeq == 0 || delivered <= 0 {
+          		return
+          	}
+          	d.mu.Lock()
+          	if d.closed || d.send == nil {
+          		d.mu.Unlock()
+          		return
+          	}
+          	if ackSeq > d.pending {
+          		d.pending = ackSeq
+          	}
+          	d.packets += delivered
+          	if d.packets >= delayedAckEvery {
+          		ack := d.pending
+          		d.pending = 0
+          		d.packets = 0
+          		if d.timer != nil {
+          			d.timer.Stop()
+          		}
+          		send := d.send
+          		d.mu.Unlock()
+          		send(ack)
+          		return
+          	}
+          	if d.timer == nil {
+          		d.timer = time.AfterFunc(delayedAckMaxDelay, d.flush)
+          	} else {
+          		d.timer.Reset(delayedAckMaxDelay)
+          	}
+          	d.mu.Unlock()
+          }
+
+          func (d *delayedAckState) flush() {
+          	d.mu.Lock()
+          	if d.closed || d.pending == 0 || d.send == nil {
+          		d.mu.Unlock()
+          		return
+          	}
+          	ack := d.pending
+          	d.pending = 0
+          	d.packets = 0
+          	send := d.send
+          	d.mu.Unlock()
+          	send(ack)
+          }
+
+          func (d *delayedAckState) close() {
+          	d.mu.Lock()
+          	d.closed = true
+          	d.pending = 0
+          	d.packets = 0
+          	if d.timer != nil {
+          		d.timer.Stop()
+          	}
+          	d.send = nil
+          	d.mu.Unlock()
+          }
+          EOF
+
+          cat > tunnel/delayed_ack_test.go <<'EOF'
+          package tunnel
+
+          import (
+          	"testing"
+          	"time"
+          )
+
+          func recvAck(t *testing.T, ch <-chan uint64, timeout time.Duration) uint64 {
+          	t.Helper()
+          	select {
+          	case v := <-ch:
+          		return v
+          	case <-time.After(timeout):
+          		t.Fatal("timed out waiting for ACK")
+          		return 0
+          	}
+          }
+
+          func TestDelayedAckFlushesSinglePacket(t *testing.T) {
+          	ch := make(chan uint64, 4)
+          	var d delayedAckState
+          	d.init(func(v uint64) { ch <- v })
+          	defer d.close()
+          	d.queue(7, 1)
+          	if got := recvAck(t, ch, 100*time.Millisecond); got != 7 {
+          		t.Fatalf("ACK=%d want 7", got)
+          	}
+          }
+
+          func TestDelayedAckEveryTwoPackets(t *testing.T) {
+          	ch := make(chan uint64, 4)
+          	var d delayedAckState
+          	d.init(func(v uint64) { ch <- v })
+          	defer d.close()
+          	d.queue(10, 1)
+          	d.queue(11, 1)
+          	if got := recvAck(t, ch, 20*time.Millisecond); got != 11 {
+          		t.Fatalf("ACK=%d want 11", got)
+          	}
+          	select {
+          	case extra := <-ch:
+          		t.Fatalf("unexpected duplicate ACK %d", extra)
+          	case <-time.After(3 * delayedAckMaxDelay):
+          	}
+          }
+
+          func TestDelayedAckContiguousRunIsImmediate(t *testing.T) {
+          	ch := make(chan uint64, 2)
+          	var d delayedAckState
+          	d.init(func(v uint64) { ch <- v })
+          	defer d.close()
+          	d.queue(22, 4)
+          	if got := recvAck(t, ch, 20*time.Millisecond); got != 22 {
+          		t.Fatalf("ACK=%d want 22", got)
+          	}
+          }
+
+          func TestDelayedAckCloseCancelsPending(t *testing.T) {
+          	ch := make(chan uint64, 2)
+          	var d delayedAckState
+          	d.init(func(v uint64) { ch <- v })
+          	d.queue(1, 1)
+          	d.close()
+          	select {
+          	case got := <-ch:
+          		t.Fatalf("ACK %d sent after close", got)
+          	case <-time.After(3 * delayedAckMaxDelay):
+          	}
+          }
+          EOF
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          # Client session: add state, initialize once, coalesce only normal
+          # contiguous delivery, keep duplicate re-ACK immediate.
+          p = Path('tunnel/client.go')
+          s = p.read_text()
+          needle = '''\tdeliverMu sync.Mutex
+
+          \tunacked   map[uint64]*unackedPkt
+          '''
+          repl = '''\tdeliverMu sync.Mutex
+
+          \tdelayedAck delayedAckState
+
+          \tunacked   map[uint64]*unackedPkt
+          '''
+          if s.count(needle) != 1:
+              raise SystemExit(f'client delayedAck field insertion mismatch: {s.count(needle)}')
+          s = s.replace(needle, repl)
+          needle = '\tsess.unackedCond = sync.NewCond(&sess.unackedMu)\n'
+          repl = needle + '\tsess.delayedAck.init(sess.sendACK)\n'
+          if s.count(needle) != 1:
+              raise SystemExit(f'client init mismatch: {s.count(needle)}')
+          s = s.replace(needle, repl)
+          old = '\ts.sendACK(expected + uint64(len(run)) - 1)\n\treturn true\n'
+          new = '\ts.delayedAck.queue(expected+uint64(len(run))-1, len(run))\n\treturn true\n'
+          if s.count(old) != 1:
+              raise SystemExit(f'client ACK call mismatch: {s.count(old)}')
+          s = s.replace(old, new)
+          needle = '''\t\tif s.fecSend != nil {
+          \t\t\ts.fecSend.close()
+          \t\t}
+          '''
+          repl = needle + '\t\ts.delayedAck.close()\n'
+          if s.count(needle) != 1:
+              raise SystemExit(f'client close insertion mismatch: {s.count(needle)}')
+          p.write_text(s.replace(needle, repl))
+
+          # Server session mirrors the client policy.
+          p = Path('tunnel/server.go')
+          s = p.read_text()
+          needle = '''\trecvQueue map[uint64][]byte
+          \trecvMu    sync.Mutex
+
+          \tunacked   map[uint64]*unackedPkt
+          '''
+          repl = '''\trecvQueue map[uint64][]byte
+          \trecvMu    sync.Mutex
+
+          \tdelayedAck delayedAckState
+
+          \tunacked   map[uint64]*unackedPkt
+          '''
+          if s.count(needle) != 1:
+              raise SystemExit(f'server delayedAck field insertion mismatch: {s.count(needle)}')
+          s = s.replace(needle, repl)
+          needle = '\tsess.unackedCond = sync.NewCond(&sess.unackedMu)\n'
+          if s.count(needle) != 1:
+              raise SystemExit(f'server init mismatch: {s.count(needle)}')
+          s = s.replace(needle, needle + '\tsess.delayedAck.init(sess.sendCumulativeACK)\n')
+          old = '\tsess.sendCumulativeACK(expected + uint64(len(run)) - 1)\n\treturn true\n'
+          new = '\tsess.delayedAck.queue(expected+uint64(len(run))-1, len(run))\n\treturn true\n'
+          if s.count(old) != 1:
+              raise SystemExit(f'server ACK call mismatch: {s.count(old)}')
+          s = s.replace(old, new)
+          needle = '''\t\tif sess.fecSend != nil {
+          \t\t\tsess.fecSend.close()
+          \t\t}
+          '''
+          repl = needle + '\t\tsess.delayedAck.close()\n'
+          if s.count(needle) != 1:
+              raise SystemExit(f'server close insertion mismatch: {s.count(needle)}')
+          p.write_text(s.replace(needle, repl))
+          PY
+
+          gofmt -w tunnel/delayed_ack.go tunnel/delayed_ack_test.go tunnel/client.go tunnel/server.go
+
+      - name: Focused ACK tests
+        run: go test -count=20 -run 'DelayedAck|Ack|ACK|Duplicate|Reorder|Concurrent' -timeout 8m ./tunnel/
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Full tests
+        run: go test -count=1 -timeout 15m ./...
+
+      - name: Race tests
+        run: go test -count=1 -race -timeout 20m ./...
+
+      - name: Benchmark delayed ACK
+        shell: bash
+        run: |
+          go test -run '^$' -bench 'Benchmark(TCP|UDP)Target_' -benchmem -benchtime=1s -count=5 -timeout 20m ./tunnel/ | tee /tmp/ack-head.txt
+          go run golang.org/x/perf/cmd/benchstat@latest /tmp/ack-base.txt /tmp/ack-head.txt | tee /tmp/ack-benchstat.txt
+          cat /tmp/ack-benchstat.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit validated implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/apply-delayed-ack.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'perf: coalesce cumulative DATA acknowledgements'
+          git push origin HEAD:perf/throughput-pipeline

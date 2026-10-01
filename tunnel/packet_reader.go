@@ -7,20 +7,15 @@ import (
 )
 
 // packetReader batches datagram reception on ONE UDP socket: next() blocks for
-// the first datagram, then drains up to recvBatch-1 more with an immediate
-// deadline until the socket is empty. Under load this amortizes one poller
-// wakeup and one deadline syscall across a whole burst instead of paying both
-// per datagram.
+// the first datagram through net.UDPConn (so the Go runtime poller owns the
+// blocking wait), then drains the ready burst. Linux uses recvmmsg through the
+// x/net batch socket layer; other platforms retain the portable immediate-
+// deadline drain. This keeps idle sockets cheap while amortizing receive
+// syscalls under load.
 //
 // The returned packets BORROW the reader's internal buffers — they are valid
 // only until the next next() call, so callers must process (or copy) them
 // before reading again. Serve paths already dispatch synchronously.
-//
-// A true recvmmsg(2) batch would shave the remaining per-datagram recvmsg
-// syscalls, but golang.org/x/sys does not export Recvmmsg/Mmsghdr on the
-// toolchain's dependency set and hand-rolled raw syscall numbers per
-// architecture are a maintenance hazard for a security tool. The drain loop
-// captures most of the win portably.
 type packetReader struct {
 	conn   *net.UDPConn
 	logger Logger      // may be nil; truncation diagnostics (warn level)
@@ -28,6 +23,7 @@ type packetReader struct {
 	bufs   [][]byte    // recvBatch receive buffers, reused every call
 	oob    [][]byte    // linux: ancillary-data buffers (origdst); nil elsewhere
 	pkts   []udpPacket // result views into bufs
+	batch  packetBatchState
 
 	// truncLogAt throttles the "datagram larger than our buffer" warning: a
 	// truncated datagram is unauthenticated (any peer can trigger it), so the
@@ -53,14 +49,16 @@ func newPacketReader(conn *net.UDPConn, logger Logger, debug bool) *packetReader
 		r.pkts = append(r.pkts, udpPacket{})
 	}
 	r.oob = newPacketReaderOOB(recvBatch)
+	r.batch = newPacketBatchState(conn, r.bufs, r.oob)
 	return r
 }
 
 // next returns 1..recvBatch received datagrams. A non-timeout error means the
 // socket is broken (closed) and the reader is done.
 func (r *packetReader) next() ([]udpPacket, error) {
-	// First read blocks: the deadline must be clear here (drain below leaves
-	// it set to the past, so clear it defensively every cycle).
+	// First read blocks in net.UDPConn, preserving Go netpoll integration. The
+	// portable drain below may have left an expired deadline, so clear it once
+	// per burst; the Linux batch path never sets one.
 	r.conn.SetReadDeadline(time.Time{})
 
 	var (
@@ -97,10 +95,26 @@ func (r *packetReader) next() ([]udpPacket, error) {
 	r.pkts[0] = udpPacket{data: r.bufs[0][:n], from: from, origPort: origPort}
 	k := 1
 
-	// Drain the socket: an already-expired deadline makes every further read
-	// return immediately (data or timeout), so up to recvBatch-1 extra
-	// datagrams are pulled with zero poller wakeups. The deadline is set once
-	// — an expired deadline stays expired, and successful reads do not clear it.
+	// Linux: after the poller-backed first read proved the socket readable,
+	// drain the rest of the burst in one non-blocking recvmmsg call. If the
+	// platform helper is unavailable it reports handled=false and we fall back
+	// to the portable loop below.
+	if end, handled, batchErr := r.batch.drain(r, k); handled {
+		// Never discard the first packet because a follow-up batch drain failed.
+		// The next cycle's blocking read will surface a persistent socket error.
+		if batchErr == nil {
+			k = end
+		}
+		if r.debug && k > 1 {
+			r.logger.Debugf("[Recv] 🌊 batch drain: %d datagrams in one wakeup", k)
+		}
+		return r.pkts[:k], nil
+	}
+
+	// Portable fallback: an already-expired deadline makes every further read
+	// return immediately (data or timeout), so up to recvBatch-1 extra datagrams
+	// are drained without extra poller wakeups. It still pays one recv syscall
+	// per datagram; Linux avoids that above with recvmmsg.
 	drain := time.Now().Add(-time.Millisecond)
 	r.conn.SetReadDeadline(drain)
 	for ; k < recvBatch; k++ {
@@ -132,10 +146,6 @@ func (r *packetReader) next() ([]udpPacket, error) {
 	}
 	// Restore blocking behaviour for the next cycle's first read.
 	r.conn.SetReadDeadline(time.Time{})
-	// Burst visibility: one poller wakeup yielding k>1 datagrams proves the
-	// drain loop is amortizing syscalls under load. Gated on a precomputed
-	// debug flag: a hot-path Debugf must not pay for variadic boxing (or a
-	// global log mutex) when debug output is off.
 	if r.debug && k > 1 {
 		r.logger.Debugf("[Recv] 🌊 burst drain: %d datagrams in one wakeup", k)
 	}

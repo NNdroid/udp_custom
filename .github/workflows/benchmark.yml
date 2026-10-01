@@ -1,0 +1,124 @@
+name: Throughput Benchmark
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '**/*.go'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/benchmark.yml'
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: throughput-benchmark-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOMAXPROCS: '2'
+  BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'push' && github.event.before || 'main' }}
+  HEAD_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  benchmark:
+    name: base vs candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout baseline
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BASE_REF }}
+          path: baseline
+          fetch-depth: 1
+
+      - name: Checkout candidate
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.HEAD_REF }}
+          path: candidate
+          fetch-depth: 1
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: candidate/go.mod
+          cache: true
+          cache-dependency-path: |
+            baseline/go.sum
+            candidate/go.sum
+
+      - name: Install benchstat
+        run: |
+          go install golang.org/x/perf/cmd/benchstat@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Runner information
+        run: |
+          {
+            echo "go: $(go version)"
+            echo "kernel: $(uname -srmo)"
+            echo "cpu: $(lscpu | sed -n 's/^Model name:[[:space:]]*//p' | head -n1)"
+            echo "gomaxprocs: ${GOMAXPROCS}"
+            echo "base: ${BASE_REF}"
+            echo "head: ${HEAD_REF}"
+          } | tee runner.txt
+
+      - name: Benchmark baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd baseline
+          go test ./tunnel \
+            -run '^$' \
+            -bench '^Benchmark(NoiseEncrypt|NoiseDecrypt|FrameEncode|FrameDecode|PortSelectorNextRandom|PortSelectorNextRoundRobin|SendSockPoolGetHit)$' \
+            -benchmem \
+            -count=5 \
+            -benchtime=2s \
+            -timeout=30m | tee "$GITHUB_WORKSPACE/baseline.txt"
+
+      - name: Benchmark candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd candidate
+          go test ./tunnel \
+            -run '^$' \
+            -bench '^Benchmark(NoiseEncrypt|NoiseDecrypt|FrameEncode|FrameDecode|PortSelectorNextRandom|PortSelectorNextRoundRobin|SendSockPoolGetHit|TunnelE2E.*)$' \
+            -benchmem \
+            -count=5 \
+            -benchtime=2s \
+            -timeout=30m | tee "$GITHUB_WORKSPACE/candidate.txt"
+
+      - name: Compare results
+        shell: bash
+        run: |
+          set -euo pipefail
+          benchstat baseline.txt candidate.txt | tee benchstat.txt
+          {
+            echo '## udp_custom throughput benchmark'
+            echo
+            echo '- Candidate additionally runs `BenchmarkTunnelE2E*` when present.'
+            echo '- `GOMAXPROCS=2`, `-count=5`, `-benchtime=2s`, `-benchmem`'
+            echo
+            echo '```text'
+            cat benchstat.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: udp-custom-throughput-${{ github.run_id }}
+          path: |
+            baseline.txt
+            candidate.txt
+            benchstat.txt
+            runner.txt
+          retention-days: 30

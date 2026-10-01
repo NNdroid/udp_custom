@@ -11,7 +11,7 @@ on:
       count:
         description: Number of benchmark samples
         required: false
-        default: '5'
+        default: '7'
 
 permissions:
   contents: read
@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       BENCHTIME: ${{ inputs.benchtime || '2s' }}
-      BENCHCOUNT: ${{ inputs.count || '5' }}
+      BENCHCOUNT: ${{ inputs.count || '7' }}
       THROUGHPUT_RE: 'Benchmark(TCP|UDP)Target_'
       HOTPATH_RE: 'Benchmark(Frame|Noise|ReplayFilter|PortSelector|SendSockPool)'
 

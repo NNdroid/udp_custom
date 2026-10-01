@@ -47,8 +47,8 @@ jobs:
           // delayedAckState coalesces the normal in-order DATA ACK stream. Two
           // delivered packets ACK immediately; a lone packet is ACKed within 1ms.
           // Duplicate/recovery re-ACKs bypass this state and remain immediate.
-          // The timer is allocated at most once per session and then reset, so the
-          // optimization does not trade UDP syscalls for per-packet timer churn.
+          // The send callback is supplied on queue instead of at construction so
+          // bare session literals used by tests retain correct ACK semantics too.
           type delayedAckState struct {
           	mu      sync.Mutex
           	timer   *time.Timer
@@ -58,22 +58,16 @@ jobs:
           	closed  bool
           }
 
-          func (d *delayedAckState) init(send func(uint64)) {
-          	d.mu.Lock()
-          	d.send = send
-          	d.closed = false
-          	d.mu.Unlock()
-          }
-
-          func (d *delayedAckState) queue(ackSeq uint64, delivered int) {
-          	if ackSeq == 0 || delivered <= 0 {
+          func (d *delayedAckState) queue(ackSeq uint64, delivered int, send func(uint64)) {
+          	if ackSeq == 0 || delivered <= 0 || send == nil {
           		return
           	}
           	d.mu.Lock()
-          	if d.closed || d.send == nil {
+          	if d.closed {
           		d.mu.Unlock()
           		return
           	}
+          	d.send = send
           	if ackSeq > d.pending {
           		d.pending = ackSeq
           	}
@@ -85,9 +79,9 @@ jobs:
           		if d.timer != nil {
           			d.timer.Stop()
           		}
-          		send := d.send
+          		cb := d.send
           		d.mu.Unlock()
-          		send(ack)
+          		cb(ack)
           		return
           	}
           	if d.timer == nil {
@@ -107,9 +101,9 @@ jobs:
           	ack := d.pending
           	d.pending = 0
           	d.packets = 0
-          	send := d.send
+          	cb := d.send
           	d.mu.Unlock()
-          	send(ack)
+          	cb(ack)
           }
 
           func (d *delayedAckState) close() {
@@ -147,9 +141,8 @@ jobs:
           func TestDelayedAckFlushesSinglePacket(t *testing.T) {
           	ch := make(chan uint64, 4)
           	var d delayedAckState
-          	d.init(func(v uint64) { ch <- v })
           	defer d.close()
-          	d.queue(7, 1)
+          	d.queue(7, 1, func(v uint64) { ch <- v })
           	if got := recvAck(t, ch, 100*time.Millisecond); got != 7 {
           		t.Fatalf("ACK=%d want 7", got)
           	}
@@ -158,10 +151,10 @@ jobs:
           func TestDelayedAckEveryTwoPackets(t *testing.T) {
           	ch := make(chan uint64, 4)
           	var d delayedAckState
-          	d.init(func(v uint64) { ch <- v })
           	defer d.close()
-          	d.queue(10, 1)
-          	d.queue(11, 1)
+          	send := func(v uint64) { ch <- v }
+          	d.queue(10, 1, send)
+          	d.queue(11, 1, send)
           	if got := recvAck(t, ch, 20*time.Millisecond); got != 11 {
           		t.Fatalf("ACK=%d want 11", got)
           	}
@@ -175,9 +168,8 @@ jobs:
           func TestDelayedAckContiguousRunIsImmediate(t *testing.T) {
           	ch := make(chan uint64, 2)
           	var d delayedAckState
-          	d.init(func(v uint64) { ch <- v })
           	defer d.close()
-          	d.queue(22, 4)
+          	d.queue(22, 4, func(v uint64) { ch <- v })
           	if got := recvAck(t, ch, 20*time.Millisecond); got != 22 {
           		t.Fatalf("ACK=%d want 22", got)
           	}
@@ -186,8 +178,7 @@ jobs:
           func TestDelayedAckCloseCancelsPending(t *testing.T) {
           	ch := make(chan uint64, 2)
           	var d delayedAckState
-          	d.init(func(v uint64) { ch <- v })
-          	d.queue(1, 1)
+          	d.queue(1, 1, func(v uint64) { ch <- v })
           	d.close()
           	select {
           	case got := <-ch:
@@ -200,8 +191,6 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          # Client session: add state, initialize once, coalesce only normal
-          # contiguous delivery, keep duplicate re-ACK immediate.
           p = Path('tunnel/client.go')
           s = p.read_text()
           needle = '''\tdeliverMu sync.Mutex
@@ -217,13 +206,8 @@ jobs:
           if s.count(needle) != 1:
               raise SystemExit(f'client delayedAck field insertion mismatch: {s.count(needle)}')
           s = s.replace(needle, repl)
-          needle = '\tsess.unackedCond = sync.NewCond(&sess.unackedMu)\n'
-          repl = needle + '\tsess.delayedAck.init(sess.sendACK)\n'
-          if s.count(needle) != 1:
-              raise SystemExit(f'client init mismatch: {s.count(needle)}')
-          s = s.replace(needle, repl)
           old = '\ts.sendACK(expected + uint64(len(run)) - 1)\n\treturn true\n'
-          new = '\ts.delayedAck.queue(expected+uint64(len(run))-1, len(run))\n\treturn true\n'
+          new = '\ts.delayedAck.queue(expected+uint64(len(run))-1, len(run), s.sendACK)\n\treturn true\n'
           if s.count(old) != 1:
               raise SystemExit(f'client ACK call mismatch: {s.count(old)}')
           s = s.replace(old, new)
@@ -236,7 +220,6 @@ jobs:
               raise SystemExit(f'client close insertion mismatch: {s.count(needle)}')
           p.write_text(s.replace(needle, repl))
 
-          # Server session mirrors the client policy.
           p = Path('tunnel/server.go')
           s = p.read_text()
           needle = '''\trecvQueue map[uint64][]byte
@@ -254,12 +237,8 @@ jobs:
           if s.count(needle) != 1:
               raise SystemExit(f'server delayedAck field insertion mismatch: {s.count(needle)}')
           s = s.replace(needle, repl)
-          needle = '\tsess.unackedCond = sync.NewCond(&sess.unackedMu)\n'
-          if s.count(needle) != 1:
-              raise SystemExit(f'server init mismatch: {s.count(needle)}')
-          s = s.replace(needle, needle + '\tsess.delayedAck.init(sess.sendCumulativeACK)\n')
           old = '\tsess.sendCumulativeACK(expected + uint64(len(run)) - 1)\n\treturn true\n'
-          new = '\tsess.delayedAck.queue(expected+uint64(len(run))-1, len(run))\n\treturn true\n'
+          new = '\tsess.delayedAck.queue(expected+uint64(len(run))-1, len(run), sess.sendCumulativeACK)\n\treturn true\n'
           if s.count(old) != 1:
               raise SystemExit(f'server ACK call mismatch: {s.count(old)}')
           s = s.replace(old, new)

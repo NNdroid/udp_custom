@@ -24,7 +24,6 @@ jobs:
   benchmark:
     name: Throughput baseline vs head
     runs-on: ubuntu-latest
-    continue-on-error: true
     env:
       BENCHTIME: ${{ inputs.benchtime || '2s' }}
       BENCHCOUNT: ${{ inputs.count || '5' }}

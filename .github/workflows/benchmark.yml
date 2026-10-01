@@ -70,6 +70,13 @@ jobs:
             echo "head: ${HEAD_REF}"
           } | tee runner.txt
 
+      # PacketReaderBurst is intentionally authored on the candidate branch but
+      # only uses APIs that already exist on main. Copying the identical harness
+      # into the baseline checkout lets benchstat compare the old drain loop and
+      # the new receive backend directly instead of reporting an unmatched test.
+      - name: Install throughput harness in baseline
+        run: cp candidate/tunnel/throughput_benchmark_test.go baseline/tunnel/throughput_benchmark_test.go
+
       - name: Benchmark baseline
         shell: bash
         run: |
@@ -77,7 +84,7 @@ jobs:
           cd baseline
           go test ./tunnel \
             -run '^$' \
-            -bench '^Benchmark(NoiseEncrypt|NoiseDecrypt|FrameEncode|FrameDecode|PortSelectorNextRandom|PortSelectorNextRoundRobin|SendSockPoolGetHit)$' \
+            -bench '^Benchmark(NoiseEncrypt|NoiseDecrypt|FrameEncode|FrameDecode|PortSelectorNextRandom|PortSelectorNextRoundRobin|SendSockPoolGetHit|PacketReaderBurst)$' \
             -benchmem \
             -count=5 \
             -benchtime=2s \
@@ -90,7 +97,7 @@ jobs:
           cd candidate
           go test ./tunnel \
             -run '^$' \
-            -bench '^Benchmark(NoiseEncrypt|NoiseDecrypt|FrameEncode|FrameDecode|PortSelectorNextRandom|PortSelectorNextRoundRobin|SendSockPoolGetHit|TunnelE2E.*)$' \
+            -bench '^Benchmark(NoiseEncrypt|NoiseDecrypt|FrameEncode|FrameDecode|PortSelectorNextRandom|PortSelectorNextRoundRobin|SendSockPoolGetHit|PacketReaderBurst)$' \
             -benchmem \
             -count=5 \
             -benchtime=2s \
@@ -104,8 +111,9 @@ jobs:
           {
             echo '## udp_custom throughput benchmark'
             echo
-            echo '- Candidate additionally runs `BenchmarkTunnelE2E*` when present.'
+            echo '- PacketReaderBurst uses the exact same harness on base and candidate.'
             echo '- `GOMAXPROCS=2`, `-count=5`, `-benchtime=2s`, `-benchmem`'
+            echo '- `MB/s` is reported from actual payload bytes returned by each receive call.'
             echo
             echo '```text'
             cat benchstat.txt

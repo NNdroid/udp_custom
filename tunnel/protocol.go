@@ -41,11 +41,13 @@ const (
 	CMD_MTU_PROBE_REPLY = uint8(0x0B)
 	CMD_MTU_COMMIT      = uint8(0x0C)
 	CMD_FEC             = uint8(0x0D)
+	CMD_SACK            = uint8(0x0E)
 
 	// FEC capability is negotiated inside the authenticated handshake header.
 	// Loss feedback rides established records in WindowSize as basis points.
-	FLAG_FEC_CAPABLE  = uint16(1 << 0)
-	FLAG_FEC_FEEDBACK = uint16(1 << 1)
+	FLAG_FEC_CAPABLE      = uint16(1 << 0)
+	FLAG_FEC_FEEDBACK     = uint16(1 << 1)
+	FLAG_RECOVERY_CAPABLE = uint16(1 << 2)
 
 	// Magic(4)+Version(1)+Cmd(1)+Flags(2)+SessionID(4)+PacketNo(8)+
 	// Seq(8)+Ack(8)+Window(2)+PayloadLen(2), followed by payload and a fixed
@@ -243,7 +245,8 @@ type FrameKeys struct {
 	// fec is set only when BOTH peers authenticated FLAG_FEC_CAPABLE during
 	// the handshake. Keeping it on the derived session state avoids changing
 	// the public handshake API while making mixed-version rollout safe.
-	fec bool
+	fec      bool
+	recovery bool
 }
 
 type PSKHandshakeKeys struct {
@@ -404,7 +407,7 @@ func parseUDPCFrame(buf []byte, expectedMagic uint32, dst *UDPCFrame) error {
 }
 
 func validUDPCCommand(cmd uint8) bool {
-	return cmd >= CMD_HANDSHAKE_SYN && cmd <= CMD_FEC
+	return cmd >= CMD_HANDSHAKE_SYN && cmd <= CMD_SACK
 }
 
 func validSessionFrameShape(frame *UDPCFrame) bool {
@@ -414,6 +417,8 @@ func validSessionFrameShape(frame *UDPCFrame) bool {
 	switch frame.Cmd {
 	case CMD_DATA:
 		return frame.Seq != 0
+	case CMD_SACK:
+		return frame.Seq == 0 && len(frame.Data) >= 2 && len(frame.Data) <= sackPayloadSize && (len(frame.Data)-2)%8 == 0
 	case CMD_FEC:
 		// Seq carries the FEC block's base DATA sequence; parity bytes live
 		// in Data and the k/m/index tuple is packed into authenticated Flags.

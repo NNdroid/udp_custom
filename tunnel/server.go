@@ -33,9 +33,10 @@ type ServerConfig struct {
 	// OrigDst enables IP_RECVORIGDSTADDR (Linux only). REQUIRED whenever the
 	// client spreads across more than one destination port: without it every
 	// reply leaves from ListenAddr and strict NATs drop it.
-	OrigDst     bool `json:"origdst"`
-	SendSockMax int  `json:"sendsock_max"` // LRU cap for per-port reply sockets (0 = 512)
-	SendWindow  int  `json:"send_window"`  // max DATA frames in flight awaiting ACK (0 = 256)
+	OrigDst     bool  `json:"origdst"`
+	SendSockMax int   `json:"sendsock_max"` // LRU cap for per-port reply sockets (0 = 512)
+	SendWindow  int   `json:"send_window"`  // maximum in-flight frames; 0 adapts up to 512 with negotiated recovery
+	Recovery    *bool `json:"recovery,omitempty"`
 
 	// MaxPkt is the largest v2 RECORD this server puts on the wire: 40-byte
 	// header + payload + 16-byte authentication tag, i.e. the UDP payload
@@ -146,6 +147,7 @@ const synCacheTTL = 10 * time.Minute
 const synCacheMax = 4096
 
 type Server struct {
+	startOnce sync.Once // one reader per UDP socket, even with concurrent Start calls
 	// Debug counters accessed with sync/atomic. atomic.Uint64 carries an
 	// align64, guaranteeing 8-byte alignment on 32-bit arches (arm, 386) —
 	// plain uint64 here would panic with "unaligned 64-bit atomic operation".
@@ -358,6 +360,8 @@ type unackedPkt struct {
 	firstSent time.Time // when the frame was first sent; used to sample RTT
 	sentTime  time.Time
 	rto       time.Duration
+	sacked    bool
+	queued    bool
 	retries   int
 }
 
@@ -403,6 +407,10 @@ type ServerSession struct {
 	recvQueue map[uint64][]byte
 	recvMu    sync.Mutex
 
+	delivery  *orderedDelivery
+	retryWake chan struct{}
+	tx        *transmitQueue
+	flow      *sendFlow
 	unacked   map[uint64]*unackedPkt
 	unackedMu sync.Mutex
 	// lowestOutstanding is the smallest Seq possibly still in unacked, so
@@ -766,16 +774,21 @@ func newServer(cfg ServerConfig, dial TargetDialer, injected *net.UDPConn) (*Ser
 }
 
 func (s *Server) Start() error {
-	netType, target := parseTargetNetworkAndAddr(s.cfg.TargetAddr)
-	s.logInfo("UDP server: %s -> Target [%s] %s (origdst=%v)", s.conn.LocalAddr(), netType, target, s.origDstOK)
-	s.logInfo("Protocol v2 authentication enabled with %d valid PSK(s)", len(s.cfg.Passwords))
-	warnWeakPSKs(s.logger, s.cfg.Passwords)
+	s.startOnce.Do(func() {
+		if atomic.LoadInt32(&s.closed) != 0 {
+			return
+		}
+		netType, target := parseTargetNetworkAndAddr(s.cfg.TargetAddr)
+		s.logInfo("UDP server: %s -> Target [%s] %s (origdst=%v)", s.conn.LocalAddr(), netType, target, s.origDstOK)
+		s.logInfo("Protocol v2 authentication enabled with %d valid PSK(s)", len(s.cfg.Passwords))
+		warnWeakPSKs(s.logger, s.cfg.Passwords)
 
-	go s.cleanupLoop()
+		go s.cleanupLoop()
 
-	for _, rc := range s.recvConns {
-		go s.serveConn(rc)
-	}
+		for _, rc := range s.recvConns {
+			go s.serveConn(rc)
+		}
+	})
 	select {
 	case <-s.closeChan:
 		return nil
@@ -909,6 +922,9 @@ func (s *Server) serveConn(conn *net.UDPConn) {
 // replay and source-path checks all succeed.
 func (sess *ServerSession) processIncomingFrame(frame *UDPCFrame, remoteAddr netip.AddrPort, origPort int) bool {
 	if frame == nil {
+		return false
+	}
+	if frame.Cmd == CMD_SACK && sess.flow == nil {
 		return false
 	}
 	if !validSessionFrameShape(frame) {
@@ -1149,6 +1165,7 @@ func (s *Server) handleHandshake(remoteAddr netip.AddrPort, frame *UDPCFrame, or
 		}
 	}
 	frameKeys.fec = fecNegotiated
+	frameKeys.recovery = fecEnabled(s.cfg.Recovery) && frame.Flags&FLAG_RECOVERY_CAPABLE != 0
 
 	sess := &ServerSession{
 		server:        s,
@@ -1168,6 +1185,9 @@ func (s *Server) handleHandshake(remoteAddr netip.AddrPort, frame *UDPCFrame, or
 		mtuGate:       make(chan struct{}),
 	}
 	sess.unackedCond = sync.NewCond(&sess.unackedMu)
+	if frameKeys.recovery {
+		sess.flow = newSendFlow(s.sendWindow, s.cfg.SendWindow <= 0)
+	}
 	if frameKeys.fec {
 		sess.fecRecv = newFECReceiver()
 		sess.fecSend = newFECSender(sess.sendFECParity)
@@ -1176,6 +1196,15 @@ func (s *Server) handleHandshake(remoteAddr netip.AddrPort, frame *UDPCFrame, or
 	// at 0 (its first AddUint64 returns 1).
 	sess.sendSeq.Store(1)
 	sess.recvSeq.Store(1)
+	limit := min(s.maxRecvQueue, deliveryWindow)
+	sess.delivery = newOrderedDelivery(limit, sess.closeChan, func(p []byte) error {
+		if sess.upstream != nil {
+			_ = sess.upstream.SetWriteDeadline(time.Now().Add(targetWriteTimeout))
+		}
+		return sess.writeToTarget(p)
+	}, func(err error) { s.logWarn("target delivery failed: %v", err); sess.Close() }, sess.sendCumulativeACK)
+	sess.retryWake = make(chan struct{}, 1)
+	sess.initTransmitter()
 	s.sessions.Store(sid, sess)
 	sess.setPath(origPort, remoteAddr)
 
@@ -1188,6 +1217,9 @@ func (s *Server) handleHandshake(remoteAddr netip.AddrPort, frame *UDPCFrame, or
 	ackData = appendTargetTLV(ackData, requestedTarget)
 	ackData = append(ackData, noiseMsg2...)
 	ackFlags := uint16(0)
+	if frameKeys.recovery {
+		ackFlags |= FLAG_RECOVERY_CAPABLE
+	}
 	if fecNegotiated {
 		ackFlags |= FLAG_FEC_CAPABLE
 	}
@@ -1449,12 +1481,17 @@ func (sess *ServerSession) handleIncomingFrame(frame *UDPCFrame, remoteAddr neti
 	sess.updateRemoteAddr(remoteAddr, false)
 	sess.setPath(origPort, remoteAddr)
 	sess.touch()
-	if frame.Ack > 0 {
+	if frame.Ack > 0 && frame.Cmd != CMD_SACK {
 		sess.handleAck(frame.Ack)
 	}
 
 	switch frame.Cmd {
+	case CMD_SACK:
+		sess.handleSACK(frame)
 	case CMD_PING:
+		if sess.flow != nil {
+			sess.sendCumulativeACK(sess.currentAck())
+		}
 		pong := &UDPCFrame{
 			Magic:     sess.server.cfg.Magic,
 			Version:   UDPC_VERSION,
@@ -1634,7 +1671,13 @@ func (sess *ServerSession) sendFECParity(p fecParityShard) {
 	if !p.applyToFrame(f) {
 		return
 	}
-	sess.sendControl(f, func(data []byte) error { sess.sendToSession(data); return nil })
+	if sess.tx != nil {
+		if wire := sess.encodeFrame(f); len(wire) > 0 {
+			sess.tx.bestEffort(wire)
+		}
+	} else {
+		sess.sendControl(f, func(data []byte) error { sess.sendToSession(data); return nil })
+	}
 }
 
 func (sess *ServerSession) deliverRecoveredFEC(recovered []fecRecovered, remoteAddr netip.AddrPort, origPort int) {
@@ -1651,6 +1694,9 @@ func (sess *ServerSession) deliverRecoveredFEC(recovered []fecRecovered, remoteA
 }
 
 func (sess *ServerSession) currentAck() uint64 {
+	if sess.delivery != nil {
+		return sess.delivery.delivered.Load()
+	}
 	if next := sess.recvSeq.Load(); next > 0 {
 		return next - 1
 	}
@@ -1668,6 +1714,9 @@ func (sess *ServerSession) sameRemoteIP(addr netip.AddrPort) bool {
 }
 
 func (sess *ServerSession) handleAck(ackSeq uint64) {
+	if next := sess.sendSeq.Load(); next > 0 && ackSeq >= next {
+		return
+	}
 	sess.unackedMu.Lock()
 	if len(sess.unacked) == 0 || ackSeq < sess.lowestOutstanding {
 		sess.unackedMu.Unlock()
@@ -1677,7 +1726,7 @@ func (sess *ServerSession) handleAck(ackSeq uint64) {
 	// delivered". This matches the ACKs this end emits and keeps a lost ACK
 	// from leaving a frame stuck in the retransmit queue — any later ACK
 	// covers it.
-	if pkt, ok := sess.unacked[ackSeq]; ok && pkt.retries == 0 {
+	if pkt, ok := sess.unacked[ackSeq]; ok && pkt.retries == 0 && !pkt.queued {
 		// Karn's rule: only sample RTT from a frame that was never
 		// retransmitted; the RTT of a retransmitted one is not trustworthy.
 		sess.rttEst.Sample(time.Since(pkt.firstSent))
@@ -1686,9 +1735,13 @@ func (sess *ServerSession) handleAck(ackSeq uint64) {
 	// inserted, so the map is the contiguous range [lowest..highest] (up to an
 	// insert racing this lock). Delete the ACKed prefix forward from the
 	// watermark instead of scanning all 256 slots per ACK.
+	acknowledged := 0
 	for seq := sess.lowestOutstanding; seq <= ackSeq; seq++ {
 		if pkt, ok := sess.unacked[seq]; ok && sess.fecSend != nil {
 			sess.fecSend.observeAck(pkt.retries > 0)
+		}
+		if sess.unacked[seq] != nil {
+			acknowledged++
 		}
 		delete(sess.unacked, seq)
 	}
@@ -1708,6 +1761,9 @@ func (sess *ServerSession) handleAck(ackSeq uint64) {
 		}
 		sess.lowestOutstanding = minSeq
 	}
+	if sess.flow != nil {
+		sess.flow.acknowledged(acknowledged)
+	}
 	sess.unackedMu.Unlock()
 	// Free send-window space; keep the broadcast outside the lock to avoid
 	// waking a sender straight into a contested mutex.
@@ -1719,6 +1775,19 @@ func (sess *ServerSession) handleData(frame *UDPCFrame, remoteAddr netip.AddrPor
 }
 
 func (sess *ServerSession) handleDataFromPath(frame *UDPCFrame, remoteAddr netip.AddrPort, origPort int) bool {
+	if sess.delivery != nil {
+		if frame.Ack > 0 {
+			sess.handleAck(frame.Ack)
+		}
+		if !sess.delivery.offer(frame.Seq, frame.Data) {
+			sess.server.queueFullDrops.Add(1)
+			return false
+		}
+		sess.updateRemoteAddr(remoteAddr, true)
+		sess.setPath(origPort, remoteAddr)
+		sess.touch()
+		return true
+	}
 	// Authentication/decryption and packet-number replay filtering have already
 	// completed in the receive loop.
 	payload := frame.Data
@@ -1817,6 +1886,15 @@ func (sess *ServerSession) handleDataFromPath(frame *UDPCFrame, remoteAddr netip
 // delivered". Used after delivering a run and when re-ACKing a duplicate whose
 // original ACK was lost. Control frames ride the pooled send buffer.
 func (sess *ServerSession) sendCumulativeACK(ackSeq uint64) {
+	if atomic.LoadInt32(&sess.closed) != 0 {
+		return
+	}
+	if sess.flow != nil && sess.delivery != nil {
+		ack, bitmap, credit := sess.delivery.snapshot()
+		f := &UDPCFrame{Magic: sess.server.cfg.Magic, Version: UDPC_VERSION, Cmd: CMD_SACK, SessionID: sess.sessionID, Ack: ack, Data: encodeSACK(credit, bitmap[0], bitmap[1:]...)}
+		sess.sendControl(f, func(p []byte) error { sess.sendToSession(p); return nil })
+		return
+	}
 	ackFrame := &UDPCFrame{
 		Magic:      sess.server.cfg.Magic,
 		Version:    UDPC_VERSION,
@@ -1881,7 +1959,7 @@ func (sess *ServerSession) sendData(payload []byte) error {
 			len(payload), budget, sess.server.maxPkt, budget)
 	}
 	sess.unackedMu.Lock()
-	for len(sess.unacked) >= sess.server.sendWindow && atomic.LoadInt32(&sess.closed) == 0 {
+	for len(sess.unacked) >= sess.sendWindow() && atomic.LoadInt32(&sess.closed) == 0 {
 		sess.unackedCond.Wait()
 	}
 	sess.unackedMu.Unlock()
@@ -1913,6 +1991,7 @@ func (sess *ServerSession) sendData(payload []byte) error {
 		sess.lowestOutstanding = seq
 	}
 	sess.unacked[seq] = &unackedPkt{
+		queued:    sess.tx != nil,
 		wire:      encoded,
 		firstSent: now,
 		sentTime:  now,
@@ -1923,7 +2002,14 @@ func (sess *ServerSession) sendData(payload []byte) error {
 
 	// Server-initiated: reply on the most recently used path so the source
 	// port matches the port the client last contacted.
-	sess.sendToSession(encoded)
+	notifyRetry(sess.retryWake)
+	if sess.tx != nil {
+		if !sess.tx.submit(encoded) {
+			return fmt.Errorf("session closed")
+		}
+	} else {
+		sess.sendToSession(encoded)
+	}
 	if sess.fecSend != nil {
 		sess.fecSend.add(seq, payload)
 	}
@@ -2039,59 +2125,45 @@ func (sess *ServerSession) forwardUpstream(chunk []byte) {
 }
 
 func (sess *ServerSession) retransmitLoop() {
-	ticker := time.NewTicker(50 * time.Millisecond)
-	defer ticker.Stop()
+	timer := time.NewTimer(10 * time.Millisecond)
+	defer timer.Stop()
 
 	for {
 		select {
 		case <-sess.closeChan:
 			return
-		case <-ticker.C:
-			now := time.Now()
-			// Collect the frames due for retransmission and do all bookkeeping
-			// under the lock, then send OUTSIDE it: a sendto(2) (and a cold
-			// reply-socket bind) must not block handleAck or the send window —
-			// stalling the ACK path delays the very ACKs that would drain the
-			// backlog.
-			type dueRetransmit struct {
-				wire []byte
-				seq  uint64
-			}
-			due := make([]dueRetransmit, 0, 8)
-			maxedOut := false
-			sess.unackedMu.Lock()
-			for seq, pkt := range sess.unacked {
-				if now.Sub(pkt.sentTime) < pkt.rto {
-					continue
-				}
-				if pkt.retries >= 15 {
-					sess.server.logWarn("[Session 0x%08X] ⚠️ Max retries reached for Seq %d, closing session", sess.sessionID, seq)
-					maxedOut = true
-					break
-				}
-				pkt.retries++
-				pkt.sentTime = now
-				pkt.rto = time.Duration(float64(pkt.rto) * 1.5) // back off 1.5x from the adaptive RTO
-				if pkt.rto > sess.rttEst.maxRTT {
-					pkt.rto = sess.rttEst.maxRTT
-				}
-				due = append(due, dueRetransmit{wire: pkt.wire, seq: seq})
-			}
-			sess.unackedMu.Unlock()
-			if maxedOut {
-				sess.Close()
-				return
-			}
-			for _, d := range due {
-				sess.sendToSession(d.wire)
+		case <-sess.retryWake:
+		case <-timer.C:
+		}
+		now := time.Now()
+		sess.unackedMu.Lock()
+		due, abandoned := retryDue(sess.unacked, now, 10*time.Second, sess.flow, sess.rttEst.SRTT())
+		sess.unackedMu.Unlock()
+		if abandoned {
+			sess.Close()
+			return
+		}
+		for _, wire := range due {
+			if sess.tx != nil {
+				sess.tx.bestEffort(wire)
+			} else {
+				sess.sendToSession(wire)
 			}
 		}
+		sess.probeReceiveCredit(now)
+		sess.unackedMu.Lock()
+		delay := nextRetryDelay(sess.unacked, sess.flow, time.Now())
+		sess.unackedMu.Unlock()
+		timer.Reset(delay)
 	}
 }
 
 func (sess *ServerSession) Close() {
 	sess.closeOnce.Do(func() {
 		atomic.StoreInt32(&sess.closed, 1)
+		if sess.delivery != nil {
+			sess.delivery.close()
+		}
 		if sess.fecSend != nil {
 			sess.fecSend.close()
 		}
@@ -2485,4 +2557,31 @@ func resolveLogLevel(cfg ServerConfig) int {
 		return 0
 	}
 	return LogLevel(cfg.LogLevel)
+}
+
+func (sess *ServerSession) sendWindow() int {
+	if sess.flow != nil {
+		return sess.flow.window()
+	}
+	return sess.server.sendWindow
+}
+func (sess *ServerSession) handleSACK(f *UDPCFrame) {
+	if sess.flow == nil {
+		return
+	}
+	sess.unackedMu.Lock()
+	wire, valid := updateSACK(sess.flow, sess.unacked, f, sess.sendSeq.Load()-1, sess.rttEst.SRTT())
+	sess.unackedCond.Broadcast()
+	sess.unackedMu.Unlock()
+	notifyRetry(sess.retryWake)
+	if valid && f.Ack > 0 {
+		sess.handleAck(f.Ack)
+	}
+	if wire != nil {
+		if sess.tx != nil {
+			sess.tx.bestEffort(wire)
+		} else {
+			sess.sendToSession(wire)
+		}
+	}
 }

@@ -207,20 +207,22 @@ func TestSpreadDialerMultiSocketAgainstServer(t *testing.T) {
 			t.Fatalf("send from socket %d: %v", idx, err)
 		}
 		// The ACK and the echo both land on the socket that sent.
-		ack := readFrameFromConn(t, d.Conn(idx), time.Second)
-		if _, err := OpenFrameAEAD(ack, frameKeys.Recv); err != nil {
-			t.Fatalf("socket %d: ACK auth: %v", idx, err)
-		}
-		echo := readFrameFromConn(t, d.Conn(idx), time.Second)
-		plain, err := OpenFrameAEAD(echo, frameKeys.Recv)
-		if err != nil {
-			t.Fatalf("socket %d: DATA auth: %v", idx, err)
-		}
-		if echo.Cmd != CMD_DATA {
-			t.Fatalf("socket %d: want DATA, got cmd=%d", idx, echo.Cmd)
-		}
-		if len(plain) != 1 || plain[0] != payload[0] {
-			t.Fatalf("socket %d: echo mismatch %q", idx, plain)
+		confirmed, echoed := false, false
+		for !confirmed || !echoed {
+			f := readFrameFromConn(t, d.Conn(idx), time.Second)
+			plain, err := OpenFrameAEAD(f, frameKeys.Recv)
+			if err != nil {
+				t.Fatalf("socket %d: reply auth: %v", idx, err)
+			}
+			if f.Ack >= dataSeq {
+				confirmed = true
+			}
+			if f.Cmd == CMD_DATA {
+				if f.Seq != dataSeq || len(plain) != 1 || plain[0] != payload[0] {
+					t.Fatalf("socket %d: echo seq=%d data=%q", idx, f.Seq, plain)
+				}
+				echoed = true
+			}
 		}
 	}
 }

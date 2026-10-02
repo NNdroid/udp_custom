@@ -1,0 +1,20 @@
+File: tunnel.test
+Build ID: 798a1f07fb265aac343d803f47a740f551721edc
+Type: alloc_space
+Time: 2026-10-02 13:17:19 CST
+Showing nodes accounting for 453.52MB, 95.27% of 476.06MB total
+Dropped 54 nodes (cum <= 2.38MB)
+Showing top 12 nodes out of 46
+      flat  flat%   sum%        cum   cum%
+  139.20MB 29.24% 29.24%   140.20MB 29.45%  github.com/NNdroid/udp_custom/tunnel.SealFrameAEAD
+  122.16MB 25.66% 54.90%   122.16MB 25.66%  github.com/NNdroid/udp_custom/tunnel.(*orderedDelivery).offer
+  113.15MB 23.77% 78.67%   113.15MB 23.77%  github.com/NNdroid/udp_custom/tunnel.(*fecReceiver).onData
+   24.50MB  5.15% 83.82%   164.67MB 34.59%  github.com/NNdroid/udp_custom/tunnel.(*Server).serveConn
+      11MB  2.31% 86.13%       11MB  2.31%  github.com/NNdroid/udp_custom/tunnel.(*Server).replyFromOrigPort
+    9.50MB  2.00% 88.12%     9.50MB  2.00%  time.newTimer
+    7.50MB  1.58% 89.70%    76.60MB 16.09%  github.com/NNdroid/udp_custom/tunnel.(*ServerSession).sendData
+       7MB  1.47% 91.17%        7MB  1.47%  golang.org/x/net/internal/socket.parseInetAddr
+       7MB  1.47% 92.64%     7.50MB  1.58%  github.com/NNdroid/udp_custom/tunnel.putDecryptBuf
+       5MB  1.05% 93.69%    76.10MB 15.99%  github.com/NNdroid/udp_custom/tunnel.(*clientSession).sendData
+       4MB  0.84% 94.53%        8MB  1.68%  github.com/NNdroid/udp_custom/tunnel.writeUDPBatch
+    3.50MB  0.74% 95.27%     3.50MB  0.74%  github.com/NNdroid/udp_custom/tunnel.OpenFrameAEADInto

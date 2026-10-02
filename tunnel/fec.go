@@ -205,6 +205,9 @@ type fecSender struct {
 	emit     func(fecParityShard)
 }
 
+var fecSourcesPool = sync.Pool{New: func() any { p := make([]fecSourceShard, 0, fecDataShardsMax); return &p }}
+var fecSlabPool = sync.Pool{New: func() any { p := make([]byte, (fecDataShardsMax+fecParityShardsMax)*UDPC_MAX_DATA); return &p }}
+
 func newFECSender(emit func(fecParityShard)) *fecSender {
 	return &fecSender{emit: emit, codecs: make(map[uint16]reedsolomon.Encoder)}
 }
@@ -231,20 +234,32 @@ func (s *fecSender) add(seq uint64, payload []byte) {
 	if seq == 0 || len(payload) == 0 {
 		return
 	}
-	owned := fecSourceShard{seq: seq, payload: append([]byte(nil), payload...)}
-
 	var blocks [][]fecSourceShard
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
 		return
 	}
+	// After bootstrap, a clean path needs neither owned DATA copies nor a
+	// per-block flush timer. ARQ/remote feedback reactivates parity on loss.
+	if len(s.pending) == 0 && s.blocks >= fecBootstrapBlocks && fecParityForLoss(s.adaptive.loss()) == 0 {
+		s.mu.Unlock()
+		return
+	}
 	if n := len(s.pending); n > 0 && seq != s.pending[n-1].seq+1 {
 		blocks = append(blocks, s.detachLocked())
 	}
+	if s.pending == nil {
+		s.pending = *fecSourcesPool.Get().(*[]fecSourceShard)
+	}
+	owned := fecSourceShard{seq: seq, payload: append([]byte(nil), payload...)}
 	s.pending = append(s.pending, owned)
 	if len(s.pending) == 1 {
-		s.timer = time.AfterFunc(fecFlushDelay, s.flushTimer)
+		if s.timer == nil {
+			s.timer = time.AfterFunc(fecFlushDelay, s.flushTimer)
+		} else {
+			s.timer.Reset(fecFlushDelay)
+		}
 	}
 	if len(s.pending) >= fecDataShardsMax {
 		blocks = append(blocks, s.detachLocked())
@@ -253,6 +268,7 @@ func (s *fecSender) add(seq uint64, payload []byte) {
 
 	for _, block := range blocks {
 		s.emitBlock(block)
+		releaseFECSources(block)
 	}
 }
 
@@ -264,7 +280,6 @@ func (s *fecSender) detachLocked() []fecSourceShard {
 	s.pending = nil
 	if s.timer != nil {
 		s.timer.Stop()
-		s.timer = nil
 	}
 	return block
 }
@@ -278,6 +293,15 @@ func (s *fecSender) flushTimer() {
 	block := s.detachLocked()
 	s.mu.Unlock()
 	s.emitBlock(block)
+	releaseFECSources(block)
+}
+
+func releaseFECSources(block []fecSourceShard) {
+	if cap(block) == fecDataShardsMax {
+		clear(block)
+		p := block[:0]
+		fecSourcesPool.Put(&p)
+	}
 }
 
 func (s *fecSender) emitBlock(block []fecSourceShard) {
@@ -326,14 +350,18 @@ func (s *fecSender) emitBlock(block []fecSourceShard) {
 
 	dataShards := len(block)
 	shards := make([][]byte, dataShards+parityShards)
+	pooled := fecSlabPool.Get().(*[]byte)
+	slab := (*pooled)[:len(shards)*shardSize]
+	clear(slab)
+	defer fecSlabPool.Put(pooled)
 	for i, src := range block {
-		shard := make([]byte, shardSize)
+		shard := slab[i*shardSize : (i+1)*shardSize]
 		binary.BigEndian.PutUint16(shard[:fecLengthPrefixSize], uint16(len(src.payload)))
 		copy(shard[fecLengthPrefixSize:], src.payload)
 		shards[i] = shard
 	}
 	for i := dataShards; i < len(shards); i++ {
-		shards[i] = make([]byte, shardSize)
+		shards[i] = slab[i*shardSize : (i+1)*shardSize]
 	}
 
 	// One session may flush from a timer while the next full block is being
@@ -368,6 +396,11 @@ func (s *fecSender) close() {
 		if s.timer != nil {
 			s.timer.Stop()
 			s.timer = nil
+		}
+		if cap(s.pending) == fecDataShardsMax {
+			clear(s.pending)
+			p := s.pending[:0]
+			fecSourcesPool.Put(&p)
 		}
 		s.pending = nil
 	}
@@ -487,7 +520,36 @@ func (r *fecReceiver) tryRecoverLocked(block *fecRecvBlock) []fecRecovered {
 	if block == nil {
 		return nil
 	}
+	// Count first: a complete block or insufficient parity needs no shard
+	// construction at all. Previously even the clean case copied every DATA.
+	available, missingCount := 0, 0
+	for i := 0; i < block.dataShards; i++ {
+		if payload, ok := r.recent[block.baseSeq+uint64(i)]; ok {
+			if len(payload) > block.shardSize-fecLengthPrefixSize {
+				return nil
+			}
+			available++
+		} else {
+			missingCount++
+		}
+	}
+	if missingCount == 0 {
+		delete(r.blocks, block.baseSeq)
+		return nil
+	}
+	for _, p := range block.parity {
+		if p != nil {
+			available++
+		}
+	}
+	if available < block.dataShards || missingCount > block.parityShards {
+		return nil
+	}
 	shards := make([][]byte, block.dataShards+block.parityShards)
+	pooled := fecSlabPool.Get().(*[]byte)
+	slab := (*pooled)[:block.dataShards*block.shardSize]
+	clear(slab)
+	defer fecSlabPool.Put(pooled)
 	missing := make([]int, 0, block.parityShards)
 	present := 0
 	for i := 0; i < block.dataShards; i++ {
@@ -500,7 +562,7 @@ func (r *fecReceiver) tryRecoverLocked(block *fecRecvBlock) []fecRecovered {
 		if len(payload) > block.shardSize-fecLengthPrefixSize {
 			return nil
 		}
-		shard := make([]byte, block.shardSize)
+		shard := slab[i*block.shardSize : (i+1)*block.shardSize]
 		binary.BigEndian.PutUint16(shard[:fecLengthPrefixSize], uint16(len(payload)))
 		copy(shard[fecLengthPrefixSize:], payload)
 		shards[i] = shard

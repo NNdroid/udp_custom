@@ -1,0 +1,8 @@
+old server / new client / psk
+verified 65536 bytes
+new server / old client / psk
+verified 65536 bytes
+old server / new client / noise
+verified 65536 bytes
+new server / old client / noise
+verified 65536 bytes

@@ -73,7 +73,8 @@ type Config struct {
 	SendSockMax int `json:"sendsock_max"`
 
 	// SendWindow caps the number of DATA frames in flight awaiting an ACK
-	// before the target read loop blocks (backpressure). 0 = 256.
+	// before the target read loop blocks. 0 adapts up to 512 with negotiated
+	// recovery, or uses the legacy 256-frame window with older peers.
 	SendWindow int `json:"send_window"`
 
 	// MaxPkt is the largest v2 record (40-byte header + payload + 16-byte
@@ -98,6 +99,9 @@ type Config struct {
 	// FEC enables adaptive Reed-Solomon FEC when both peers support it.
 	// Absent = enabled; set false to keep pure ARQ behavior.
 	FEC *bool `json:"fec"`
+	// Recovery enables negotiated selective ACK, adaptive window and pacing.
+	// Absent = enabled. False retains the legacy cumulative-ACK wire behavior.
+	Recovery *bool `json:"recovery,omitempty"`
 }
 
 func (c *Config) UnmarshalJSON(data []byte) error {
@@ -226,6 +230,7 @@ func runClientMode(cfg *Config, magicStr, lvl string, sendWindow int) {
 		MaxPkt:     cfg.MaxPkt,
 		MtuProbe:   cfg.MtuProbe,
 		FEC:        cfg.FEC,
+		Recovery:   cfg.Recovery,
 	}
 
 	// Optional Noise_NK encryption, keyed by the server's static public key.
@@ -321,6 +326,7 @@ func runFromConfig(path string) {
 		MaxPkt:         cfg.MaxPkt,
 		MtuProbe:       cfg.MtuProbe,
 		FEC:            cfg.FEC,
+		Recovery:       cfg.Recovery,
 	}
 
 	srv, err := tunnel.NewServer(srvCfg)

@@ -28,7 +28,7 @@ jobs:
       BENCHTIME: ${{ inputs.benchtime || '2s' }}
       BENCHCOUNT: ${{ inputs.count || '7' }}
       THROUGHPUT_RE: 'Benchmark(TCP|UDP)Target_'
-      HOTPATH_RE: 'Benchmark(Frame|Noise|ReplayFilter|PortSelector|SendSockPool)'
+      HOTPATH_RE: 'Benchmark(Frame|Noise|ReplayFilter|PortSelector|SendSockPool|FECSenderCleanPath)'
 
     steps:
       - name: Check out head
@@ -69,6 +69,9 @@ jobs:
           set -euo pipefail
           go test -run '^$' ./tunnel/...
           (cd /tmp/udp-custom-base && go test -run '^$' ./tunnel/...)
+
+      - name: Verify delivery and recovery under concurrency and loss
+        run: go test -race -count=10 -run 'OrderedDelivery|DelayedACK|SACK|Stalled|PipelineRecovers|RecoveryNegotiation|SendBatch|ConcurrentServerStart|ServerReceiveSocketsGroup' -timeout 10m ./tunnel/
 
       - name: Benchmark base throughput
         shell: bash

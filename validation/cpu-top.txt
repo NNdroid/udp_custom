@@ -1,0 +1,21 @@
+File: tunnel.test
+Build ID: 798a1f07fb265aac343d803f47a740f551721edc
+Type: cpu
+Time: 2026-10-02 13:17:11 CST
+Duration: 7.57s, Total samples = 19.89s (262.66%)
+Showing nodes accounting for 12.18s, 61.24% of 19.89s total
+Dropped 407 nodes (cum <= 0.10s)
+Showing top 12 nodes out of 232
+      flat  flat%   sum%        cum   cum%
+     8.17s 41.08% 41.08%      8.17s 41.08%  internal/runtime/syscall/linux.Syscall6
+     1.47s  7.39% 48.47%      1.47s  7.39%  golang.org/x/crypto/chacha20.quarterRound (inline)
+     0.54s  2.71% 51.18%      0.54s  2.71%  golang.org/x/crypto/internal/poly1305.update
+     0.39s  1.96% 53.14%      0.63s  3.17%  internal/runtime/maps.(*Iter).Next
+     0.32s  1.61% 54.75%      1.92s  9.65%  golang.org/x/crypto/chacha20.(*Cipher).xorKeyStreamBlocksGeneric
+     0.30s  1.51% 56.26%      0.72s  3.62%  runtime.selectgo
+     0.26s  1.31% 57.57%      0.26s  1.31%  internal/runtime/atomic.(*Uint32).CompareAndSwap
+     0.21s  1.06% 58.62%      0.21s  1.06%  runtime.futex
+     0.15s  0.75% 59.38%      0.15s  0.75%  runtime.memclrNoHeapPointers
+     0.13s  0.65% 60.03%      0.13s  0.65%  golang.org/x/crypto/chacha20.addXor (inline)
+     0.12s   0.6% 60.63%      0.69s  3.47%  golang.org/x/crypto/internal/poly1305.(*mac).Write
+     0.12s   0.6% 61.24%      0.18s   0.9%  runtime.mallocgcTiny

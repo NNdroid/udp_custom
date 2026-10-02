@@ -112,13 +112,19 @@ func TestUDPCustom_Noise_E2E(t *testing.T) {
 			return f
 		}
 	}
-	ack := readFrame()
-	if ack.Cmd != CMD_ACK || ack.Ack != 1 {
-		t.Fatalf("want ACK(1), got cmd=%d ack=%d", ack.Cmd, ack.Ack)
-	}
-	echo := readFrame()
-	if echo.Cmd != CMD_DATA || echo.Seq != 1 {
-		t.Fatalf("want DATA seq=1, got cmd=%d seq=%d", echo.Cmd, echo.Seq)
+	var echo *UDPCFrame
+	confirmed := false
+	for !confirmed || echo == nil {
+		f := readFrame()
+		if f.Ack == 1 {
+			confirmed = true
+		}
+		if f.Cmd == CMD_DATA {
+			if f.Seq != 1 {
+				t.Fatalf("DATA seq=%d, want 1", f.Seq)
+			}
+			echo = f
+		}
 	}
 	if string(echo.Data) != string(msg) {
 		t.Fatalf("echo mismatch: got %q", echo.Data)

@@ -5,6 +5,11 @@
 `codex/throughput-stability`。保留该分支的 Linux 接收批处理，未混入
 `perf/throughput-p0` 的另一套原始系统调用实现。
 
+本报告的基准及源码 hash 记录对应运行时实现提交 `4482175`。
+后续 PR CI 发现 macOS 可接受 64 KiB IPv6 UDP，因而将超大包失败注入限定为
+IPv4；IPv4/IPv6 socket 修复测试保留。这一后续改动只调整测试与文档，未改变
+运行时代码或基准函数。PR CI 结果以 GitHub 的最新 head 为准。
+
 ## 完成的优化
 
 1. 每会话一个有序写入者，最多保留 512 个已认证 DATA，隔离慢应用与慢后端；

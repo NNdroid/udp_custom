@@ -74,8 +74,8 @@ Parity and recovered application payloads still receive independent ownership.
 
 Tests cover blocked backends and applications sharing a receiver, concurrent
 ordered admission, queue ownership/saturation, ACK timers, full-window SACK,
-stale/malformed feedback, lost credit updates, IPv4/IPv6 partial batch sends,
-socket repair and real UDP delay/loss/reorder/duplicate injection with FEC on/off.
+stale/malformed feedback, lost credit updates, IPv4 partial batch sends,
+IPv4/IPv6 socket repair and real UDP delay/loss/reorder/duplicate injection with FEC on/off.
 Compatibility tests opt out on the client, server or both ends. Existing tests
 accept ACK/DATA reordering and still validate authentication and payloads.
 

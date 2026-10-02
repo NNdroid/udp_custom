@@ -1,0 +1,43 @@
+goos: linux
+goarch: amd64
+pkg: github.com/NNdroid/udp_custom/tunnel
+cpu: Intel(R) Celeron(R) CPU  J1900  @ 1.99GHz
+                     │ benchmark-base-final.txt │      benchmark-head-final.txt      │
+                     │          sec/op          │   sec/op     vs base               │
+FECSenderCleanPath-4              2245.00n ± 1%   63.41n ± 3%  -97.18% (p=0.001 n=7)
+TCPTarget_PSK-4                     20.23m ± 6%   14.23m ± 2%  -29.65% (p=0.001 n=7)
+TCPTarget_Noise-4                   20.54m ± 3%   14.32m ± 3%  -30.27% (p=0.001 n=7)
+UDPTarget_PSK-4                     2.850m ± 2%   2.323m ± 7%  -18.48% (p=0.001 n=7)
+UDPTarget_Noise-4                   2.854m ± 2%   2.282m ± 2%  -20.04% (p=0.001 n=7)
+geomean                             1.500m        585.1µ       -60.99%
+
+                     │ benchmark-base-final.txt │        benchmark-head-final.txt         │
+                     │           B/s            │      B/s        vs base                 │
+FECSenderCleanPath-4               552.3Mi ± 1%   19551.8Mi ± 3%  +3439.75% (p=0.001 n=7)
+TCPTarget_PSK-4                    6.180Mi ± 6%     8.783Mi ± 2%    +42.13% (p=0.001 n=7)
+TCPTarget_Noise-4                  6.084Mi ± 3%     8.726Mi ± 3%    +43.42% (p=0.001 n=7)
+UDPTarget_PSK-4                    5.484Mi ± 2%     6.723Mi ± 7%    +22.61% (p=0.001 n=7)
+UDPTarget_Noise-4                  5.474Mi ± 2%     6.847Mi ± 2%    +25.09% (p=0.001 n=7)
+geomean                            14.42Mi          36.96Mi        +156.33%
+
+                     │ benchmark-base-final.txt │         benchmark-head-final.txt          │
+                     │           B/op           │     B/op       vs base                    │
+FECSenderCleanPath-4               1.452Ki ± 0%    0.000Ki ± 0%  -100.00% (p=0.001 n=7)
+TCPTarget_PSK-4                   1020.1Ki ± 0%   1008.1Ki ± 0%    -1.18% (p=0.001 n=7)
+TCPTarget_Noise-4                 1020.4Ki ± 0%   1007.7Ki ± 0%    -1.24% (p=0.001 n=7)
+UDPTarget_PSK-4                    125.5Ki ± 0%    126.0Ki ± 0%    +0.34% (p=0.001 n=7)
+UDPTarget_Noise-4                  125.5Ki ± 0%    125.9Ki ± 0%    +0.32% (p=0.001 n=7)
+geomean                            119.0Ki                       ?                      ¹ ²
+¹ summaries must be >0 to compute geomean
+² ratios must be >0 to compute geomean
+
+                     │ benchmark-base-final.txt │        benchmark-head-final.txt         │
+                     │        allocs/op         │  allocs/op   vs base                    │
+FECSenderCleanPath-4                 1.000 ± 0%    0.000 ± 0%  -100.00% (p=0.001 n=7)
+TCPTarget_PSK-4                     6.581k ± 0%   5.881k ± 0%   -10.64% (p=0.001 n=7)
+TCPTarget_Noise-4                   6.591k ± 0%   5.886k ± 0%   -10.70% (p=0.001 n=7)
+UDPTarget_PSK-4                      801.0 ± 0%    775.0 ± 0%    -3.25% (p=0.001 n=7)
+UDPTarget_Noise-4                    801.0 ± 0%    775.0 ± 0%    -3.25% (p=0.001 n=7)
+geomean                              488.5                     ?                      ¹ ²
+¹ summaries must be >0 to compute geomean
+² ratios must be >0 to compute geomean

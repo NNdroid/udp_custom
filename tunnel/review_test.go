@@ -132,6 +132,7 @@ func TestNoiseSameIPControlAllowsPortRebinding(t *testing.T) {
 	rig := newTestRig(t, true)
 	rebound := netip.AddrPortFrom(rig.clientAddr.Addr(), rig.clientAddr.Port()+1)
 	rig.sess.unacked[1] = &unackedPkt{firstSent: time.Now(), sentTime: time.Now()}
+	rig.sess.sendSeq.Store(2) // seq 1 represents a frame that was actually sent
 
 	ack := rig.makeWireFrame(&UDPCFrame{Cmd: CMD_ACK, PacketNo: 1, Ack: 1})
 	rig.sess.processIncomingFrame(ack, rebound, 45679)

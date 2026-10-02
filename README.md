@@ -4,7 +4,7 @@ High-Performance Custom UDP Stream Tunnel Server & Client with Authenticated Con
 
 ## Features
 
-- **Reliable UDP Stream Transmission**: ARQ with adaptive RTO (RFC 6298 + Karn's rule), cumulative ACKs, out-of-order buffering, a bounded send window (`send_window`) for backpressure, and 64-bit sequence numbers.
+- **Reliable UDP Stream Transmission**: ARQ with adaptive RTO, negotiated selective ACK and fast repair, ordered bounded delivery queues, adaptive send windows and RTT-based pacing. Older peers retain cumulative ACKs and a fixed window.
 - **Authenticated Protocol v2 Records**: every DATA, ACK, PING, PONG, FIN, PATH_CHALLENGE, and PATH_RESPONSE carries a 64-bit per-direction `PacketNo` plus a fixed 16-byte authentication tag. A 2048-packet sliding window rejects duplicates and too-old packets before they can mutate session state.
 - **Hardened Handshake**: direction-separated PSK MAC keys protect both SYN and ACK; the ACK echoes `ClientNonce` and adds `ServerNonce`. Session keys bind both nonces and `SessionID`. A ±300s timestamp window, per-source-IP SYN rate limiting, target-dial concurrency cap, and PSK-isolated idempotency cache limit replay and resource exhaustion.
 - **Dual Target Forwarding**: Proxies to both TCP (`tcp://host:port`) and UDP (`udp://host:port`) services.
@@ -196,7 +196,8 @@ Keep `"mode": "client"` in the config.
 | `origdst` | `bool` | `true` | **Required (Linux).** Enables `IP_RECVORIGDSTADDR` so the server recovers each client packet's original destination port (pre-DNAT) and replies FROM that exact port. Without it every reply leaves from `listen` and any NAT stricter than full-cone drops it. Ignored on non-Linux platforms. |
 | `receive_sockets` | `int` | `1` | **Linux only.** Opens N UDP sockets sharing `listen` via `SO_REUSEPORT`, one read goroutine each — scales packet intake across cores. The kernel hashes the 4-tuple, so one client source socket always lands on the same receiver (per-session ordering preserved) while different clients spread across the group. 0/1 = single socket; non-Linux platforms clamp to 1 with a warning; hard cap 8. |
 | `sendsock_max` | `int` | `512` | Per-port reply-socket pool cap (LRU). One socket is bound per distinct origdst port so the kernel stamps the reply's source port correctly. Set it >= the size of `port_range`. |
-| `send_window` | `int` | `256` | Max DATA frames in flight awaiting an ACK. When the window is full the target read loop blocks (backpressure), bounding memory and the retransmit backlog for a slow or silent client. |
+| `send_window` | `int` | `0` (automatic) | With negotiated recovery, starts at 64 frames and grows up to 512; loss reduces the congestion window and peer receive credit limits admission. A positive value caps the adaptive window (at most 512). Older peers or `recovery:false` use the configured fixed window, default 256. |
+| `recovery` | `bool` | `true` | Enables authenticated negotiation of SACK, receive-credit feedback, adaptive windows and pacing. Set false on either end to retain the legacy cumulative-ACK behavior. Does not disable FEC or ordered delivery. |
 | `max_pkt` | `int` | `1450` | Largest v2 record this end puts on the wire (40-byte header + payload + 16-byte tag), i.e. the UDP payload size. See [Frame size](#frame-size-max_pkt). |
 
 ---

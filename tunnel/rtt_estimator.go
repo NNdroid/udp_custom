@@ -80,3 +80,13 @@ func absDuration(d time.Duration) time.Duration {
 	}
 	return d
 }
+
+// SRTT is zero until a real, non-retransmitted sample arrives.
+func (e *rttEstimator) SRTT() time.Duration {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.hasData {
+		return 0
+	}
+	return e.srtt
+}

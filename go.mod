@@ -10,6 +10,7 @@ require (
 
 require (
 	github.com/klauspost/reedsolomon v1.14.2
+	golang.org/x/net v0.56.0
 	golang.org/x/sys v0.46.0
 )
 

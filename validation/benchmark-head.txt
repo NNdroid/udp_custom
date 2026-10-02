@@ -1,0 +1,41 @@
+goos: linux
+goarch: amd64
+pkg: github.com/NNdroid/udp_custom/tunnel
+cpu: Intel(R) Celeron(R) CPU  J1900  @ 1.99GHz
+BenchmarkFECSenderCleanPath-4   	18938577	        62.00 ns/op	20969.15 MB/s	       0 B/op	       0 allocs/op
+BenchmarkFECSenderCleanPath-4   	19003130	        63.48 ns/op	20479.37 MB/s	       0 B/op	       0 allocs/op
+BenchmarkFECSenderCleanPath-4   	18734229	        61.50 ns/op	21139.89 MB/s	       0 B/op	       0 allocs/op
+BenchmarkFECSenderCleanPath-4   	17892909	        65.20 ns/op	19937.19 MB/s	       0 B/op	       0 allocs/op
+BenchmarkFECSenderCleanPath-4   	18796563	        63.39 ns/op	20508.78 MB/s	       0 B/op	       0 allocs/op
+BenchmarkFECSenderCleanPath-4   	18645896	        63.41 ns/op	20501.51 MB/s	       0 B/op	       0 allocs/op
+BenchmarkFECSenderCleanPath-4   	19324495	        63.44 ns/op	20490.31 MB/s	       0 B/op	       0 allocs/op
+BenchmarkTCPTarget_PSK-4        	      73	  13901158 ns/op	   9.43 MB/s	 1033094 B/op	    5883 allocs/op
+BenchmarkTCPTarget_PSK-4        	      73	  14233770 ns/op	   9.21 MB/s	 1032272 B/op	    5886 allocs/op
+BenchmarkTCPTarget_PSK-4        	      72	  14427436 ns/op	   9.08 MB/s	 1032665 B/op	    5893 allocs/op
+BenchmarkTCPTarget_PSK-4        	      84	  14297871 ns/op	   9.17 MB/s	 1031250 B/op	    5857 allocs/op
+BenchmarkTCPTarget_PSK-4        	      88	  14177748 ns/op	   9.24 MB/s	 1032250 B/op	    5881 allocs/op
+BenchmarkTCPTarget_PSK-4        	      86	  14142049 ns/op	   9.27 MB/s	 1031450 B/op	    5864 allocs/op
+BenchmarkTCPTarget_PSK-4        	      90	  14556403 ns/op	   9.00 MB/s	 1030523 B/op	    5858 allocs/op
+BenchmarkTCPTarget_Noise-4      	      91	  14019140 ns/op	   9.35 MB/s	 1030698 B/op	    5874 allocs/op
+BenchmarkTCPTarget_Noise-4      	      82	  14789253 ns/op	   8.86 MB/s	 1031855 B/op	    5886 allocs/op
+BenchmarkTCPTarget_Noise-4      	      86	  14229739 ns/op	   9.21 MB/s	 1031549 B/op	    5888 allocs/op
+BenchmarkTCPTarget_Noise-4      	      78	  14324775 ns/op	   9.15 MB/s	 1031864 B/op	    5892 allocs/op
+BenchmarkTCPTarget_Noise-4      	      82	  14423559 ns/op	   9.09 MB/s	 1032064 B/op	    5883 allocs/op
+BenchmarkTCPTarget_Noise-4      	      82	  14584621 ns/op	   8.99 MB/s	 1031587 B/op	    5863 allocs/op
+BenchmarkTCPTarget_Noise-4      	      85	  14187888 ns/op	   9.24 MB/s	 1032232 B/op	    5890 allocs/op
+BenchmarkUDPTarget_PSK-4        	     532	   2244136 ns/op	   7.30 MB/s	  128956 B/op	     774 allocs/op
+BenchmarkUDPTarget_PSK-4        	     507	   2293887 ns/op	   7.14 MB/s	  128940 B/op	     775 allocs/op
+BenchmarkUDPTarget_PSK-4        	     526	   2325888 ns/op	   7.04 MB/s	  128998 B/op	     774 allocs/op
+BenchmarkUDPTarget_PSK-4        	     506	   2323494 ns/op	   7.05 MB/s	  128991 B/op	     776 allocs/op
+BenchmarkUDPTarget_PSK-4        	     523	   2281687 ns/op	   7.18 MB/s	  128935 B/op	     775 allocs/op
+BenchmarkUDPTarget_PSK-4        	     501	   2493957 ns/op	   6.57 MB/s	  129040 B/op	     775 allocs/op
+BenchmarkUDPTarget_PSK-4        	     474	   2411650 ns/op	   6.79 MB/s	  129084 B/op	     777 allocs/op
+BenchmarkUDPTarget_Noise-4      	     528	   2277068 ns/op	   7.20 MB/s	  128958 B/op	     775 allocs/op
+BenchmarkUDPTarget_Noise-4      	     519	   2281817 ns/op	   7.18 MB/s	  128876 B/op	     774 allocs/op
+BenchmarkUDPTarget_Noise-4      	     511	   2283200 ns/op	   7.18 MB/s	  128951 B/op	     775 allocs/op
+BenchmarkUDPTarget_Noise-4      	     532	   2267027 ns/op	   7.23 MB/s	  128970 B/op	     774 allocs/op
+BenchmarkUDPTarget_Noise-4      	     530	   2279149 ns/op	   7.19 MB/s	  128991 B/op	     774 allocs/op
+BenchmarkUDPTarget_Noise-4      	     522	   2299012 ns/op	   7.13 MB/s	  128978 B/op	     776 allocs/op
+BenchmarkUDPTarget_Noise-4      	     481	   2320436 ns/op	   7.06 MB/s	  129078 B/op	     775 allocs/op
+PASS
+ok  	github.com/NNdroid/udp_custom/tunnel	50.119s

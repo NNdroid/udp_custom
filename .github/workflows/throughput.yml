@@ -1,0 +1,139 @@
+name: Throughput
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      benchtime:
+        description: Per-benchmark sample duration
+        required: false
+        default: 2s
+      count:
+        description: Number of benchmark samples
+        required: false
+        default: '7'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: throughput-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    name: Throughput baseline vs head
+    runs-on: ubuntu-latest
+    env:
+      BENCHTIME: ${{ inputs.benchtime || '2s' }}
+      BENCHCOUNT: ${{ inputs.count || '7' }}
+      THROUGHPUT_RE: 'Benchmark(TCP|UDP)Target_'
+      HOTPATH_RE: 'Benchmark(Frame|Noise|ReplayFilter|PortSelector|SendSockPool|FECSenderCleanPath)'
+
+    steps:
+      - name: Check out head
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+
+      - name: Resolve comparison base
+        id: base
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            base_sha='${{ github.event.pull_request.base.sha }}'
+          else
+            git fetch origin main --depth=1
+            base_sha="$(git rev-parse origin/main)"
+          fi
+          echo "sha=$base_sha" >> "$GITHUB_OUTPUT"
+          echo "Comparing base $base_sha with head $GITHUB_SHA"
+
+      - name: Create base worktree
+        shell: bash
+        run: |
+          set -euo pipefail
+          git worktree add /tmp/udp-custom-base '${{ steps.base.outputs.sha }}'
+
+      - name: Warm Go build cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -run '^$' ./tunnel/...
+          (cd /tmp/udp-custom-base && go test -run '^$' ./tunnel/...)
+
+      - name: Verify delivery and recovery under concurrency and loss
+        run: go test -race -count=10 -run 'OrderedDelivery|DelayedACK|SACK|Stalled|PipelineRecovers|RecoveryNegotiation|SendBatch|ConcurrentServerStart|ServerReceiveSocketsGroup' -timeout 10m ./tunnel/
+
+      - name: Benchmark base throughput
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/udp-custom-base
+          go test -run '^$' -bench "$THROUGHPUT_RE" -benchmem -benchtime="$BENCHTIME" -count="$BENCHCOUNT" -timeout 30m ./tunnel/ | tee "$GITHUB_WORKSPACE/benchmark-base.txt"
+
+      - name: Benchmark head throughput
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -run '^$' -bench "$THROUGHPUT_RE" -benchmem -benchtime="$BENCHTIME" -count="$BENCHCOUNT" -timeout 30m ./tunnel/ | tee benchmark-head.txt
+
+      - name: Benchmark head hot paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -run '^$' -bench "$HOTPATH_RE" -benchmem -benchtime="$BENCHTIME" -count="$BENCHCOUNT" -timeout 30m ./tunnel/ | tee benchmark-hotpath.txt
+
+      - name: Generate CPU and memory profiles for head
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -run '^$' -bench "$THROUGHPUT_RE" -benchmem -benchtime=5s -count=1 \
+            -cpuprofile cpu-throughput.prof -memprofile mem-throughput.prof -timeout 30m ./tunnel/ \
+            | tee benchmark-profile.txt
+
+      - name: Compare with benchstat
+        shell: bash
+        run: |
+          set -euo pipefail
+          go run golang.org/x/perf/cmd/benchstat@latest benchmark-base.txt benchmark-head.txt | tee benchstat.txt
+
+      - name: Publish summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## udp_custom throughput benchmark'
+            echo
+            echo '- End-to-end target/protocol throughput plus hot-path microbenchmarks'
+            echo "- Samples: ${BENCHCOUNT}, benchtime: ${BENCHTIME}"
+            echo '- Metrics include throughput, ns/op, B/op and allocs/op.'
+            echo
+            echo '```text'
+            if [[ -f benchstat.txt ]]; then cat benchstat.txt; else echo 'benchstat output unavailable'; fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: udp-throughput-${{ github.sha }}
+          path: |
+            benchmark-base.txt
+            benchmark-head.txt
+            benchmark-hotpath.txt
+            benchmark-profile.txt
+            benchstat.txt
+            cpu-throughput.prof
+            mem-throughput.prof
+          if-no-files-found: ignore
+          retention-days: 30

@@ -35,6 +35,13 @@ curl -fsSL https://raw.githubusercontent.com/NNdroid/udp_custom/master/scripts/i
 ```
 
 ### 3. Pin a Release Version (Optional)
+
+To publish without calculating a tag, open GitHub **Actions → Release → Run
+workflow**, select the branch and leave **publish_release** checked (the default).
+After tests and builds pass, the workflow creates the Git-derived version tag
+and publishes the binaries. Uncheck it for an artifact-only build. The run
+summary shows the version and exact commit; manual runs also retain artifacts.
+
 Leave `APP_VERSION` unset to install the latest release. To install a specific
 raw-binary release, supply its tag
 (`v1.0.yyyyMMdd.<commit-count>-<7-character-git-hash>`):

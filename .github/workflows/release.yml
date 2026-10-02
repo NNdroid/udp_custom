@@ -1,15 +1,22 @@
 name: Release
 
-# Pushing a tag v1.0.* creates a GitHub Release. The release version string is
-# derived from git metadata (scripts/version.sh):
-#   v1.0.yyyyMMdd.<commit-count>-<short-sha>
-# so the same rule is used for local builds and CI. A manual run creates no
-# Release; it uploads one Actions artifact instead.
+# Tag pushes publish a release. Manual runs generate the version automatically;
+# publish_release controls whether to publish or only upload build artifacts.
 on:
   push:
     tags:
       - 'v1.0.*'
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: 'Automatically create the version tag and publish a GitHub Release'
+        type: boolean
+        required: true
+        default: true
+
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -30,29 +37,49 @@ jobs:
       - name: Determine and validate version
         id: version
         shell: bash
+        env:
+          PUBLISH_RELEASE: ${{ inputs.publish_release }}
         run: |
           set -euo pipefail
-          # Auto-generate the version from git metadata (same rule as local builds).
-          derived="$(bash "${GITHUB_WORKSPACE}/scripts/version.sh")"
+          target_sha="$(git rev-parse HEAD)"
+          short_sha="${target_sha:0:7}"
+          commit_count="$(git rev-list --count HEAD)"
+          derived="v1.0.$(date -u +%Y%m%d).${commit_count}-${short_sha}"
 
           if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
-            # The pushed tag IS the release version; it must follow the rule
-            # (v1.0.yyyyMMdd.<commit-count>-<7-char-sha>), i.e. what
-            # "git tag $(scripts/version.sh)" produces.
-            tag="${GITHUB_REF_NAME}"
-            if ! [[ "${tag}" =~ ^v1\.0\.[0-9]{8}\.[0-9]+-[0-9a-f]{7}$ ]]; then
-              echo "Tag must be v1.0.yyyyMMdd.<commit-count>-<7-char-sha>." >&2
-              echo "Create it with:  git tag \$(scripts/version.sh) && git push --tags" >&2
+            version="${GITHUB_REF_NAME}"
+            if ! [[ "${version}" =~ ^v1\.0\.[0-9]{8}\.${commit_count}-${short_sha}$ ]]; then
+              echo "The pushed tag must contain this commit's count (${commit_count}) and hash (${short_sha})." >&2
+              echo "Use Actions > Release > Run workflow with publish_release enabled to generate the tag automatically." >&2
               exit 1
             fi
-            version="${tag}"
+            publish=true
           else
-            # Manual dispatch: use the git-derived version (no release is created).
             version="${derived}"
+            publish="${PUBLISH_RELEASE:-false}"
           fi
 
-          echo "version=${version}" >> "${GITHUB_OUTPUT}"
-          echo "Building ${version}"
+          # Re-runs may update the same release, but must never reuse a tag
+          # belonging to another commit.
+          if [ "${publish}" = "true" ] && git show-ref --verify --quiet "refs/tags/${version}"; then
+            tagged_sha="$(git rev-parse "refs/tags/${version}^{commit}")"
+            if [ "${tagged_sha}" != "${target_sha}" ]; then
+              echo "Tag ${version} already belongs to another commit; refusing to overwrite it." >&2
+              exit 1
+            fi
+          fi
+
+          {
+            echo "version=${version}"
+            echo "target_sha=${target_sha}"
+            echo "publish=${publish}"
+          } >> "${GITHUB_OUTPUT}"
+          {
+            echo "Version: ${version}"
+            echo "Commit: ${target_sha}"
+            echo "Publish Release: ${publish}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+          echo "Building ${version} (publish=${publish})"
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -110,9 +137,12 @@ jobs:
           if-no-files-found: error
 
       - name: Create GitHub Release
-        if: github.event_name == 'push'
+        if: steps.version.outputs.publish == 'true'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.version.outputs.version }}
+          target_commitish: ${{ steps.version.outputs.target_sha }}
           name: ${{ env.APP_NAME }} ${{ steps.version.outputs.version }}
           files: dist/*
+          fail_on_unmatched_files: true
           generate_release_notes: true

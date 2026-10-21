@@ -133,6 +133,115 @@ func TestAPI_EmbeddedTunnelEndToEnd(t *testing.T) {
 	_ = closed
 }
 
+// TestAPI_OversizedWriteIsChunkedEndToEnd proves a library caller writing far
+// more than one record gets every byte back through the tunnel instead of a
+// torn session. Before this landed the client pump failed the first over-cap
+// write and closed the session, and the server split a large backend read with
+// a stride loop that could lose bytes if the frame cap shrank mid-call.
+func TestAPI_OversizedWriteIsChunkedEndToEnd(t *testing.T) {
+	const payloadSize = 32 << 10
+	pinProbe := false
+	for _, probe := range []*bool{nil, &pinProbe} {
+		name := "probing"
+		if probe != nil {
+			name = "pinned cap"
+		}
+		probe := probe
+		t.Run(name, func(t *testing.T) {
+			srv, err := NewServerWithDialer(ServerConfig{
+				ListenAddr: "127.0.0.1:0",
+				TargetAddr: "tcp://in-process.echo:1234",
+				Passwords:  []string{"chunk-psk"},
+				Logger:     Nop,
+			}, func(ctx context.Context, sessionID uint32, network, address string) (net.Conn, error) {
+				// Reads and writes go to opposite ends of a net.Pipe, so copying
+				// one end onto itself echoes what the tunnel sent.
+				serverSide, clientSide := net.Pipe()
+				go func() { defer serverSide.Close(); io.Copy(serverSide, serverSide) }()
+				return clientSide, nil
+			})
+			if err != nil {
+				t.Fatalf("NewServerWithDialer: %v", err)
+			}
+			defer srv.Close()
+			go srv.Start()
+
+			cli, err := NewClient(ClientConfig{
+				ServerAddr: srv.conn.LocalAddr().String(),
+				Passwords:  []string{"chunk-psk"},
+				MtuProbe:   probe,
+				Logger:     Nop,
+			})
+			if err != nil {
+				t.Fatalf("NewClient: %v", err)
+			}
+			defer cli.Close()
+
+			conn, err := cli.DialTunnel(context.Background(), DialOptions{})
+			if err != nil {
+				t.Fatalf("DialTunnel: %v", err)
+			}
+			defer conn.Close()
+
+			msg := make([]byte, payloadSize)
+			for i := range msg {
+				msg[i] = byte(i*7 + len(msg))
+			}
+			conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			if _, err := conn.Write(msg); err != nil {
+				t.Fatalf("write of %d bytes failed: %v", len(msg), err)
+			}
+
+			out := make([]byte, payloadSize)
+			conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			if _, err := io.ReadFull(conn, out); err != nil {
+				t.Fatalf("read of %d bytes back failed: %v", len(out), err)
+			}
+			if !bytes.Equal(msg, out) {
+				for i := range msg {
+					if msg[i] != out[i] {
+						t.Fatalf("byte %d of %d differs: got %d want %d", i, len(msg), out[i], msg[i])
+					}
+				}
+			}
+
+			// The session must still be alive: the oversized write was chunked,
+			// not fatal.
+			if _, err := conn.Write([]byte("alive")); err != nil {
+				t.Fatalf("post-transfer write failed: %v", err)
+			}
+			tail := make([]byte, 5)
+			conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			if _, err := io.ReadFull(conn, tail); err != nil {
+				t.Fatalf("post-transfer read failed: %v", err)
+			}
+			if string(tail) != "alive" {
+				t.Fatalf("post-transfer echo = %q", tail)
+			}
+
+			// Now drive the coalesce window: many tiny writes reach the pump
+			// faster than uplinkCoalesceWindow, so they must merge into fewer
+			// records without losing, splitting or reordering a byte.
+			var small []byte
+			for i := 0; i < 8; i++ {
+				if _, err := conn.Write([]byte("xy")); err != nil {
+					t.Fatalf("small write %d failed: %v", i, err)
+				}
+				small = append(small, 'x', 'y')
+				time.Sleep(100 * time.Microsecond)
+			}
+			smallOut := make([]byte, len(small))
+			conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			if _, err := io.ReadFull(conn, smallOut); err != nil {
+				t.Fatalf("reading the small writes back failed: %v", err)
+			}
+			if !bytes.Equal(small, smallOut) {
+				t.Fatalf("small-write echo mismatch: got %q want %q", smallOut, small)
+			}
+		})
+	}
+}
+
 // TestAPI_PerSessionTargetThroughDialTunnel proves an embedder can point each
 // tunnel at its own endpoint via DialOptions.Target, gated by allowed_targets.
 func TestAPI_PerSessionTargetThroughDialTunnel(t *testing.T) {

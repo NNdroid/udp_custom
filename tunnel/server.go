@@ -115,11 +115,23 @@ type ServerConfig struct {
 // unacked map and the retransmit backlog for a stalled client.
 const defaultSendWindow = 256
 
-// targetWriteTimeout bounds each delivery run to the backend. Without it a
-// backend that stops reading fills its TCP receive window and blocks writeToTarget
-// indefinitely — freezing the whole receive socket (no ACKs, no PONGs, no new
-// handshakes for any session multiplexed onto it).
-const targetWriteTimeout = 30 * time.Second
+// targetWriteTimeout bounds ONE record's write to the backend. It is refreshed
+// on every delivery, so it measures how long a ~1.4KB write may take before we
+// declare the backend dead rather than how long a run may run.
+//
+// A backend that stops reading fills its TCP receive window and blocks the
+// session's delivery goroutine. While blocked that session emits no ACKs at
+// all, so the peer keeps retransmitting until it gives up and tears the
+// session down — which is exactly what we want, just quickly. Thirty seconds
+// made a single wedged backend hold the session hostage for a half minute per
+// stuck record.
+const targetWriteTimeout = 5 * time.Second
+
+// upstreamReadBuf is the read buffer for stream (TCP) backends. forwardUpstream
+// splits one read into records regardless of size, so reading the frame budget
+// alone costs one read syscall per record. A larger buffer amortizes the reads;
+// the per-record cap is still enforced downstream.
+const upstreamReadBuf = 64 << 10
 
 const (
 	pathChallengeTTL  = 5 * time.Second
@@ -213,15 +225,21 @@ func parseLogLevel(s string) int { return LogLevel(s) }
 // source of truth for path selection and removes any client/server sync.
 
 func (s *Server) logDebug(format string, v ...interface{}) {
-	s.logger.Debugf(format, v...)
+	if s.logger != nil {
+		s.logger.Debugf(format, v...)
+	}
 }
 
 func (s *Server) logInfo(format string, v ...interface{}) {
-	s.logger.Infof(format, v...)
+	if s.logger != nil {
+		s.logger.Infof(format, v...)
+	}
 }
 
 func (s *Server) logWarn(format string, v ...interface{}) {
-	s.logger.Warnf(format, v...)
+	if s.logger != nil {
+		s.logger.Warnf(format, v...)
+	}
 }
 
 // warnWeakPSKs flags short shared secrets without echoing them: the v2
@@ -1181,7 +1199,7 @@ func (s *Server) handleHandshake(remoteAddr netip.AddrPort, frame *UDPCFrame, or
 		unacked:       make(map[uint64]*unackedPkt),
 		lastActive:    time.Now(),
 		closeChan:     make(chan struct{}),
-		rttEst:        newRTTEstimator(200*time.Millisecond, 200*time.Millisecond, 10*time.Second),
+		rttEst:        newDefaultRTTEstimator(),
 		mtuGate:       make(chan struct{}),
 	}
 	sess.unackedCond = sync.NewCond(&sess.unackedMu)
@@ -1529,24 +1547,25 @@ func (sess *ServerSession) handleIncomingFrame(frame *UDPCFrame, remoteAddr neti
 	return true
 }
 
-// applyMtuCommit pins the session's frame budget to the size the client's
-// path probe converged on, releasing the upstream gate. The commit can only
-// shrink the local budget, and only the first one is honored — the client
-// sends a couple of identical copies back to back, so later ones are just
-// duplicates, and the budget is immutable once set.
+// applyMtuCommit pins the session's frame budget to a record size the client
+// has published, releasing the upstream gate. The client commits the
+// never-fragment floor first and the converged size after, and later commits a
+// smaller size if an idle re-probe finds the path has degraded — so both
+// growth and shrink are honored (latest wins), each value clamped to this
+// server's own configured budget. Every value a client commits is either just
+// proven to round-trip or the guaranteed floor, so applying it can never raise
+// the server's budget above what the path carries. Two identical back-to-back
+// copies are a no-op, which is what makes the duplicate sends harmless.
 func (sess *ServerSession) applyMtuCommit(n int) {
 	sess.openMtuGate()
-	if sess.maxPkt.Load() > 0 {
-		return
-	}
 	if n < maxPktFloor {
 		n = maxPktFloor
 	}
 	if n > sess.server.maxPkt {
 		n = sess.server.maxPkt
 	}
-	if n == sess.server.maxPkt {
-		return // equals the configured budget: nothing to record
+	if cur := int(sess.maxPkt.Load()); cur != 0 && cur == n {
+		return // duplicate copy of a commit already applied
 	}
 	sess.maxPkt.Store(int32(n))
 	sess.server.logInfo("[Session 0x%08X] 📏 [mtu] client committed %d-byte records (payload %d, configured %d)",
@@ -1945,19 +1964,34 @@ func writeAll(w io.Writer, data []byte) error {
 	return nil
 }
 
+// sendData ships payload as one or more records, splitting at the session's
+// current cap. A TCP read can return far more than one record, and the cap can
+// shrink mid-call when an idle re-probe commits a smaller size — so the split
+// must be computed per record rather than captured once. Splitting here also
+// keeps forwardUpstream free of a stride loop that could lose bytes if the cap
+// shrank under it.
 func (sess *ServerSession) sendData(payload []byte) error {
+	for len(payload) > 0 {
+		end := min(sess.maxPayload(), len(payload))
+		if err := sess.sendRecord(payload[:end]); err != nil {
+			return err
+		}
+		payload = payload[end:]
+	}
+	return nil
+}
+
+func (sess *ServerSession) sendRecord(payload []byte) error {
 	// Send window: block while too many frames are still un-ACKed. This is the
 	// backpressure that keeps the unacked map (and the retransmit backlog)
 	// bounded when the client is slow or silent — the "sliding window" in its
 	// simplest form: the read loop stops reading the target until ACKs arrive.
 	//
-	// Like the client side: oversized payloads fail fast with an actionable
-	// error instead of an opaque seal failure (the upstreamToUdpLoop reads at
-	// most the frame budget, so this only guards custom dialers).
-	if budget := sess.maxPayload(); len(payload) > budget {
-		return fmt.Errorf("payload of %d bytes exceeds the per-frame budget (%d with max_pkt=%d): chunk writes to %d bytes or smaller",
-			len(payload), budget, sess.server.maxPkt, budget)
-	}
+	// Like the client side, the cap is not re-checked here: sendData sized the
+	// chunk, and a chunk sized by a previously committed cap is still a size
+	// the client already accepted, so it is safe on the wire. The AEAD seal
+	// below enforces the record ceiling and is evaluated before the frame is
+	// recorded, so an oversize can only fail here, never after a partial write.
 	sess.unackedMu.Lock()
 	for len(sess.unacked) >= sess.sendWindow() && atomic.LoadInt32(&sess.closed) == 0 {
 		sess.unackedCond.Wait()
@@ -2024,12 +2058,19 @@ func (sess *ServerSession) sendData(payload []byte) error {
 func (sess *ServerSession) upstreamToUdpLoop() {
 	defer sess.Close()
 	sess.awaitMtuGate()
-	// One byte more than the frame budget: a UDP datagram that fills the
-	// buffer exactly cannot be distinguished from a truncated one, but a
-	// datagram LARGER than the budget reports len(buf) — Read on a connected
-	// UDP socket truncates silently, and forwarding the cut-down bytes would
-	// corrupt the datagram's contents while preserving its boundary.
-	buf := make([]byte, sess.server.maxPayload()+1)
+	// Stream backends read into a large buffer: forwardUpstream splits one read
+	// into records anyway, so a frame-budget-sized buffer costs one read
+	// syscall per record.
+	buf := make([]byte, upstreamReadBuf)
+	if sess.targetNetwork == "udp" {
+		// One byte more than the frame budget: a UDP datagram that fills the
+		// buffer exactly cannot be distinguished from a truncated one, but a
+		// datagram LARGER than the budget reports len(buf) — Read on a
+		// connected UDP socket truncates silently, and forwarding the cut-down
+		// bytes would corrupt the datagram's contents while preserving its
+		// boundary. UDP keeps the small buffer so this stays true.
+		buf = make([]byte, sess.server.maxPayload()+1)
+	}
 	for {
 		if atomic.LoadInt32(&sess.closed) == 1 {
 			return
@@ -2098,30 +2139,19 @@ func (sess *ServerSession) maxPayload() int {
 	return budget
 }
 
-// forwardUpstream ships one target read into the tunnel under the session's
-// frame budget. A TCP target is a byte stream, so an oversized read is simply
-// split across records; a UDP datagram cannot be split without breaking its
-// end-to-end boundary, so an oversized one is dropped with a warning — on a
-// path that narrow it could not have been delivered intact anyway.
+// forwardUpstream ships one target read into the tunnel. sendData splits a
+// stream read across as many records as it needs, so there is no stride loop
+// here to lose bytes if the cap shrinks mid-call. A UDP datagram cannot be
+// split without breaking its end-to-end boundary, so an oversized one is
+// dropped with a warning — on a path that narrow it could not have been
+// delivered intact anyway.
 func (sess *ServerSession) forwardUpstream(chunk []byte) {
-	if len(chunk) <= sess.maxPayload() {
-		_ = sess.sendData(chunk)
-		return
-	}
-	if sess.targetNetwork != "tcp" {
+	if sess.targetNetwork != "tcp" && len(chunk) > sess.maxPayload() {
 		sess.server.logWarn("[Session 0x%08X] 🗑️ dropping %d-byte target datagram: exceeds the %d-byte frame budget (narrow path)",
 			sess.sessionID, len(chunk), sess.maxPayload())
 		return
 	}
-	for off := 0; off < len(chunk); off += sess.maxPayload() {
-		end := off + sess.maxPayload()
-		if end > len(chunk) {
-			end = len(chunk)
-		}
-		if err := sess.sendData(chunk[off:end]); err != nil {
-			return
-		}
-	}
+	_ = sess.sendData(chunk)
 }
 
 func (sess *ServerSession) retransmitLoop() {
@@ -2137,7 +2167,7 @@ func (sess *ServerSession) retransmitLoop() {
 		}
 		now := time.Now()
 		sess.unackedMu.Lock()
-		due, abandoned := retryDue(sess.unacked, now, 10*time.Second, sess.flow, sess.rttEst.SRTT())
+		due, abandoned, delay, probe := retryDue(sess.unacked, now, rttMaxRTO, sess.flow, sess.rttEst.SRTT())
 		sess.unackedMu.Unlock()
 		if abandoned {
 			sess.Close()
@@ -2150,10 +2180,9 @@ func (sess *ServerSession) retransmitLoop() {
 				sess.sendToSession(wire)
 			}
 		}
-		sess.probeReceiveCredit(now)
-		sess.unackedMu.Lock()
-		delay := nextRetryDelay(sess.unacked, sess.flow, time.Now())
-		sess.unackedMu.Unlock()
+		if probe {
+			sess.sendControl(&UDPCFrame{Magic: sess.server.cfg.Magic, Version: UDPC_VERSION, Cmd: CMD_PING, SessionID: sess.sessionID, Ack: sess.currentAck()}, func(p []byte) error { sess.sendToSession(p); return nil })
+		}
 		timer.Reset(delay)
 	}
 }
@@ -2563,7 +2592,12 @@ func (sess *ServerSession) sendWindow() int {
 	if sess.flow != nil {
 		return sess.flow.window()
 	}
-	return sess.server.sendWindow
+	// A bare-literal Server (sendWindow 0) would otherwise report a zero window,
+	// making `len(unacked) >= 0` true forever and parking sendData on unackedCond.
+	if w := sess.server.sendWindow; w > 0 {
+		return w
+	}
+	return defaultSendWindow
 }
 func (sess *ServerSession) handleSACK(f *UDPCFrame) {
 	if sess.flow == nil {

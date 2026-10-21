@@ -9,15 +9,6 @@ import (
 
 func wireSequence(wire []byte) uint64 { return binary.BigEndian.Uint64(wire[20:28]) }
 
-func needsCreditProbe(flow *sendFlow, outstanding map[uint64]*unackedPkt, now time.Time) bool {
-	interval, need := creditProbeInterval(flow, outstanding)
-	if !need || now.Sub(flow.lastProbe) < interval {
-		return false
-	}
-	flow.lastProbe = now
-	return true
-}
-
 func creditProbeInterval(flow *sendFlow, outstanding map[uint64]*unackedPkt) (time.Duration, bool) {
 	if flow == nil {
 		return 0, false
@@ -38,73 +29,88 @@ func creditProbeInterval(flow *sendFlow, outstanding map[uint64]*unackedPkt) (ti
 	return 100 * time.Millisecond, flow.credit == 0 || sacked
 }
 
-func (s *clientSession) probeReceiveCredit(now time.Time) {
-	s.unackedMu.Lock()
-	probe := needsCreditProbe(s.flow, s.unacked, now)
-	s.unackedMu.Unlock()
-	if probe {
-		s.sendControl(&UDPCFrame{Magic: s.client.magic, Version: UDPC_VERSION, Cmd: CMD_PING, SessionID: s.sid, Ack: s.currentAck()}, s.client.dialer.Send)
-	}
-}
-
-func (s *ServerSession) probeReceiveCredit(now time.Time) {
-	s.unackedMu.Lock()
-	probe := needsCreditProbe(s.flow, s.unacked, now)
-	s.unackedMu.Unlock()
-	if probe {
-		s.sendControl(&UDPCFrame{Magic: s.server.cfg.Magic, Version: UDPC_VERSION, Cmd: CMD_PING, SessionID: s.sessionID, Ack: s.currentAck()}, func(p []byte) error { s.sendToSession(p); return nil })
-	}
-}
-
 func (s *clientSession) initTransmitter() {
-	s.tx = newTransmitQueue(s.closeChan, func(wires [][]byte) { _ = s.client.dialer.sendBatch(wires) }, func(n int) bool {
-		if s.flow == nil {
-			return true
-		}
-		s.unackedMu.Lock()
-		window := s.flow.cwnd
-		s.unackedMu.Unlock()
-		return s.flow.waitBurst(n, window, s.rttEst.SRTT(), s.closeChan)
+	s.tx = newTransmitQueue(s.closeChan, s.client.dialer.sendBatch, func(n int) bool {
+		return s.paceBurst(n)
 	}, func(wires [][]byte) {
-		s.unackedMu.Lock()
-		markTransmitted(s.unacked, wires, time.Now())
-		s.unackedMu.Unlock()
-		notifyRetry(s.retryWake)
-	}, func() int {
-		s.unackedMu.Lock()
-		defer s.unackedMu.Unlock()
-		if s.flow != nil {
-			return s.flow.cwnd
-		}
-		return 16
+		s.markBatchTransmitted(wires)
+	}, s.burstWindow, func(err error) {
+		s.client.logWarn("[Client] [Session 0x%08X] ⚠️ batch send failed: %v (affected frames will be repaired by the retransmit loop)", s.sid, err)
 	})
+}
+
+// paceBurst paces one batch against the effective window. Guarded by
+// unackedMu by the caller's closure only; the lock is held here so cwnd and
+// credit are read consistently.
+func (s *clientSession) paceBurst(n int) bool {
+	if s.flow == nil {
+		return true
+	}
+	s.unackedMu.Lock()
+	window := s.flow.window()
+	s.unackedMu.Unlock()
+	return s.flow.waitBurst(n, window, s.rttEst.SRTT(), s.closeChan)
+}
+
+func (s *clientSession) markBatchTransmitted(wires [][]byte) {
+	s.unackedMu.Lock()
+	markTransmitted(s.unacked, wires, time.Now())
+	s.unackedMu.Unlock()
+	notifyRetry(s.retryWake)
+}
+
+// burstWindow is the effective flight size: the smaller of the congestion
+// window and the receiver's advertised credit.
+func (s *clientSession) burstWindow() int {
+	s.unackedMu.Lock()
+	defer s.unackedMu.Unlock()
+	if s.flow != nil {
+		return s.flow.window()
+	}
+	return 16
 }
 
 func (s *ServerSession) initTransmitter() {
 	s.tx = newTransmitQueue(s.closeChan, s.sendToSessionBatch, func(n int) bool {
-		if s.flow == nil {
-			return true
-		}
-		s.unackedMu.Lock()
-		window := s.flow.cwnd
-		s.unackedMu.Unlock()
-		return s.flow.waitBurst(n, window, s.rttEst.SRTT(), s.closeChan)
+		return s.paceBurst(n)
 	}, func(wires [][]byte) {
-		s.unackedMu.Lock()
-		markTransmitted(s.unacked, wires, time.Now())
-		s.unackedMu.Unlock()
-		notifyRetry(s.retryWake)
-	}, func() int {
-		s.unackedMu.Lock()
-		defer s.unackedMu.Unlock()
-		if s.flow != nil {
-			return s.flow.cwnd
-		}
-		return 16
+		s.markBatchTransmitted(wires)
+	}, s.burstWindow, func(err error) {
+		s.server.logWarn("[Server] [Session 0x%08X] ⚠️ batch send failed: %v (affected frames will be repaired by the retransmit loop)", s.sessionID, err)
 	})
 }
 
-func (s *ServerSession) sendToSessionBatch(wires [][]byte) {
+func (s *ServerSession) paceBurst(n int) bool {
+	if s.flow == nil {
+		return true
+	}
+	s.unackedMu.Lock()
+	window := s.flow.window()
+	s.unackedMu.Unlock()
+	return s.flow.waitBurst(n, window, s.rttEst.SRTT(), s.closeChan)
+}
+
+func (s *ServerSession) markBatchTransmitted(wires [][]byte) {
+	s.unackedMu.Lock()
+	markTransmitted(s.unacked, wires, time.Now())
+	s.unackedMu.Unlock()
+	notifyRetry(s.retryWake)
+}
+
+func (s *ServerSession) burstWindow() int {
+	s.unackedMu.Lock()
+	defer s.unackedMu.Unlock()
+	if s.flow != nil {
+		return s.flow.window()
+	}
+	return 16
+}
+
+// sendToSessionBatch ships one batch. Every branch degrades to per-frame
+// writes, so there is no observable failure to report: the caller marks the
+// frames transmitted either way and the retransmit loop repairs anything the
+// kernel did not accept.
+func (s *ServerSession) sendToSessionBatch(wires [][]byte) error {
 	port := int(atomic.LoadInt32(&s.lastOrigPort))
 	s.pathMu.RLock()
 	addr := s.pathAddrs[port].addr
@@ -113,7 +119,7 @@ func (s *ServerSession) sendToSessionBatch(wires [][]byte) {
 		for _, wire := range wires {
 			s.sendToSession(wire)
 		}
-		return
+		return nil
 	}
 	if port > 0 && port != s.server.bindPort {
 		pc, err := s.server.sockPool.Get(port)
@@ -121,7 +127,7 @@ func (s *ServerSession) sendToSessionBatch(wires [][]byte) {
 			for _, wire := range wires {
 				s.sendToSession(wire)
 			}
-			return
+			return nil
 		}
 		pc.refs.Add(1)
 		dst := make([]netip.AddrPort, len(wires))
@@ -138,7 +144,7 @@ func (s *ServerSession) sendToSessionBatch(wires [][]byte) {
 				s.server.sendViaPort.Add(1)
 			}
 		}
-		return
+		return nil
 	}
 	dst := make([]netip.AddrPort, len(wires))
 	for i := range dst {
@@ -149,6 +155,7 @@ func (s *ServerSession) sendToSessionBatch(wires [][]byte) {
 	for _, wire := range wires[n:] {
 		s.server.replyFromOrigPort(0, addr, wire)
 	}
+	return nil
 }
 
 // sendBatch selects the same n:n tuples as Send and groups frames by source

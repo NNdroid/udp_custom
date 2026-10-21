@@ -37,7 +37,7 @@ func TestSACKRepairsOnlyGapAndRejectsStaleFeedback(t *testing.T) {
 			t.Fatal("accepted unsent cumulative ACK")
 		}
 		time.Sleep(500 * time.Millisecond)
-		due, abandoned := retryDue(out, time.Now(), time.Second, flow, 0)
+		due, abandoned, _, _ := retryDue(out, time.Now(), time.Second, flow, 0)
 		if abandoned || len(due) != 1 || due[0][0] != 1 {
 			t.Fatalf("timeout repairs=%v abandoned=%v", due, abandoned)
 		}
@@ -75,7 +75,7 @@ func TestSACKCoversFullReceiveWindowAndLostCreditUpdate(t *testing.T) {
 		t.Fatal("high window position was not selectively acknowledged")
 	}
 	f.credit = 0
-	if !needsCreditProbe(f, map[uint64]*unackedPkt{}, time.Now()) {
+	if _, probe := creditProbeInterval(f, map[uint64]*unackedPkt{}); !probe {
 		t.Fatal("lost window update strands sender after outstanding queue drains")
 	}
 	frame.PacketNo = 2

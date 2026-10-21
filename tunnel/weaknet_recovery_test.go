@@ -134,11 +134,14 @@ func TestConservativeMtuFallback(t *testing.T) {
 		ceiling int
 		want    int
 	}{
-		{1450, 1200},
-		{1300, 1200},
-		{1200, 1200},
-		{1000, 1000},
+		// No rung answered, including the never-fragment floor, so the
+		// fallback is that floor — never a size the ladder already rejected.
+		{1450, 548},
+		{1300, 548},
+		{1200, 548},
+		{1000, 548},
 		{548, 548},
+		{300, 300},
 	} {
 		t.Run(fmt.Sprintf("ceiling_%d", tc.ceiling), func(t *testing.T) {
 			if got := conservativeMtuFallback(tc.ceiling); got != tc.want {

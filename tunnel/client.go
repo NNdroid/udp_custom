@@ -40,7 +40,16 @@ const (
 	clientKeepAliveInterval    = 15 * time.Second
 	clientRecvTimeout          = 210 * time.Second // > server's 180s weak-network idle cleanup
 	clientMaxRetries           = 15
-	clientRetransmitInterval   = 10 * time.Millisecond
+
+	// uplinkCoalesceWindow bounds how long a partial record waits for more
+	// bytes from the local application before it is sent. Web traffic is made
+	// of tiny TCP segments, and without it each segment becomes its own record
+	// — 40-byte header, 16-byte tag, the FEC length prefix, plus the
+	// application's own IP/UDP stack — so the wire cost is several times the
+	// payload and every one of those records draws a reply record of its own.
+	// 250 microseconds is far below any real RTT, so the added latency is
+	// invisible while bursts of segments merge into one record.
+	uplinkCoalesceWindow = 250 * time.Microsecond
 )
 
 type ClientConfig struct {
@@ -308,7 +317,7 @@ func (c *Client) maxPayload() int { return effectivePayloadCap(c.maxPkt) }
 // maxPayload is the session's frame budget: the MTU probe converged it before
 // the pump started and it never changes for the session's lifetime.
 func (s *clientSession) maxPayload() int {
-	cap := effectivePayloadCap(s.sendCap)
+	cap := effectivePayloadCap(int(s.sendCap.Load()))
 	if s.fecSend != nil {
 		return fecDataPayloadCap(cap)
 	}
@@ -755,7 +764,7 @@ func (c *Client) establish(ctx context.Context, target string, conn net.Conn) (*
 		lastActive: time.Now(),
 		lastSent:   time.Now(),
 		closeChan:  make(chan struct{}),
-		rttEst:     newRTTEstimator(200*time.Millisecond, 200*time.Millisecond, 10*time.Second),
+		rttEst:     newDefaultRTTEstimator(),
 	}
 	sess.unackedCond = sync.NewCond(&sess.unackedMu)
 	if frameKeys.recovery {
@@ -771,15 +780,22 @@ func (c *Client) establish(ctx context.Context, target string, conn net.Conn) (*
 	// (its first AddUint64 returns 1).
 	sess.sendSeq.Store(1)
 	sess.recvSeq.Store(1)
+	// The session starts at the never-fragment floor, not the ceiling: a record
+	// sent above the path's capacity is stranded for good (a retransmission
+	// reuses its exact encoded bytes), so the cap is conservative until the
+	// probe proves otherwise. It only ever rises here.
+	sess.sendCap.Store(int32(mtuStartCap(c.maxPkt, mtuProbeEnabled(c.cfg.MtuProbe))))
 	sess.delivery = newOrderedDelivery(deliveryWindow, sess.closeChan, func(p []byte) error { return writeAll(sess.conn, p) }, func(err error) { sess.closeWithReason("application write failed: " + err.Error()) }, sess.sendACK)
 	sess.retryWake = make(chan struct{}, 1)
 	sess.initTransmitter()
 	c.sessions.Store(sid, sess)
 
-	// Converge the frame budget BEFORE any pump starts: a DATA frame encoded
-	// above the path's capability can never be re-chunked on retransmission,
-	// so the very first large write must already use the probed size.
-	c.convergeFrameBudget(ctx, sess)
+	// Converge the frame budget IN THE BACKGROUND. Walking the ladder serially
+	// here used to hold the first byte of a session for up to
+	// len(ladder)*attempts*timeout (6 seconds) on a cold cache — with the
+	// session pinned at the floor the pumps can start at once and the cap
+	// converges under them.
+	go c.convergeFrameBudget(ctx, sess)
 
 	c.logInfo("[Client] [Session 0x%08X] ✅ Tunnel established", sid)
 	c.events.emit(ClientEvent{Kind: TunnelEstablished, Session: sid, Detail: granted})
@@ -1029,18 +1045,23 @@ type clientSession struct {
 	fecSend *fecSender
 	fecRecv *fecReceiver
 
-	// sendCap is the largest record this session may put on the wire: the MTU
-	// probe converges it right after the handshake and it never changes again
-	// (a retransmission reuses its exact encoded bytes, so the cap cannot be
-	// lowered under an in-flight frame). Zero = the ceiling (bare-literal
-	// sessions in tests).
-	sendCap int
+	// sendCap is the largest record this session may put on the wire. The MTU
+	// probe converges it right after the handshake and an idle re-probe may
+	// later LOWER it when the path degrades (a retransmission reuses its exact
+	// encoded bytes, so a lower cap only ever protects future frames — it is
+	// therefore applied with a shrink-only compare-and-swap and never raised
+	// under traffic). Written on the probe goroutines, read on every send.
+	// Zero = the ceiling (bare-literal sessions in tests).
+	sendCap atomic.Int32
 
 	// probeReply receives the COPY of an MTU probe echo handed over by
 	// dispatch. Written atomically by the probe goroutine (probeOnce) and read
 	// by the receive-loop goroutine (dispatch); safe because the pointer swap
 	// is ordered: Store before send, Load before deliver.
 	probeReply atomic.Pointer[chan []byte]
+	// probeMu serializes probeOnce: the setup probe and the idle re-probe
+	// both publish their reply channel into the shared probeReply slot.
+	probeMu sync.Mutex
 
 	lastActive time.Time
 	lastSent   time.Time
@@ -1062,6 +1083,17 @@ func (s *clientSession) touch() {
 }
 
 func (s *clientSession) isClosed() bool { return atomic.LoadInt32(&s.closed) == 1 }
+
+// lastActivity returns the most recent inbound or outbound traffic timestamp.
+// Used by the idle re-probe to avoid probing an active flow.
+func (s *clientSession) lastActivity() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lastSent.After(s.lastActive) {
+		return s.lastSent
+	}
+	return s.lastActive
+}
 
 // closeWithReason closes the session and records WHY, for TunnelSession.Err().
 // The reason string is human-readable and stable enough for log matching.
@@ -1106,34 +1138,61 @@ func (s *clientSession) close() {
 
 // localToRemote streams the local application's bytes into the tunnel.
 func (s *clientSession) localToRemote() {
-	// A short read deadline keeps a half-closed connection from pinning the
-	// session forever; a timeout is the marker for "no data right now". The
-	// deadline is refreshed at most once per second (see recvLoop).
-	buf := make([]byte, s.maxPayload())
+	// Sized to the CEILING, not the converged cap: the pump starts while the
+	// cap is still at the never-fragment floor (~490 bytes), so sizing by the
+	// cap here would silently cap reads at the floor for the session's whole
+	// life and cost ~65% of the recovered throughput.
+	buf := make([]byte, effectivePayloadCap(UDPC_MAX_PKT))
+	// acc gathers the bytes of several Reads into one record.
+	acc := make([]byte, 0, len(buf))
 	var deadline time.Time
 	for {
 		if s.isClosed() {
 			return
 		}
-		if now := time.Now(); !now.Before(deadline) {
-			deadline = now.Add(time.Second)
-			s.conn.SetReadDeadline(deadline)
+		var wait time.Duration
+		if len(acc) > 0 {
+			// Bytes are already outstanding: wait only as long as it takes for
+			// the segments the application has queued to arrive, never longer.
+			// The coalesce window must not touch `deadline`: it belongs to the
+			// idle branch, and letting the short window overwrite it would leave
+			// the conn on a 250µs deadline while the refresh guard still believed
+			// the 1s idle window was open — an instant-timeout spin that blocks
+			// the application's Write until its own deadline fires.
+			wait = uplinkCoalesceWindow
+		} else {
+			if now := time.Now(); !now.Before(deadline) {
+				// A short deadline keeps a half-closed connection from pinning
+				// the session forever; a timeout marks "no data right now".
+				// Refreshed at most once per second.
+				deadline = now.Add(time.Second)
+			}
+			wait = deadline.Sub(time.Now())
 		}
+		s.conn.SetReadDeadline(time.Now().Add(wait))
 		n, err := s.conn.Read(buf)
 		if n > 0 {
-			if serr := s.sendData(buf[:n]); serr != nil {
-				if !s.isClosed() {
-					s.client.logWarn("[Client] [Session 0x%08X] ❌ send failed: %v", s.sid, serr)
-				}
-				s.closeWithReason("tunnel send failed")
-				return
+			if len(acc)+n > len(buf) {
+				n = len(buf) - len(acc)
 			}
+			acc = append(acc, buf[:n]...)
 			s.mu.Lock()
 			s.lastSent = time.Now()
 			s.mu.Unlock()
+			// A full record is ready: send it now rather than paying the
+			// coalesce window for bytes we would not have merged anyway.
+			if len(acc) >= s.maxPayload() {
+				if !s.flushUplink(&acc) {
+					return
+				}
+			}
+			continue
 		}
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				if !s.flushUplink(&acc) {
+					return
+				}
 				continue
 			}
 			s.closeWithReason("local conn read failed")
@@ -1142,21 +1201,52 @@ func (s *clientSession) localToRemote() {
 	}
 }
 
-// sendData assigns a sequence number, records the frame for retransmission and
-// pushes it out. It blocks while the send window is full (backpressure).
+// flushUplink ships acc as whole records and returns false when the session
+// must die. sendData splits at the current cap, so a buffer larger than the
+// cap is simply more records, not a failure.
+func (s *clientSession) flushUplink(acc *[]byte) bool {
+	payload := *acc
+	if err := s.sendData(payload); err != nil {
+		if !s.isClosed() {
+			s.client.logWarn("[Client] [Session 0x%08X] ❌ send failed: %v", s.sid, err)
+		}
+		s.closeWithReason("tunnel send failed")
+		return false
+	}
+	*acc = payload[:0]
+	return true
+}
+
+// sendData ships payload as one or more records, splitting at the session's
+// current cap. Splitting instead of failing is what keeps an oversized library
+// write from killing a tunnel: the AEAD seal would refuse the record and the
+// pump would then tear the session down over one large write. The cap is
+// re-read per record because an idle re-probe may shrink it mid-call.
 func (s *clientSession) sendData(payload []byte) error {
+	for len(payload) > 0 {
+		end := min(s.maxPayload(), len(payload))
+		if err := s.sendRecord(payload[:end]); err != nil {
+			return err
+		}
+		payload = payload[end:]
+	}
+	return nil
+}
+
+// sendRecord ships exactly one record: it assigns a sequence number, records
+// the frame for retransmission and pushes it out. It blocks while the send
+// window is full (backpressure).
+//
+// It deliberately does not re-check the cap: sendData sized the chunk, and the
+// cap may have shrunk by the time this runs (an idle re-probe). A chunk sized
+// by a previously committed cap is still a size the server already accepted, so
+// it is safe on the wire. Rejecting it here would turn a routine shrink into a
+// torn session. An undersized seal is impossible, and an oversized one cannot
+// happen: sendData never asks for more than maxPayload(), which is itself
+// capped at the record ceiling.
+func (s *clientSession) sendRecord(payload []byte) error {
 	if s.isClosed() {
 		return fmt.Errorf("session closed")
-	}
-	// A payload over the frame budget cannot fit one record: the AEAD seal
-	// would return nil and this method would then fail with an opaque
-	// "failed to seal" AFTER a partial write had already been counted by the
-	// caller. Fail fast with an actionable error instead; the CLI pump never
-	// exceeds the budget (it reads at most the frame budget), but library
-	// users writing arbitrary-sized buffers hit this constantly.
-	if cap := s.maxPayload(); len(payload) > cap {
-		return fmt.Errorf("payload of %d bytes exceeds the per-frame budget (%d with max_pkt=%d): chunk writes to %d bytes or smaller",
-			len(payload), cap, s.client.maxPkt, cap)
 	}
 
 	s.unackedMu.Lock()
@@ -1269,7 +1359,7 @@ func (s *clientSession) retransmitLoop() {
 		}
 		now := time.Now()
 		s.unackedMu.Lock()
-		due, abandoned := retryDue(s.unacked, now, 10*time.Second, s.flow, s.rttEst.SRTT())
+		due, abandoned, delay, probe := retryDue(s.unacked, now, rttMaxRTO, s.flow, s.rttEst.SRTT())
 		s.unackedMu.Unlock()
 		if abandoned {
 			s.closeWithReason("max retransmits exceeded")
@@ -1282,10 +1372,9 @@ func (s *clientSession) retransmitLoop() {
 				_ = s.client.dialer.Send(wire)
 			}
 		}
-		s.probeReceiveCredit(now)
-		s.unackedMu.Lock()
-		delay := nextRetryDelay(s.unacked, s.flow, time.Now())
-		s.unackedMu.Unlock()
+		if probe {
+			s.sendControl(&UDPCFrame{Magic: s.client.magic, Version: UDPC_VERSION, Cmd: CMD_PING, SessionID: s.sid, Ack: s.currentAck()}, s.client.dialer.Send)
+		}
 		timer.Reset(delay)
 		s.mu.Lock()
 		idle := now.Sub(s.lastActive)
@@ -1546,7 +1635,13 @@ func (s *clientSession) sendWindow() int {
 	if s.flow != nil {
 		return s.flow.window()
 	}
-	return s.client.cfg.SendWindow
+	// 0 means "adapt", which only the recovery path implements. On a legacy
+	// session without a flow a 0 window would make `len(unacked) >= 0` true
+	// forever and park sendRecord on unackedCond until the session closes.
+	if w := s.client.cfg.SendWindow; w > 0 {
+		return w
+	}
+	return defaultSendWindow
 }
 func (s *clientSession) handleSACK(f *UDPCFrame) {
 	if s.flow == nil {

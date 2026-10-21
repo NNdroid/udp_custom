@@ -50,7 +50,9 @@ func TestMtuLadderFor(t *testing.T) {
 		ceiling int
 		want    []int
 	}{
-		{UDPC_MAX_PKT, []int{1450, 1200, 1000, 800, 548}},
+		{UDPC_MAX_PKT, []int{1450, 1392, 1200, 1000, 800, 548}},
+		{1420, []int{1420, 1392, 1200, 1000, 800, 548}},
+		{1392, []int{1392, 1200, 1000, 800, 548}},
 		{1200, []int{1200, 1000, 800, 548}},
 		{900, []int{900, 800, 548}},
 		{548, []int{548}},
@@ -189,7 +191,6 @@ func newProberRig(t *testing.T, fake *fakeProbeServer, pk *proberKeyPair) (*Clie
 		client:    cli,
 		sid:       pk.sid,
 		frameKeys: pk.client,
-		sendCap:   cli.maxPkt,
 
 		recvQueue:  make(map[uint64][]byte),
 		unacked:    make(map[uint64]*unackedPkt),
@@ -197,6 +198,7 @@ func newProberRig(t *testing.T, fake *fakeProbeServer, pk *proberKeyPair) (*Clie
 		lastSent:   time.Now(),
 		closeChan:  make(chan struct{}),
 	}
+	sess.sendCap.Store(int32(mtuStartCap(cli.maxPkt, mtuProbeEnabled(cli.cfg.MtuProbe))))
 	sess.unackedCond = sync.NewCond(&sess.unackedMu)
 	cli.sessions.Store(pk.sid, sess)
 	// The prober's echo arrives through the client's receive loops (same path
@@ -272,8 +274,8 @@ func TestConvergeFrameBudgetAppliesCacheAndCommit(t *testing.T) {
 	cli.probeCache.store(800) // warm cache: no probe traffic, straight to the commit
 
 	cli.convergeFrameBudget(context.Background(), sess)
-	if sess.sendCap != 800 {
-		t.Fatalf("session sendCap = %d, want the cached 800", sess.sendCap)
+	if got := int(sess.sendCap.Load()); got != 800 {
+		t.Fatalf("session sendCap = %d, want the cached 800", got)
 	}
 	commits := fake.waitForCommit(800, time.Second)
 	if commits == nil {
@@ -376,5 +378,123 @@ func TestUpstreamSplitsOversizedTcpChunks(t *testing.T) {
 	}
 	if largest != 300 {
 		t.Fatalf("largest record is %d bytes, want exactly the committed 300", largest)
+	}
+}
+
+func TestMtuInitialCap(t *testing.T) {
+	for _, tc := range []struct {
+		maxPkt int
+		want   int
+	}{
+		{1450, 548},
+		{800, 548},
+		{548, 548},
+		{300, 300},
+		{120, 120},
+	} {
+		if got := mtuInitialCap(tc.maxPkt); got != tc.want {
+			t.Errorf("mtuInitialCap(%d) = %d, want %d", tc.maxPkt, got, tc.want)
+		}
+	}
+}
+
+// The floor commit must reach the server BEFORE the ladder has a chance to
+// overrun it: otherwise the server's upstream gate sits on mtuCommitWait and
+// encodes records the path cannot carry, and those frames can never be
+// re-chunked on retransmission.
+func TestConvergeFrameBudgetCommitsFloorFirst(t *testing.T) {
+	withFastProbing(t)
+	pk := newProberKeyPair(t)
+	fake := newFakeProbeServer(t, pk.server)
+	fake.silence.Store(true) // no rung answers at all
+
+	cli, sess := newProberRig(t, fake, pk)
+
+	cli.convergeFrameBudget(context.Background(), sess)
+
+	commits := fake.commitValues()
+	if len(commits) == 0 {
+		t.Fatal("the server received no commit at all")
+	}
+	if commits[0] != mtuProbeFloor {
+		t.Fatalf("first commit = %d, want the never-fragment floor %d", commits[0], mtuProbeFloor)
+	}
+	// Everything the client committed must be a size it is actually willing to
+	// send, and never above the ceiling.
+	for _, v := range commits {
+		if v > UDPC_MAX_PKT || v < mtuInitialCap(UDPC_MAX_PKT) {
+			t.Fatalf("commit %d is outside [%d,%d]", v, mtuInitialCap(UDPC_MAX_PKT), UDPC_MAX_PKT)
+		}
+	}
+	// The probe answered nothing, so the session must end at the fallback floor
+	// rather than the configured ceiling.
+	if got := int(sess.sendCap.Load()); got != weakNetworkMtuFallback {
+		t.Fatalf("session sendCap = %d, want the no-answer fallback %d", got, weakNetworkMtuFallback)
+	}
+}
+
+// applyMtuCommit must honor both growth (floor commit, then the converged
+// value) and shrink (an idle re-probe that found the path degraded). Every
+// applied value stays inside the server's own configured budget.
+func TestServerApplyMtuCommitHonorsGrowAndShrink(t *testing.T) {
+	srv := &Server{maxPkt: 1450}
+	sess := &ServerSession{sessionID: 1, server: srv}
+
+	sess.applyMtuCommit(mtuProbeFloor)
+	if got := int(sess.maxPkt.Load()); got != mtuProbeFloor {
+		t.Fatalf("after floor commit maxPkt = %d, want %d", got, mtuProbeFloor)
+	}
+
+	sess.applyMtuCommit(1450)
+	if got := int(sess.maxPkt.Load()); got != 1450 {
+		t.Fatalf("after grow maxPkt = %d, want 1450", got)
+	}
+
+	sess.applyMtuCommit(1200)
+	if got := int(sess.maxPkt.Load()); got != 1200 {
+		t.Fatalf("after shrink maxPkt = %d, want 1200", got)
+	}
+
+	// Duplicate copies are a no-op, so the extra sends are harmless.
+	sess.applyMtuCommit(1200)
+	if got := int(sess.maxPkt.Load()); got != 1200 {
+		t.Fatalf("after duplicate maxPkt = %d, want 1200", got)
+	}
+
+	// A commit can never push the server past its own configured budget.
+	sess.applyMtuCommit(99999)
+	if got := int(sess.maxPkt.Load()); got != 1450 {
+		t.Fatalf("after over-ceiling commit maxPkt = %d, want 1450", got)
+	}
+
+	// And never below the usable floor.
+	sess.applyMtuCommit(10)
+	if got := int(sess.maxPkt.Load()); got != maxPktFloor {
+		t.Fatalf("after under-floor commit maxPkt = %d, want %d", got, maxPktFloor)
+	}
+}
+
+func TestLowerSendCapIsShrinkOnly(t *testing.T) {
+	sess := &clientSession{}
+	sess.sendCap.Store(1450)
+
+	sess.lowerSendCap(1200)
+	if got := int(sess.sendCap.Load()); got != 1200 {
+		t.Fatalf("after shrink sendCap = %d, want 1200", got)
+	}
+	sess.lowerSendCap(1000)
+	if got := int(sess.sendCap.Load()); got != 1000 {
+		t.Fatalf("after second shrink sendCap = %d, want 1000", got)
+	}
+	// Raises are refused: only the setup path may grow the cap.
+	sess.lowerSendCap(1400)
+	sess.lowerSendCap(9999)
+	if got := int(sess.sendCap.Load()); got != 1000 {
+		t.Fatalf("after refused raise sendCap = %d, want 1000", got)
+	}
+	// Equal is a no-op, not a failure.
+	sess.lowerSendCap(1000)
+	if got := int(sess.sendCap.Load()); got != 1000 {
+		t.Fatalf("after equal sendCap = %d, want 1000", got)
 	}
 }

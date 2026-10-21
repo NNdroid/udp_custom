@@ -10,6 +10,11 @@ import (
 
 const sackPayloadSize = 66 // receive credit (2), up to 512 admission bits (64)
 
+// idleRetryDelay is how long the retransmit loop sleeps when nothing is
+// outstanding. It bounds how long a submission on an empty window waits before
+// being noticed, and it is the ceiling on the loop's idle polling rate.
+const idleRetryDelay = time.Millisecond * 10
+
 // sendFlow is guarded by the session's unackedMu. Outstanding wire buffers
 // remain owned until delivery ACK, including selectively acknowledged frames.
 type sendFlow struct {
@@ -24,12 +29,20 @@ type sendFlow struct {
 	nextSend          time.Time
 }
 
+// initialCwnd is the flight size a fresh session starts with. It used to be 64
+// frames, which capped upload at 64*record/RTT (about 7 Mbps at 100 ms RTT)
+// and took ~450 RTTs to climb to the window cap; TCP opens connections with a
+// much larger window for exactly this reason. Web traffic is bursty, so the
+// window spends most of its life below ssthresh and grows additively anyway,
+// which means the extra in-flight frames cost nothing but room in `unacked`.
+const initialCwnd = 256
+
 func newSendFlow(maximum int, automatic bool) *sendFlow {
 	if automatic {
 		maximum = deliveryWindow
 	}
 	maximum = min(max(maximum, 1), deliveryWindow)
-	return &sendFlow{max: maximum, cwnd: min(64, maximum), credit: deliveryWindow, ssthresh: maximum}
+	return &sendFlow{max: maximum, cwnd: min(initialCwnd, maximum), credit: deliveryWindow, ssthresh: maximum}
 }
 
 func (f *sendFlow) window() int { return min(f.cwnd, f.credit) }
@@ -156,24 +169,6 @@ type retryFrame struct {
 	wire []byte
 }
 
-func nextRetryDelay(outstanding map[uint64]*unackedPkt, flow *sendFlow, now time.Time) time.Duration {
-	delay := time.Second
-	interval, probe := creditProbeInterval(flow, outstanding)
-	for _, p := range outstanding {
-		if p.sacked {
-			continue
-		}
-		if p.queued {
-			continue
-		}
-		delay = min(delay, p.rto-now.Sub(p.sentTime))
-	}
-	if probe {
-		delay = min(delay, interval-now.Sub(flow.lastProbe))
-	}
-	return max(time.Millisecond, delay)
-}
-
 func notifyRetry(ch chan struct{}) {
 	if ch != nil {
 		select {
@@ -183,24 +178,48 @@ func notifyRetry(ch chan struct{}) {
 	}
 }
 
-// retryDue bounds retransmission bursts and sends in sequence order. SACKed
-// frames still reside in the receiver's bounded queue, so need no repair.
-func retryDue(outstanding map[uint64]*unackedPkt, now time.Time, maximumRTO time.Duration, flow *sendFlow, rtt time.Duration) ([][]byte, bool) {
+// retryBurstMax bounds how many frames one wake repairs. It used to be 16,
+// which made a 256-frame stall need ~16 wakes at >=1 ms each before recovery
+// resumed; 64 drains a full window in one or two.
+const retryBurstMax = 64
+
+// retryDue repairs the frames whose RTO expired, and reports how long to wait
+// before the next wake — in ONE pass over the outstanding map. The loop used to
+// do up to four scans plus four lock round trips per wake (retryDue,
+// nextRetryDelay, and two nested creditProbeInterval passes), mostly
+// re-reading a map nothing had changed in. It also returns whether a credit
+// probe is due, so the loop never re-locks to discover that.
+func retryDue(outstanding map[uint64]*unackedPkt, now time.Time, maximumRTO time.Duration, flow *sendFlow, rtt time.Duration) ([][]byte, bool, time.Duration, bool) {
 	// Most wakeups only register a fresh transmission or feedback. Do not
 	// allocate a sorting buffer until a packet actually needs repair.
 	var due []retryFrame
+	next := idleRetryDelay
 	for seq, p := range outstanding {
-		if p.queued || p.sacked || now.Sub(p.sentTime) < p.rto {
+		if p.queued || p.sacked {
+			continue
+		}
+		remaining := p.rto - now.Sub(p.sentTime)
+		if remaining >= 0 {
+			if remaining < next {
+				next = remaining
+			}
 			continue
 		}
 		if p.retries >= clientMaxRetries {
-			return nil, true
+			return nil, true, 0, false
 		}
 		due = append(due, retryFrame{seq, p.wire})
 	}
+	interval, probe := creditProbeInterval(flow, outstanding)
+	if probe {
+		if d := interval - now.Sub(flow.lastProbe); d < next {
+			next = d
+		}
+		flow.lastProbe = now
+	}
 	sort.Slice(due, func(i, j int) bool { return due[i].seq < due[j].seq })
-	if len(due) > 16 {
-		due = due[:16]
+	if len(due) > retryBurstMax {
+		due = due[:retryBurstMax]
 	}
 	wires := make([][]byte, 0, len(due))
 	for _, d := range due {
@@ -208,10 +227,13 @@ func retryDue(outstanding map[uint64]*unackedPkt, now time.Time, maximumRTO time
 		p.retries++
 		p.sentTime = now
 		p.rto = min(p.rto*3/2, maximumRTO)
-		wires = append(wires, d.wire)
+		if p.rto < next { // this frame's own backed-off deadline
+			next = p.rto
+		}
+		wires = append(wires, p.wire)
 	}
 	if len(wires) > 0 && flow != nil {
 		flow.loss(now, rtt)
 	}
-	return wires, false
+	return wires, false, max(time.Millisecond, next), probe && len(outstanding) > 0
 }

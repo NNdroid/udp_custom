@@ -17,9 +17,25 @@ type rttEstimator struct {
 	rttvar  time.Duration // RTT variance
 	rto     time.Duration // current retransmission timeout
 	hasData bool          // whether at least one sample has been taken
-	minRTT  time.Duration // lower clamp (e.g. 200ms)
-	maxRTT  time.Duration // upper clamp (e.g. 10s)
+	minRTT  time.Duration // lower clamp on the computed RTO
+	maxRTT  time.Duration // upper clamp on the computed RTO
 }
+
+// Default estimator bounds, shared by client and server.
+//
+// minRTO is the RFC 6298 floor, not the 200 ms value Linux ships with. The RTO
+// is srtt+4*rttvar, so on a healthy 1 ms LAN the estimator computes about 1 ms
+// and the old 200 ms floor clamped it UP by two orders of magnitude: every lost
+// datagram waited 200 ms before its first repair, and the 1.5x backoff ladder
+// (200/300/450/675/1012/1518 ms) burned all 15 retries in roughly a minute. A
+// 1 ms floor makes that ladder sub-second, which is what lets a dead path fail
+// fast and reconnect instead of limping. maxRTO still caps the worst case, so a
+// genuinely dead link cannot spin the retransmit loop.
+const (
+	rttInitialGuess = 200 * time.Millisecond // RTO before the first sample lands
+	rttMinRTO       = 1 * time.Millisecond   // RFC 6298 floor
+	rttMaxRTO       = 10 * time.Second       // backoff cap; also the give-up point
+)
 
 // newRTTEstimator builds an estimator. `initial` is used before any sample is
 // collected (acts as the first RTO). `minRTT`/`maxRTT` clamp the computed RTO.
@@ -32,6 +48,11 @@ func newRTTEstimator(initial, minRTT, maxRTT time.Duration) *rttEstimator {
 		minRTT:  minRTT,
 		maxRTT:  maxRTT,
 	}
+}
+
+// newDefaultRTTEstimator is the estimator both ends build a session with.
+func newDefaultRTTEstimator() *rttEstimator {
+	return newRTTEstimator(rttInitialGuess, rttMinRTO, rttMaxRTO)
 }
 
 // Sample feeds one RTT measurement (usually now - firstSent of an ACKed packet).

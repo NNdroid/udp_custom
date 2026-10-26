@@ -644,8 +644,11 @@ func (r *fecReceiver) tryRecoverLocked(block *fecRecvBlock) []fecRecovered {
 		seq := block.baseSeq + uint64(idx)
 		payload := append([]byte(nil), shard[fecLengthPrefixSize:fecLengthPrefixSize+n]...)
 		// Cache for a later block that still needs this shard, then hand the same
-		// buffer to the caller. The copy is against the pooled slab, so it is not
-		// aliased with any other reconstruction; the second copy here was pure waste.
+		// buffer to the caller. The copy is not redundant: reedsolomon rebuilds a
+		// missing shard into a freshly aligned allocation (AllocAligned, not the
+		// pooled slab), so a future change to that dependency or to shard reuse
+		// could start aliasing these buffers with a buffer that outlives this
+		// call. Owning the bytes here keeps r.recent and the caller independent.
 		r.recent[seq] = payload
 		out = append(out, fecRecovered{Seq: seq, Payload: payload})
 	}

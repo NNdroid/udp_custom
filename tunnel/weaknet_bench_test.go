@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"bytes"
+	"container/heap"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -122,6 +123,161 @@ func weaknetIsFeedback(cmd uint8) bool {
 	return cmd == CMD_ACK || cmd == CMD_SACK || cmd == CMD_PING || cmd == CMD_PONG || cmd == CMD_FIN
 }
 
+// weaknetScheduled is one datagram waiting on the relay's shared delay queue.
+type weaknetScheduled struct {
+	due       time.Time
+	wire      []byte
+	dest      *net.UDPAddr
+	duplicate bool
+}
+
+type weaknetDelayQueue []*weaknetScheduled
+
+func (h weaknetDelayQueue) Len() int           { return len(h) }
+func (h weaknetDelayQueue) Less(i, j int) bool { return h[i].due.Before(h[j].due) }
+func (h weaknetDelayQueue) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *weaknetDelayQueue) Push(x any)        { *h = append(*h, x.(*weaknetScheduled)) }
+func (h *weaknetDelayQueue) Pop() any {
+	old := *h
+	n := len(old) - 1
+	item := old[n]
+	old[n] = nil
+	*h = old[:n]
+	return item
+}
+
+// weaknetScheduler fires every due write off a few goroutines and a few timers
+// instead of one goroutine and one timer per datagram. At 10% loss a single
+// 128 KiB transfer schedules thousands of both, and that churn lands in the
+// allocs/op the benchmarks exist to measure. Shards keep the write goroutines
+// disjoint, so one write blocked on a full kernel buffer cannot stall the
+// others.
+type weaknetScheduler struct {
+	shards []*weaknetShard
+}
+
+type weaknetShard struct {
+	mu       sync.Mutex
+	queue    weaknetDelayQueue
+	wake     chan struct{}
+	done     <-chan struct{}
+	write    func(*weaknetScheduled)
+	finished chan struct{}
+}
+
+// writeDeadline bounds one relay write. A blocked write would otherwise stall
+// the whole shard, and the benchmark would hang rather than report a number.
+const writeDeadline = 500 * time.Millisecond
+
+func newWeaknetScheduler(done <-chan struct{}, write func(*weaknetScheduled)) *weaknetScheduler {
+	s := &weaknetScheduler{}
+	for i := 0; i < 4; i++ {
+		sh := &weaknetShard{
+			done:     done,
+			write:    write,
+			wake:     make(chan struct{}, 1),
+			finished: make(chan struct{}),
+		}
+		s.shards = append(s.shards, sh)
+		go sh.run()
+	}
+	return s
+}
+
+// schedule adds a datagram; it is written at least at item's due time.
+func (s *weaknetScheduler) schedule(item *weaknetScheduled) {
+	shard := int(absHash64(scheduledHash(item))) % len(s.shards)
+	s.shards[shard].offer(item)
+}
+
+// wait blocks until every shard has drained its queue and exited, so the relay
+// is safe to tear down behind it.
+func (s *weaknetScheduler) wait() {
+	for _, sh := range s.shards {
+		<-sh.finished
+	}
+}
+
+func (sh *weaknetShard) offer(item *weaknetScheduled) {
+	sh.mu.Lock()
+	heap.Push(&sh.queue, item)
+	sh.mu.Unlock()
+	select {
+	case sh.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (sh *weaknetShard) run() {
+	defer close(sh.finished)
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+	for {
+		var due time.Time
+		sh.mu.Lock()
+		if sh.queue.Len() == 0 {
+			sh.mu.Unlock()
+			select {
+			case <-sh.done:
+				return
+			case <-sh.wake:
+			}
+			continue
+		}
+		due = sh.queue[0].due
+		if !due.After(time.Now()) {
+			sh.mu.Unlock()
+			sh.writeDue()
+			continue
+		}
+		sh.mu.Unlock()
+		if timer == nil {
+			timer = time.NewTimer(time.Until(due))
+		} else {
+			timer.Reset(time.Until(due))
+		}
+		select {
+		case <-sh.done:
+			return
+		case <-timer.C:
+		case <-sh.wake:
+			// A new item may be earlier than the armed expiry: re-check.
+		}
+	}
+}
+
+// writeDue drains everything whose delay has elapsed, leaving the queue holding
+// only future work.
+func (sh *weaknetShard) writeDue() {
+	for {
+		sh.mu.Lock()
+		var item *weaknetScheduled
+		if sh.queue.Len() == 0 || sh.queue[0].due.After(time.Now()) {
+			sh.mu.Unlock()
+			return
+		}
+		item = heap.Pop(&sh.queue).(*weaknetScheduled)
+		sh.mu.Unlock()
+		sh.write(item)
+	}
+}
+
+// scheduledHash spreads datagrams across shards. A stable hash keeps a
+// datagram's duplicate copy on the same shard, so the two writes stay adjacent.
+func scheduledHash(item *weaknetScheduled) uint64 {
+	h := uint64(uint32(item.dest.Port))
+	for i, b := range item.wire {
+		h ^= uint64(b) << uint((i*7)%64)
+	}
+	return h
+}
+
+func absHash64(h uint64) uint64 { return h & 0x7fffffffffffffff }
+
 // weaknetRelay stands up an impaired UDP relay in front of server and returns
 // its listen address. The client connects to that address instead of the
 // server's, so all frames traverse the injection.
@@ -146,11 +302,18 @@ func weaknetRelay(tb testing.TB, spec weaknetSpec, server *net.UDPAddr) *weaknet
 	}
 	link := &weaknetLink{addr: conn.LocalAddr().String()}
 	rng := rand.New(rand.NewSource(int64(spec.seed)))
-	var wg sync.WaitGroup
+	var readers sync.WaitGroup
 	done := make(chan struct{})
-	wg.Add(1)
+	scheduler := newWeaknetScheduler(done, func(item *weaknetScheduled) {
+		_ = conn.SetWriteDeadline(time.Now().Add(writeDeadline))
+		_, _ = conn.WriteToUDP(item.wire, item.dest)
+		if item.duplicate {
+			_, _ = conn.WriteToUDP(item.wire, item.dest)
+		}
+	})
+	readers.Add(1)
 	go func() {
-		defer wg.Done()
+		defer readers.Done()
 		var client *net.UDPAddr
 		buf := make([]byte, 4096)
 		for {
@@ -186,27 +349,17 @@ func weaknetRelay(tb testing.TB, spec weaknetSpec, server *net.UDPAddr) *weaknet
 				delay += time.Duration(rng.Int63n(int64(spec.jitter) + 1))
 			}
 			duplicate := lossy && spec.duplicate > 0 && rng.Float64() < spec.duplicate
-			wg.Add(1)
-			go func(wire []byte, dest *net.UDPAddr, delay time.Duration, duplicate bool) {
-				defer wg.Done()
-				timer := time.NewTimer(delay)
-				defer timer.Stop()
-				select {
-				case <-done:
-					return
-				case <-timer.C:
-				}
-				_, _ = conn.WriteToUDP(wire, dest)
-				if duplicate {
-					_, _ = conn.WriteToUDP(wire, dest)
-				}
-			}(wire, dest, delay, duplicate)
+			scheduler.schedule(&weaknetScheduled{due: time.Now().Add(delay), wire: wire, dest: dest, duplicate: duplicate})
 		}
 	}()
 	tb.Cleanup(func() {
 		close(done)
+		// The socket must go away BEFORE waiting for the reader: the reader is
+		// blocked inside ReadFromUDP and nothing else can wake it, so waiting
+		// first is a self-deadlock.
 		_ = conn.Close()
-		wg.Wait()
+		readers.Wait()
+		scheduler.wait()
 	})
 	return link
 }

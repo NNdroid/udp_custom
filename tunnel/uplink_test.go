@@ -11,7 +11,7 @@ import (
 // real frame keys (so the seal succeeds), a capture wire instead of a dialer,
 // and no send flow — which is also the legacy path that must not report a zero
 // send window.
-func newUplinkSession(t *testing.T, maxPkt int, capValue int) (*clientSession, *[][]byte) {
+func newUplinkSession(t *testing.T, maxPkt int, capValue int) (*clientSession, *uplinkCapture) {
 	t.Helper()
 	c := &Client{maxPkt: maxPkt}
 	kp := newProberKeyPair(t)
@@ -29,31 +29,55 @@ func newUplinkSession(t *testing.T, maxPkt int, capValue int) (*clientSession, *
 	s.sendCap.Store(int32(capValue))
 	s.sendSeq.Store(1)
 
-	var mu sync.Mutex
-	got := &[][]byte{}
+	got := &uplinkCapture{}
 	done := make(chan struct{})
-	s.tx = newTransmitQueue(done, func(wires [][]byte) error {
-		mu.Lock()
-		for _, w := range wires {
-			*got = append(*got, append([]byte(nil), w...))
-		}
-		mu.Unlock()
-		return nil
-	}, func(int) bool { return true }, func([][]byte) {}, func() int { return 256 }, nil)
+	s.tx = newTransmitQueue(done, got.record, func(int) bool { return true }, func([][]byte) {}, func() int { return 256 }, nil)
 	t.Cleanup(func() { close(done) })
 	return s, got
 }
 
-func waitForCount(t *testing.T, got *[][]byte, n int) {
+// uplinkCapture is the wire sink newUplinkSession hands the session. The
+// transmit queue appends from its own goroutine while the test reads from the
+// main one, so every read goes through the mutex - a bare read raced the append
+// and made the race detector fail all three tests in this file.
+type uplinkCapture struct {
+	mu    sync.Mutex
+	wires [][]byte
+}
+
+func (c *uplinkCapture) record(wires [][]byte) error {
+	c.mu.Lock()
+	for _, w := range wires {
+		c.wires = append(c.wires, append([]byte(nil), w...))
+	}
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *uplinkCapture) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.wires)
+}
+
+// snapshot returns a copy, so an append landing while the caller iterates cannot
+// shift the slice under it.
+func (c *uplinkCapture) snapshot() [][]byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([][]byte(nil), c.wires...)
+}
+
+func waitForCount(t *testing.T, got *uplinkCapture, n int) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if len(*got) >= n {
+		if got.count() >= n {
 			return
 		}
 		time.Sleep(time.Millisecond)
 	}
-	t.Fatalf("after %d frames only %d were sent", n, len(*got))
+	t.Fatalf("after %d frames only %d were sent", n, got.count())
 }
 
 // An oversized library write must be split into records, not rejected: the AEAD
@@ -69,10 +93,10 @@ func TestSendDataSplitsOversizedPayload(t *testing.T) {
 	}
 	want := 4
 	waitForCount(t, got, want)
-	if len(*got) != want {
-		t.Fatalf("sent %d records for %d bytes at cap %d, want %d", len(*got), len(payload), cap, want)
+	if n := got.count(); n != want {
+		t.Fatalf("sent %d records for %d bytes at cap %d, want %d", n, len(payload), cap, want)
 	}
-	for i, w := range *got {
+	for i, w := range got.snapshot() {
 		if len(w) > cap {
 			t.Fatalf("record %d is %d bytes, exceeds the %d-byte cap", i, len(w), cap)
 		}
@@ -109,7 +133,7 @@ func TestSendDataSurvivesConcurrentCapShrink(t *testing.T) {
 	// transmit queue to drain and assert the ceiling instead of a count.
 	waitForCount(t, got, 2)
 	time.Sleep(20 * time.Millisecond)
-	for i, w := range *got {
+	for i, w := range got.snapshot() {
 		if len(w) > UDPC_MAX_PKT {
 			t.Fatalf("record %d is %d bytes, exceeds the %d-byte ceiling", i, len(w), UDPC_MAX_PKT)
 		}
@@ -147,8 +171,8 @@ func TestFlushUplinkShipsAccumulatorAsOneRecord(t *testing.T) {
 		t.Fatalf("accumulator was not drained: %d bytes left", len(acc))
 	}
 	waitForCount(t, got, 1)
-	if len(*got) != 1 {
-		t.Fatalf("sent %d records for one accumulated buffer, want 1", len(*got))
+	if n := got.count(); n != 1 {
+		t.Fatalf("sent %d records for one accumulated buffer, want 1", n)
 	}
 	if unsafe.SliceData(acc) != backing {
 		t.Fatal("flushUplink replaced the accumulator's backing array")
@@ -159,7 +183,7 @@ func TestFlushUplinkShipsAccumulatorAsOneRecord(t *testing.T) {
 	if !s.flushUplink(&acc) {
 		t.Fatal("flushUplink failed on an empty accumulator")
 	}
-	if len(*got) != 1 {
-		t.Fatalf("sent %d records after the empty flush, want still 1", len(*got))
+	if n := got.count(); n != 1 {
+		t.Fatalf("sent %d records after the empty flush, want still 1", n)
 	}
 }

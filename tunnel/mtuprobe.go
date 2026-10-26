@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -50,11 +51,26 @@ const (
 
 // Probe timing. Weak public UDP links can easily exceed 300 ms during loss and
 // queueing; 600 ms avoids treating ordinary jitter as an MTU black hole while
-// keeping the worst-case ladder bounded. Vars remain mutable for tests.
-var (
-	mtuProbeTimeout  = 600 * time.Millisecond
-	mtuProbeAttempts = 2
+// keeping the worst-case ladder bounded.
+//
+// Both stay mutable for tests, which is also why they are atomic: a test swaps
+// them to fast values and restores them in its own Cleanup, and by then an
+// earlier test's client may still be walking the ladder. Plain vars there are a
+// data race, caught by CI's race jobs.
+const (
+	defaultProbeTimeout  = 600 * time.Millisecond
+	defaultProbeAttempts = 2
 )
+
+var (
+	mtuProbeTimeout  atomic.Int64 // nanoseconds
+	mtuProbeAttempts atomic.Int32
+)
+
+func init() {
+	mtuProbeTimeout.Store(int64(defaultProbeTimeout))
+	mtuProbeAttempts.Store(defaultProbeAttempts)
+}
 
 // mtuProbeFloor is the largest record that can never be fragmented on an IPv4
 // path: 576 (IPv4 minimum reassembly) - 20 (IP) - 8 (UDP). It is the last rung
@@ -329,7 +345,7 @@ func probePath(ctx context.Context, sess *clientSession) int {
 		if sess.isClosed() {
 			return 0
 		}
-		for attempt := 0; attempt < mtuProbeAttempts; attempt++ {
+		for attempt := 0; attempt < int(mtuProbeAttempts.Load()); attempt++ {
 			if probeOnce(ctx, sess, size) {
 				return size
 			}
@@ -372,7 +388,7 @@ func probeOnce(ctx context.Context, sess *clientSession, size int) bool {
 		return false
 	}
 
-	deadline := time.NewTimer(mtuProbeTimeout)
+	deadline := time.NewTimer(time.Duration(mtuProbeTimeout.Load()))
 	defer deadline.Stop()
 	select {
 	case got := <-ch:

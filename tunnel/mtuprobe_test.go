@@ -219,9 +219,13 @@ func newProberRig(t *testing.T, fake *fakeProbeServer, pk *proberKeyPair) (*Clie
 
 func withFastProbing(t *testing.T) {
 	t.Helper()
-	oldTimeout, oldAttempts := mtuProbeTimeout, mtuProbeAttempts
-	mtuProbeTimeout, mtuProbeAttempts = 50*time.Millisecond, 1
-	t.Cleanup(func() { mtuProbeTimeout, mtuProbeAttempts = oldTimeout, oldAttempts })
+	oldTimeout, oldAttempts := mtuProbeTimeout.Load(), mtuProbeAttempts.Load()
+	mtuProbeTimeout.Store(int64(50 * time.Millisecond))
+	mtuProbeAttempts.Store(1)
+	t.Cleanup(func() {
+		mtuProbeTimeout.Store(oldTimeout)
+		mtuProbeAttempts.Store(oldAttempts)
+	})
 }
 
 // waitForCommit polls until the fake server observed the expected commit.

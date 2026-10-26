@@ -414,9 +414,25 @@ type ServerSession struct {
 
 	// maxPkt is this session's frame budget, set by the client's
 	// CMD_MTU_COMMIT after its path probe converges. Zero = no commit received
-	// yet, so the server's configured budget applies. It only ever shrinks the
-	// local value and never changes again once set.
+	// yet, so the server's configured budget applies. Both growth and shrink are
+	// honored (latest wins): the client commits the never-fragment floor first,
+	// the converged size after, and a smaller size when an idle re-probe finds
+	// the path has degraded.
 	maxPkt atomic.Int32
+
+	// observedPayload is the largest DATA payload this session has accepted from
+	// the client, and it RAISES the frame budget on top of maxPkt (see
+	// maxPayload). A commit travels on the same unordered datagram stream as the
+	// data it authorizes, so the client's converged record can reach the server
+	// before the commit that justifies it: the session still believes the
+	// never-fragment floor while it has already written a full-size record to a
+	// "udp" target. If forwardUpstream then refuses to send that target's reply
+	// back, the round trip's bytes are dropped on the floor and the
+	// application's byte stream is silently corrupted. A record the server has
+	// decoded and authenticated is the freshest evidence there is that the path
+	// carries that size right now, in both directions. Cleared by a shrink
+	// commit: that is the client saying the path got narrower.
+	observedPayload atomic.Int32
 
 	// mtuGate holds target->client traffic until the frame budget is known
 	// (commit received) or the client is clearly not probing (its first DATA
@@ -1559,6 +1575,9 @@ func (sess *ServerSession) handleIncomingFrame(frame *UDPCFrame, remoteAddr neti
 // proven to round-trip or the guaranteed floor, so applying it can never raise
 // the server's budget above what the path carries. Two identical back-to-back
 // copies are a no-op, which is what makes the duplicate sends harmless.
+//
+// A shrink also discards observedPayload: the commit is an explicit statement
+// that the path narrowed, which supersedes whatever the client sent before it.
 func (sess *ServerSession) applyMtuCommit(n int) {
 	sess.openMtuGate()
 	if n < maxPktFloor {
@@ -1567,12 +1586,36 @@ func (sess *ServerSession) applyMtuCommit(n int) {
 	if n > sess.server.maxPkt {
 		n = sess.server.maxPkt
 	}
-	if cur := int(sess.maxPkt.Load()); cur != 0 && cur == n {
+	cur := int(sess.maxPkt.Load())
+	if cur != 0 && cur == n {
 		return // duplicate copy of a commit already applied
+	}
+	// A shrink is the client's explicit word that the path got narrower, so the
+	// observed high-water no longer describes it and must go. Growth keeps the
+	// high-water: it is exactly what a climb in flight needs.
+	if cur > 0 && n < cur {
+		sess.observedPayload.Store(0)
 	}
 	sess.maxPkt.Store(int32(n))
 	sess.server.logInfo("[Session 0x%08X] 📏 [mtu] client committed %d-byte records (payload %d, configured %d)",
 		sess.sessionID, n, payloadCap(n), sess.server.maxPkt)
+}
+
+// noteObservedPayload records the largest record the client has actually sent.
+// It only ever raises the high-water; applyMtuCommit clears it on a shrink.
+func (sess *ServerSession) noteObservedPayload(n int) {
+	if n <= 0 {
+		return
+	}
+	for {
+		cur := int(sess.observedPayload.Load())
+		if n <= cur {
+			return
+		}
+		if sess.observedPayload.CompareAndSwap(int32(cur), int32(n)) {
+			return
+		}
+	}
 }
 
 func (sess *ServerSession) sendPathChallenge(remoteAddr netip.AddrPort, origPort int) {
@@ -1809,6 +1852,11 @@ func (sess *ServerSession) handleData(frame *UDPCFrame, remoteAddr netip.AddrPor
 }
 
 func (sess *ServerSession) handleDataFromPath(frame *UDPCFrame, remoteAddr netip.AddrPort, origPort int) bool {
+	// A decoded record is the client's own proof of path capacity, and it can
+	// arrive ahead of the commit that announces it. Note it before admission so
+	// a record refused on a full queue still counts as evidence.
+	sess.noteObservedPayload(len(frame.Data))
+
 	if sess.delivery != nil {
 		if frame.Ack > 0 {
 			sess.handleAck(frame.Ack)
@@ -2207,9 +2255,13 @@ func (sess *ServerSession) openMtuGate() {
 }
 
 // maxPayload is the session's frame budget: whatever the client committed,
-// capped by what this server is configured to send.
+// raised by what the client has actually sent, and capped by what this server
+// is configured to send.
 func (sess *ServerSession) maxPayload() int {
-	budget := sess.server.maxPayload()
+	// The operator's ceiling stays the hard outer bound. observedPayload is
+	// evidence about the path, not permission to exceed it.
+	ceiling := sess.server.maxPayload()
+	budget := ceiling
 	if mp := int(sess.maxPkt.Load()); mp > 0 {
 		if p := payloadCap(mp); p < budget {
 			budget = p
@@ -2218,15 +2270,27 @@ func (sess *ServerSession) maxPayload() int {
 	if sess.fecSend != nil {
 		budget = fecDataPayloadCap(budget)
 	}
+	// Observed LAST, after the FEC cap: the client's payload is already
+	// FEC-capped, so comparing it against the pre-cap value would under-size
+	// the budget by the length prefix and drop the very datagram it exists to
+	// cover.
+	if obs := int(sess.observedPayload.Load()); obs > budget && obs <= ceiling {
+		budget = obs
+	}
 	return budget
 }
 
 // forwardUpstream ships one target read into the tunnel. sendData splits a
 // stream read across as many records as it needs, so there is no stride loop
-// here to lose bytes if the cap shrinks mid-call. A UDP datagram cannot be
-// split without breaking its end-to-end boundary, so an oversized one is
-// dropped with a warning — on a path that narrow it could not have been
-// delivered intact anyway.
+// here to lose bytes if the cap shrinks mid-call.
+//
+// A UDP datagram cannot be split without breaking its end-to-end boundary, so
+// one that exceeds the frame budget is dropped. Note that this is only
+// reachable for a datagram the target originated itself: a reply to something
+// this session wrote can never exceed maxPayload, because maxPayload honors
+// observedPayload and the client's record for it was already accepted. That
+// ordering is what stops a stale commit from eating this session's own round
+// trips.
 func (sess *ServerSession) forwardUpstream(chunk []byte) {
 	if sess.targetNetwork != "tcp" && len(chunk) > sess.maxPayload() {
 		sess.server.logWarn("[Session 0x%08X] 🗑️ dropping %d-byte target datagram: exceeds the %d-byte frame budget (narrow path)",

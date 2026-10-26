@@ -185,8 +185,13 @@ func newWeaknetScheduler(done <-chan struct{}, write func(*weaknetScheduled)) *w
 }
 
 // schedule adds a datagram; it is written at least at item's due time.
+//
+// The modulo must happen in 64-bit space before the int conversion. A hash
+// whose low 32 bits are large truncates to a NEGATIVE int on 386 and arm, and
+// Go's % keeps the dividend's sign, so `int(h) % n` returns -3 where it should
+// return 1 - an index-out-of-range panic, roughly a third of the time.
 func (s *weaknetScheduler) schedule(item *weaknetScheduled) {
-	shard := int(absHash64(scheduledHash(item))) % len(s.shards)
+	shard := int(scheduledHash(item) % uint64(len(s.shards)))
 	s.shards[shard].offer(item)
 }
 
@@ -275,8 +280,6 @@ func scheduledHash(item *weaknetScheduled) uint64 {
 	}
 	return h
 }
-
-func absHash64(h uint64) uint64 { return h & 0x7fffffffffffffff }
 
 // weaknetRelay stands up an impaired UDP relay in front of server and returns
 // its listen address. The client connects to that address instead of the

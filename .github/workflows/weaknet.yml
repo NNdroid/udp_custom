@@ -1,0 +1,221 @@
+name: WeakNET
+
+# Weak-network benchmarks: every BenchmarkWeakNET_* family sends one 32 KiB
+# write into an echo target and reads the echo back byte-for-byte, with a UDP
+# relay in the middle injecting loss, delay, jitter and duplication. See the
+# header of tunnel/weaknet_bench_test.go for the impairment model and profile
+# table.
+#
+# Same merge policy as throughput.yml: continue-on-error, never a gate.
+# Shared-runner timing noise plus a lossy synthetic link makes a hard ns/op
+# threshold a false-positive factory; the useful signal is drift across
+# commits (benchstat) plus the FEC bandwidth tax per profile.
+#
+# Note the FEC-vs-ARQ ratio is a cost, not a win: FEC pays up to 50% wire
+# overhead for parity, so its throughput is lower by design. It is below 1 at
+# every profile, and it is only supposed to be a small gap at the lossiest
+# ones — the reliability case is made by the integrity and stress tests below,
+# not by this table.
+#
+# benchtime defaults to 3s, one second longer than throughput.yml: an
+# iteration is latency-bound rather than CPU-bound, so it needs more wall
+# clock to get several samples per sub-benchmark.
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      benchtime:
+        description: Per-benchmark sample duration
+        required: false
+        default: 3s
+      count:
+        description: Number of benchmark samples
+        required: false
+        default: '7'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: weaknet-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  weaknet:
+    name: Weak-network baseline vs head
+    runs-on: ubuntu-latest
+    # noisy timing, never block merges
+    continue-on-error: true
+    env:
+      BENCHTIME: ${{ inputs.benchtime || '3s' }}
+      BENCHCOUNT: ${{ inputs.count || '7' }}
+      WEAKNET_RE: 'BenchmarkWeakNET_'
+
+    steps:
+      - name: Check out head
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+
+      - name: Resolve comparison base
+        id: base
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            base_sha='${{ github.event.pull_request.base.sha }}'
+          else
+            git fetch origin main --depth=1
+            base_sha="$(git rev-parse origin/main)"
+          fi
+          echo "sha=$base_sha" >> "$GITHUB_OUTPUT"
+          echo "Comparing base $base_sha with head $GITHUB_SHA"
+
+      - name: Create base worktree
+        shell: bash
+        run: |
+          set -euo pipefail
+          git worktree add /tmp/udp-custom-base '${{ steps.base.outputs.sha }}'
+
+      - name: Warm Go build cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -run '^$' ./tunnel/...
+          (cd /tmp/udp-custom-base && go test -run '^$' ./tunnel/...)
+
+      # The one hard assertion this job owns: randomised loss/delay/jitter/dup
+      # profiles must still deliver byte-exact data and must not overflow the
+      # reorder buffer, with FEC on and off. The stress test runs the regime
+      # above 10% loss and asserts the failure mode (byte-exact delivery, or a
+      # clean session error) rather than success, so it cannot go red on seed
+      # luck. Run with -race because these are concurrency tests, not timing
+      # tests.
+      - name: Integrity and stress tests under impaired paths
+        run: >
+          go test -race -count=1
+          -run 'TestWeakNET_RandomizedIntegritySweep|TestWeakNET_AdaptiveFECReactstoLoss|TestWeakNET_StressSurvivesCrossover|TestPipelineRecovers'
+          -timeout 30m ./tunnel/
+
+      - name: Benchmark base weak network
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/udp-custom-base
+          go test -run '^$' -bench "$WEAKNET_RE" -benchmem -benchtime="$BENCHTIME" -count="$BENCHCOUNT" -timeout 60m ./tunnel/ | tee "$GITHUB_WORKSPACE/benchmark-base.txt"
+
+      - name: Benchmark head weak network
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -run '^$' -bench "$WEAKNET_RE" -benchmem -benchtime="$BENCHTIME" -count="$BENCHCOUNT" -timeout 60m ./tunnel/ | tee benchmark-head.txt
+
+      - name: Compare with benchstat
+        shell: bash
+        run: |
+          set -euo pipefail
+          go run golang.org/x/perf/cmd/benchstat@latest benchmark-base.txt benchmark-head.txt | tee benchstat.txt
+
+      - name: Build FEC vs ARQ delta table
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo '## FEC bandwidth tax by profile'
+            echo
+            echo 'Mean throughput per sample, MB/s. FEC/ARQ is FEC throughput'
+            echo 'over ARQ throughput: below 1 because parity costs wire'
+            echo 'bandwidth, the gap narrowing as loss makes ARQ retransmit.'
+            echo 'A widening gap on a lossy profile is FEC parity being added'
+            echo 'without buying reliability — worth a look.'
+            echo
+            awk '
+            /^[[:space:]]*BenchmarkWeakNET_/ {
+              # go test pads benchmark names to a common width with U+00A0
+              # (NBSP), which does not split as a field separator: the name is
+              # "BenchmarkWeakNET_TCP_FEC/GoodWiFi\302\240\302\240-32" and
+              # everything is shifted two columns right, so bytes is $7, not
+              # $5.
+              split($1, a, "/");
+              # Strip the -GOMAXPROCS suffix go test appends: b[3] would be
+              # "FEC-16" and the FEC/ARQ lookup below would never match.
+              name = a[1]; gsub(/-[0-9]+$/, "", name); split(name, b, "_");
+              prof = a[2]; gsub(/-[0-9]+$/, "", prof);
+              key = prof SUBSEP b[2] SUBSEP b[3];
+              nsop[key] += $3;
+              cnt[key]  += 1;
+              bytes[key] = $7;
+            }
+            END {
+              for (k in cnt) {
+                split(k, kk, SUBSEP);
+                mean = nsop[k] / cnt[k];
+                mbps = (mean > 0) ? bytes[k] * 1000 / mean : 0;
+                printf "%s\t%s\t%s\t%.2f\n", kk[1], kk[2], kk[3], mbps;
+              }
+            }' benchmark-head.txt | sort > /tmp/fec_rows.tsv
+            awk -F'\t' '
+            {
+              v[$1 "," $2 $3] = $4;
+              if (!($1 in seen)) { seen[$1] = 1; order[++n] = $1 }
+            }
+            END {
+              if (n == 0) { print "No BenchmarkWeakNET_ results found."; exit 0 }
+                printf "| Profile | FEC TCP | ARQ TCP | FEC/ARQ | FEC UDP | ARQ UDP | FEC/ARQ |\n"
+              printf "| --- | --- | --- | --- | --- | --- | --- |\n"
+              for (i = 1; i <= n; i++) {
+                p = order[i];
+                ft = v[p ",TCPFEC"]; at = v[p ",TCPARQ"];
+                fu = v[p ",UDPFEC"]; au = v[p ",UDPARQ"];
+                g1 = (at > 0 && ft > 0) ? sprintf("%.2fx", ft / at) : "n/a";
+                g2 = (au > 0 && fu > 0) ? sprintf("%.2fx", fu / au) : "n/a";
+                printf "| %s | %s | %s | %s | %s | %s | %s |\n", p, ft, at, g1, fu, au, g2;
+              }
+            }' /tmp/fec_rows.tsv
+          } | tee fec-delta.md
+
+      - name: Publish summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## udp_custom weak-network benchmark'
+            echo
+            echo '- Impaired-link throughput: loss, delay, jitter and duplication injected'
+            echo '  in both directions by a UDP relay. Feedback frames (ACK/SACK/'
+            echo '  PING/PONG/FIN) are exempt from loss; see the relay comment.'
+            echo "- Samples: ${BENCHCOUNT}, benchtime: ${BENCHTIME}"
+            echo
+            if [[ -f fec-delta.md ]]; then
+              cat fec-delta.md
+            else
+              echo 'FEC/ARQ delta table unavailable.'
+            fi
+            echo
+            echo '### benchstat (base vs head)'
+            echo
+            echo '```text'
+            if [[ -f benchstat.txt ]]; then cat benchstat.txt; else echo 'benchstat output unavailable'; fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload weak-network artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: udp-weaknet-${{ github.sha }}
+          path: |
+            benchmark-base.txt
+            benchmark-head.txt
+            benchstat.txt
+            fec-delta.md
+          if-no-files-found: ignore
+          retention-days: 30

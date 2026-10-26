@@ -1,6 +1,7 @@
 name: Test
 
-# Runs the FULL suite (141 test/benchmark/fuzz-seed functions) on every push
+# Runs the FULL suite (every Test/Benchmark/Fuzz function in the repo — the
+# count grows every change, so it is not stated here) on every push
 # to main and every pull request. The race detector runs on ALL three
 # platforms: Linux needs nothing extra; macOS has Apple Clang preinstalled;
 # Windows needs a mingw-w64 gcc (installed via Chocolatey) because the race

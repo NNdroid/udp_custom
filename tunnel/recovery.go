@@ -159,6 +159,10 @@ func updateSACK(flow *sendFlow, outstanding map[uint64]*unackedPkt, f *UDPCFrame
 	}
 	p.retries++
 	p.sentTime = now
+	// Advance the same backoff ladder retryDue does: a fast repair burns one
+	// retry like anything else, so leaving rto alone would consume the whole
+	// 15-retry budget at the guard cadence and abandon a live path in seconds.
+	p.rto = min(p.rto*3/2, rttMaxRTO)
 	flow.fastRepairs++
 	flow.loss(now, rtt)
 	return p.wire, true

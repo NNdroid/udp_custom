@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -228,6 +229,97 @@ func TestTargets_DNSOverTunnel(t *testing.T) {
 	}
 }
 
+// --- write-coalescing integrity ------------------------------------------------
+
+// TestTargets_BurstWritesAreByteExact guards the uplink pump against dropping
+// bytes at the boundary between two consecutive application writes. The pump
+// reads into one buffer and tops up an accumulator for the coalesce window, so
+// a Read that returns more bytes than the accumulator can still hold must not
+// discard the excess. Every write-write boundary used to lose exactly
+// chunk % recordCap bytes -- one full Read return's worth of overflow -- with
+// no error anywhere: both Writes succeeded, every record that was sent was
+// acknowledged, and the missing tail record was simply never queued.
+//
+// The throughput benchmarks below would never have caught this: they fill the
+// write buffer with zeros, so dropped bytes are indistinguishable from payload.
+// A non-zero payload makes both loss and corruption visible.
+func TestTargets_BurstWritesAreByteExact(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				io.Copy(c, c)
+			}(c)
+		}
+	}()
+
+	shapes := []struct {
+		chunk, batch int
+	}{
+		{1394, 3}, // exact record multiples: no partial tail
+		{1395, 3}, // one byte past a record boundary
+		{4096, 4},
+		{8192, 1}, // control: a single write has no boundary to break
+		{8192, 2},
+		{13000, 2},
+		{16384, 16},
+	}
+	for _, sh := range shapes {
+		t.Run(strconv.Itoa(sh.chunk)+"x"+strconv.Itoa(sh.batch), func(t *testing.T) {
+			_, _, conn := startTargetPair(t, false, "tcp://"+ln.Addr().String())
+			total := sh.chunk * sh.batch
+			chunk := patternPayload(sh.chunk)
+			// Every write carries the same chunk, so the echo is that chunk
+			// repeated: comparing against the whole payload instead would flag
+			// a correct echo at the first write boundary.
+			want := make([]byte, total)
+			for i := 0; i < sh.batch; i++ {
+				copy(want[i*sh.chunk:], chunk)
+			}
+			got := make([]byte, total)
+			conn.SetDeadline(time.Now().Add(30 * time.Second))
+
+			// Drain concurrently: the tunnel delivers into an unbuffered pipe,
+			// so the application must read while it writes or the burst stalls.
+			done := make(chan struct{})
+			var gotN int
+			go func() {
+				gotN, _ = io.ReadFull(conn, got)
+				close(done)
+			}()
+			for i := 0; i < sh.batch; i++ {
+				if _, err := conn.Write(chunk); err != nil {
+					t.Fatalf("write %d: %v", i, err)
+				}
+			}
+			<-done
+			if gotN != total {
+				t.Fatalf("echo returned %d of %d bytes", gotN, total)
+			}
+			if !bytes.Equal(got, want) {
+				first := 0
+				for i := range want {
+					if got[i] != want[i] {
+						first = i
+						break
+					}
+				}
+				t.Fatalf("echo was not byte-exact: first difference at byte %d of %d (got %x want %x)",
+					first, total, got[first:first+10], want[first:first+10])
+			}
+		})
+	}
+}
+
 // --- throughput benchmarks: protocol (PSK/Noise) x target (TCP/UDP) -----------
 
 // benchTunnelTCPTarget: 16 KB writes pipelined 16 deep through the tunnel into
@@ -256,7 +348,14 @@ func benchTunnelTCPTarget(b *testing.B, noise bool) {
 
 	const chunk = 8192
 	const batch = 16
-	chunkBuf := make([]byte, chunk)
+	// Non-zero payload plus a byte-for-byte comparison: a zero-filled buffer
+	// makes a silently dropped record indistinguishable from data, which is how
+	// the uplink pump's write-boundary drop survived uncaught here.
+	chunkBuf := patternPayload(chunk)
+	want := make([]byte, chunk*batch)
+	for j := 0; j < batch; j++ {
+		copy(want[j*chunk:], chunkBuf)
+	}
 	readBuf := make([]byte, chunk*batch)
 	b.SetBytes(int64(chunk * batch))
 	b.ResetTimer()
@@ -268,6 +367,9 @@ func benchTunnelTCPTarget(b *testing.B, noise bool) {
 		}
 		if _, err := io.ReadFull(conn, readBuf); err != nil {
 			b.Fatal(err)
+		}
+		if !bytes.Equal(readBuf, want) {
+			b.Fatal("TCP echo was not byte-exact")
 		}
 	}
 }
@@ -301,7 +403,10 @@ func benchTunnelUDPTarget(b *testing.B, noise bool) {
 
 	const chunk = 1024
 	const batch = 16
-	chunkBuf := make([]byte, chunk)
+	// Non-zero payload and a per-datagram comparison, for the same reason as the
+	// TCP benchmark above: zeros would hide a silently dropped record.
+	chunkBuf := patternPayload(chunk)
+	readBuf := make([]byte, chunk)
 	b.SetBytes(int64(chunk * batch))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -311,8 +416,11 @@ func benchTunnelUDPTarget(b *testing.B, noise bool) {
 			}
 		}
 		for j := 0; j < batch; j++ {
-			if _, err := conn.Read(chunkBuf); err != nil {
+			if _, err := io.ReadFull(conn, readBuf); err != nil {
 				b.Fatal(err)
+			}
+			if !bytes.Equal(readBuf, chunkBuf) {
+				b.Fatal("UDP echo was not byte-exact")
 			}
 		}
 	}

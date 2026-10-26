@@ -1170,12 +1170,20 @@ func (s *clientSession) localToRemote() {
 			wait = deadline.Sub(time.Now())
 		}
 		s.conn.SetReadDeadline(time.Now().Add(wait))
-		n, err := s.conn.Read(buf)
+		// Read only into the space the accumulator has left. Acc is partial
+		// exactly when a tail record is waiting out the coalesce window, and the
+		// next write's bytes arrive during that window -- a full Read return
+		// then overflows acc, and clamping n here discarded the excess outright:
+		// every write-write boundary in a burst lost one Read's worth of
+		// application data, with both Writes succeeding and every record sent
+		// acknowledged. Sizing the read to the free tail makes the overflow
+		// impossible instead of handling it. Note that acc stays below len(buf)
+		// because a flush fires at maxPayload(), which never exceeds the ceiling
+		// buf is sized to, so the read slice is never empty.
+		free := buf[len(acc):]
+		n, err := s.conn.Read(free)
 		if n > 0 {
-			if len(acc)+n > len(buf) {
-				n = len(buf) - len(acc)
-			}
-			acc = append(acc, buf[:n]...)
+			acc = append(acc, free[:n]...)
 			s.mu.Lock()
 			s.lastSent = time.Now()
 			s.mu.Unlock()

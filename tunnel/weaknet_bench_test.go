@@ -295,10 +295,10 @@ func startUDPEcho(tb testing.TB) string {
 	return echo.LocalAddr().String()
 }
 
-// weaknetPayload fills a buffer with a repeating non-trivial pattern so a
+// patternPayload fills a buffer with a repeating non-trivial pattern so a
 // transport bug that zeroes, truncates or reorders bytes cannot hide behind
 // all-zero data.
-func weaknetPayload(n int) []byte {
+func patternPayload(n int) []byte {
 	out := make([]byte, n)
 	for i := range out {
 		out[i] = byte((i*17 + i/31) % 251)
@@ -316,30 +316,53 @@ func weaknetPayload(n int) []byte {
 const weaknetIterDeadline = 30 * time.Second
 
 // weaknetLoopbackDrives runs one benchmark body against a full-duplex echo
-// target: each iteration writes total bytes and reads the whole echo back.
+// target: each iteration writes chunk x batch bytes as a pipelined burst and
+// reads the whole echo back, byte for byte.
 //
-// One Write per iteration, not a burst of small writes — the burst shape loses
-// data. Reproduced against a plain server with zero impairment and no relay: a
-// burst of 2 x 8 KiB returns 15162 of 16384 bytes with a record's payload
-// repeating its neighbour's, while 8 x 1 KiB returns 11806 of 16384. Single
-// writes of any size are exact, so this is a burst-coalescing defect in the
-// tunnel, not a benchmark artifact. benchTunnelTCPTarget (targets_test.go:263)
-// uses the burst shape too and understates itself for the same reason. The
-// byte-exact readback below would fail loudly on any short or garbled echo.
-func weaknetLoopbackDrives(b *testing.B, conn net.Conn, total int) {
-	payload := weaknetPayload(total)
-	readBuf := make([]byte, total)
+// The burst is deliberate: coalescing several application writes into one wire
+// record is the pump's hot path, and a single write per iteration leaves the
+// write-write boundary unexercised. It mirrors the shapes benchTunnelTCPTarget
+// and benchTunnelUDPTarget measure on a clean link, so the weaknet numbers stay
+// comparable to them. A non-zero payload plus the byte-exact comparison below
+// makes any short or garbled echo fail loudly rather than understate itself.
+//
+// The echo is drained by a dedicated goroutine: reading it inline would
+// serialise write and read, and the tunnel hands application data across an
+// unbuffered pipe in both directions, so a burst that nobody drains stalls.
+func weaknetLoopbackDrives(b *testing.B, conn net.Conn, chunk, batch int) {
+	total := chunk * batch
+	payload := patternPayload(chunk)
+	want := make([]byte, total)
+	for j := 0; j < batch; j++ {
+		copy(want[j*chunk:], payload)
+	}
+	got := make([]byte, total)
+	readDone := make(chan struct{}, 1)
+	go func() {
+		for {
+			select {
+			case <-b.Context().Done():
+				return
+			default:
+			}
+			if _, err := io.ReadFull(conn, got); err != nil {
+				return
+			}
+			readDone <- struct{}{}
+		}
+	}()
+
 	b.SetBytes(int64(total))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		conn.SetDeadline(time.Now().Add(weaknetIterDeadline))
-		if _, err := conn.Write(payload); err != nil {
-			b.Fatal(err)
+		for j := 0; j < batch; j++ {
+			if _, err := conn.Write(payload); err != nil {
+				b.Fatal(err)
+			}
 		}
-		if _, err := io.ReadFull(conn, readBuf); err != nil {
-			b.Fatal(err)
-		}
-		if !bytes.Equal(readBuf, payload) {
+		<-readDone
+		if !bytes.Equal(got, want) {
 			b.Fatal("echo was not byte-exact")
 		}
 	}
@@ -359,7 +382,7 @@ func benchWeakNETTCP(b *testing.B, fec bool) {
 		b.Run(spec.name, func(b *testing.B) {
 			target := startTCPEcho(b)
 			conn, _, _ := weaknetPair(b, spec, fec, "tcp://"+target)
-			weaknetLoopbackDrives(b, conn, 32<<10)
+			weaknetLoopbackDrives(b, conn, 8<<10, 4)
 		})
 	}
 }
@@ -371,7 +394,7 @@ func benchWeakNETUDP(b *testing.B, fec bool) {
 		b.Run(spec.name, func(b *testing.B) {
 			target := startUDPEcho(b)
 			conn, _, _ := weaknetPair(b, spec, fec, "udp://"+target)
-			weaknetLoopbackDrives(b, conn, 1024)
+			weaknetLoopbackDrives(b, conn, 1024, 16)
 		})
 	}
 }
@@ -394,7 +417,7 @@ func TestWeakNET_AdaptiveFECReactstoLoss(t *testing.T) {
 	conn, _, link := weaknetPair(t, spec, true, "tcp://"+startTCPEcho(t))
 	conn.SetDeadline(time.Now().Add(120 * time.Second))
 
-	want := weaknetPayload(256 << 10)
+	want := patternPayload(256 << 10)
 	got := make([]byte, len(want))
 	writeErr := make(chan error, 1)
 	go func() {
@@ -443,7 +466,7 @@ func TestWeakNET_AdaptiveFECReactstoLoss(t *testing.T) {
 // of the four regardless of which outcome the RNG produced.
 func TestWeakNET_StressSurvivesCrossover(t *testing.T) {
 	const payload = 128 << 10
-	want := weaknetPayload(payload)
+	want := patternPayload(payload)
 	for _, loss := range []float64{0.20, 0.30} {
 		for _, fec := range []bool{true, false} {
 			spec := weaknetSpec{
@@ -520,7 +543,7 @@ func TestWeakNET_RandomizedIntegritySweep(t *testing.T) {
 	rng := rand.New(rand.NewSource(0x5EED5EED))
 	const profiles = 8
 	const payload = 32 << 10
-	want := weaknetPayload(payload)
+	want := patternPayload(payload)
 
 	for i := 0; i < profiles; i++ {
 		spec := weaknetSpec{

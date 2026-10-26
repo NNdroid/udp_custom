@@ -19,6 +19,14 @@ const (
 	fecMaxPendingBlocks = 16
 	fecBlockTTL         = 2 * time.Second
 	fecBootstrapBlocks  = 4
+	// EWMA denominator for the loss estimator. See observeOutcome for why it is
+	// 64 rather than 32.
+	fecLossAlpha = 64
+	// fecBootstrapLossRate is the rate below which parity stays at zero (see
+	// fecParityForLoss). fecAdaptiveLoss.loss uses it as the lead a peer's loss
+	// report may run ahead of local ARQ evidence, so a fresh path can still see
+	// a real burst before its first retransmit.
+	fecBootstrapLossRate = 0.005
 
 	// CMD_FEC reuses authenticated header fields instead of spending payload
 	// bytes on metadata. Seq is the block's first DATA sequence; Flags packs
@@ -59,9 +67,12 @@ func (e *fecLossEstimator) observeOutcome(lost bool) {
 		sample = 1
 	}
 	e.mu.Lock()
-	// 1/32 EWMA: fast enough to react within a few dozen packets, but slow
-	// enough that one reordered datagram does not swing parity wildly.
-	e.value += (sample - e.value) / 32
+	// 1/64 EWMA: fast enough to converge within a few hundred packets, slow
+	// enough that one dropped or reordered datagram cannot swing parity by a
+	// whole bucket. At 1/32 a single lost sample jumped the value by 1/32 =
+	// 3.1%, already above the 2.5% threshold, so one reorder bought about 58
+	// records of parity-2 transmission before the estimate decayed back.
+	e.value += (sample - e.value) / fecLossAlpha
 	e.mu.Unlock()
 }
 
@@ -117,10 +128,22 @@ func (a *fecAdaptiveLoss) observeRemoteBasisPoints(bp uint16) {
 func (a *fecAdaptiveLoss) loss() float64 {
 	local := a.local.loss()
 	remote := a.remote.loss()
-	if remote > local {
-		return remote
+	if remote <= local {
+		return local
 	}
-	return local
+	// remote is the peer's FEC recovery rate, which is a function of the parity
+	// this side emits: more parity buys more recoveries, which advertises a higher
+	// rate, which buys more parity. Unclamped it is a positive feedback loop that
+	// settled near 35% on a 0.5% loss path and parked parity at its ceiling. Cap
+	// the lead the peer's report may run ahead of the sender's own ARQ evidence by
+	// a factor of two, plus a floor at the parity-1 threshold so a burst is still
+	// visible before the first local retransmit. The cap shrinks as local falls,
+	// which is the negative feedback the parity overhead needs.
+	ceiling := 2*local + fecBootstrapLossRate
+	if remote > ceiling {
+		remote = ceiling
+	}
+	return remote
 }
 
 func fecParityForLoss(loss float64) int {
@@ -330,6 +353,17 @@ func (s *fecSender) emitBlock(block []fecSourceShard) {
 	if blockNo <= fecBootstrapBlocks && parityShards < 1 {
 		parityShards = 1
 	}
+	dataShards := len(block)
+	// More parity than dataShards-1 recovers nothing extra: with k data and m
+	// parity the block needs k survivors out of k+m, so beyond k-1 every extra
+	// parity datagram is pure waste. The timer flush made this common — a
+	// 1-record block flushed 15 ms after a lull paid up to four parity
+	// datagrams to protect one record, which is what pushed the FEC-to-DATA
+	// ratio past 100% on a 10% loss profile. A block of one falls out of this
+	// cap at zero and is left to ARQ, which is correct if slower.
+	if parityShards > dataShards-1 {
+		parityShards = dataShards - 1
+	}
 	if parityShards <= 0 {
 		return
 	}
@@ -348,7 +382,6 @@ func (s *fecSender) emitBlock(block []fecSourceShard) {
 		return
 	}
 
-	dataShards := len(block)
 	shards := make([][]byte, dataShards+parityShards)
 	pooled := fecSlabPool.Get().(*[]byte)
 	slab := (*pooled)[:len(shards)*shardSize]
@@ -461,7 +494,14 @@ func (r *fecReceiver) onData(seq uint64, payload []byte) []fecRecovered {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	now := time.Now()
 	if _, exists := r.recent[seq]; !exists {
+		// Retained unconditionally: the sender decides parity after this block's
+		// DATA has already been sent, so whether this record will ever be needed
+		// for reconstruction cannot be known here. The cost is one copy per
+		// record on a clean path; once the feedback loop in
+		// fecAdaptiveLoss.loss is broken the parity overhead itself is what
+		// dominates, not this.
 		r.recent[seq] = append([]byte(nil), payload...)
 		r.loss.observeOutcome(false)
 		if seq > r.highest {
@@ -477,8 +517,10 @@ func (r *fecReceiver) onData(seq uint64, payload []byte) []fecRecovered {
 			out = append(out, r.tryRecoverLocked(block)...)
 		}
 	}
-	r.pruneBlocksLocked(time.Now())
-	sort.Slice(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })
+	r.pruneBlocksLocked(now)
+	if len(out) > 1 {
+		sort.Slice(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })
+	}
 	return out
 }
 
@@ -512,7 +554,9 @@ func (r *fecReceiver) onParityFrame(frame *UDPCFrame) []fecRecovered {
 
 	out := r.tryRecoverLocked(block)
 	r.pruneBlocksLocked(now)
-	sort.Slice(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })
+	if len(out) > 1 {
+		sort.Slice(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })
+	}
 	return out
 }
 
@@ -599,10 +643,17 @@ func (r *fecReceiver) tryRecoverLocked(block *fecRecvBlock) []fecRecovered {
 		}
 		seq := block.baseSeq + uint64(idx)
 		payload := append([]byte(nil), shard[fecLengthPrefixSize:fecLengthPrefixSize+n]...)
+		// Cache for a later block that still needs this shard, then hand the same
+		// buffer to the caller. The copy is against the pooled slab, so it is not
+		// aliased with any other reconstruction; the second copy here was pure waste.
 		r.recent[seq] = payload
-		r.loss.observeOutcome(true)
-		out = append(out, fecRecovered{Seq: seq, Payload: append([]byte(nil), payload...)})
+		out = append(out, fecRecovered{Seq: seq, Payload: payload})
 	}
+	// A reconstructed shard means the sender over-committed its parity estimate, so
+	// the receive side has to feed that back to the sender. Keep this: it is the
+	// only signal that FEC itself is doing useful work, and fecAdaptiveLoss.loss
+	// clamps the effect so it cannot turn into a positive feedback loop.
+	r.loss.observeOutcome(true)
 	delete(r.blocks, block.baseSeq)
 	return out
 }

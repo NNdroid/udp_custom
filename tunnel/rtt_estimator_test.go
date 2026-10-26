@@ -21,14 +21,31 @@ func TestRTTEstimator(t *testing.T) {
 		t.Fatalf("rto=%v, want 300ms", e.RTO())
 	}
 
-	// Stable samples (above the 200ms floor) converge to srtt as rttvar
-	// decays to 0: rto -> srtt (here 300ms), no longer the initial 3R=900ms.
+	// Stable samples converge as rttvar decays to 0, but the RTO no longer
+	// collapses onto srtt: the 1.5*srtt margin floors it at 450ms here. That
+	// floor is the point — a quiet path's rttvar decays away, so without it the
+	// RTO sits a hair above the smoothed RTT and any ordinary jitter fires a
+	// timeout that is not loss.
 	e2 := newRTTEstimator(200*time.Millisecond, 200*time.Millisecond, 10*time.Second)
 	for i := 0; i < 50; i++ {
 		e2.Sample(300 * time.Millisecond)
 	}
-	if e2.RTO() < 250*time.Millisecond || e2.RTO() > 350*time.Millisecond {
-		t.Fatalf("stable rto=%v, want ~300ms", e2.RTO())
+	if e2.RTO() < 425*time.Millisecond || e2.RTO() > 475*time.Millisecond {
+		t.Fatalf("stable rto=%v, want ~1.5*srtt (450ms)", e2.RTO())
+	}
+
+	// Real variance still dominates the margin: a jittery path gets
+	// srtt+4*rttvar, not 1.5*srtt.
+	e2b := newRTTEstimator(200*time.Millisecond, 200*time.Millisecond, 10*time.Second)
+	for i := 0; i < 60; i++ {
+		if i%2 == 0 {
+			e2b.Sample(300 * time.Millisecond)
+		} else {
+			e2b.Sample(400 * time.Millisecond)
+		}
+	}
+	if got := e2b.RTO(); got < 500*time.Millisecond {
+		t.Fatalf("jittery rto=%v, want >500ms (srtt+4*rttvar past the margin floor)", got)
 	}
 
 	// Jitter widens the variance and raises rto (must stay positive).

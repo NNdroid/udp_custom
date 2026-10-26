@@ -52,7 +52,7 @@ func TestAdaptiveWindowLimitsAndLoss(t *testing.T) {
 	if f.cwnd != deliveryWindow {
 		t.Fatalf("window=%d", f.cwnd)
 	}
-	f.loss(time.Now(), time.Millisecond)
+	f.loss(time.Now(), time.Millisecond, false)
 	if f.cwnd != deliveryWindow/2 {
 		t.Fatalf("loss window=%d", f.cwnd)
 	}
@@ -64,6 +64,55 @@ func TestAdaptiveWindowLimitsAndLoss(t *testing.T) {
 	f.acknowledged(1000)
 	if f.cwnd != 16 {
 		t.Fatal("explicit cap ignored")
+	}
+}
+
+func TestUndoLossRetractsSpuriousTimeout(t *testing.T) {
+	f := newSendFlow(deliveryWindow, true)
+	for i := 0; i < 32; i++ {
+		f.acknowledged(64)
+	}
+	before := f.cwnd
+
+	// A retransmit whose ACK beats the retransmit's own round trip is evidence
+	// the timeout was jitter, not loss: the window has to come back up.
+	f.loss(time.Now(), time.Second, true)
+	if f.cwnd != before/2 {
+		t.Fatalf("undoable loss window=%d, want %d", f.cwnd, before/2)
+	}
+	retried := &unackedPkt{retries: 1, sentTime: time.Now()}
+	if !f.undoIfSpurious(retried, time.Second) {
+		t.Fatal("fresh retransmit ACK was not recognised as spurious")
+	}
+	if f.cwnd != before {
+		t.Fatalf("undo restored window=%d, want %d", f.cwnd, before)
+	}
+
+	// Nothing left to undo, and none of the non-spurious shapes may revert it.
+	if f.undoIfSpurious(retried, time.Second) {
+		t.Fatal("undoed twice for one timeout")
+	}
+	if f.undoIfSpurious(&unackedPkt{retries: 0, sentTime: time.Now()}, time.Second) {
+		t.Fatal("untouched packet triggered an undo")
+	}
+	if f.undoIfSpurious(&unackedPkt{retries: 1, sentTime: time.Now().Add(-2 * time.Second)}, time.Second) {
+		t.Fatal("an ACK a full RTT late was treated as spurious")
+	}
+	if f.undoIfSpurious(retried, 0) {
+		t.Fatal("zero RTT estimate must not classify anything as spurious")
+	}
+	if f.cwnd != before {
+		t.Fatalf("window drifted to %d, want %d", f.cwnd, before)
+	}
+
+	// A SACK-driven cut is stronger evidence and stays put.
+	f.lastLoss = time.Time{}
+	f.loss(time.Now(), time.Second, false)
+	if f.undoIfSpurious(retried, time.Second) {
+		t.Fatal("non-undoable loss was retracted")
+	}
+	if f.cwnd != before/2 {
+		t.Fatalf("window=%d, want %d", f.cwnd, before/2)
 	}
 }
 

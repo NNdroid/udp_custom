@@ -80,6 +80,16 @@ func (e *rttEstimator) Sample(rtt time.Duration) {
 	}
 
 	e.rto = e.srtt + 4*e.rttvar
+	// SRTT + 4*RTTVAR is tuned for a path whose RTT variance is genuinely
+	// measurable. On a jittery last-mile link RTTVAR often stays tiny next to
+	// SRTT, so the computed RTO sits a fraction of a millisecond above SRTT and
+	// ordinary jitter fires a timeout that is not loss at all. Hold the RTO at
+	// least 50% past the smoothed RTT; the x1.5 retry ladder still backs off from
+	// whatever that turns out to be, and on a 1 ms LAN this only moves the RTO to
+	// 1.5 ms.
+	if e.rto < e.srtt*3/2 {
+		e.rto = e.srtt * 3 / 2
+	}
 	if e.rto < e.minRTT {
 		e.rto = e.minRTT
 	}

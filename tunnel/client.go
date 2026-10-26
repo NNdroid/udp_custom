@@ -704,9 +704,8 @@ func (c *Client) dispatch(frame *UDPCFrame) {
 		sess.touch()
 	case CMD_PING:
 		sess.touch()
-		if sess.flow != nil {
-			sess.sendACK(sess.currentAck())
-		}
+		// The PONG carries the same cumulative Ack, so a standalone ACK here was
+		// always a redundant second datagram for the same information.
 		pong := &UDPCFrame{Magic: c.magic, Version: UDPC_VERSION, Cmd: CMD_PONG, SessionID: sess.sid, Ack: sess.currentAck()}
 		sess.sendControl(pong, c.dialer.Send)
 	case CMD_PONG:
@@ -1039,6 +1038,10 @@ type clientSession struct {
 
 	rttEst *rttEstimator
 
+	// ackCoalesce suppresses standalone ACK/SACK datagrams that add no
+	// information. Owns its own mutex; the session is never copied.
+	ackCoalesce ackCoalescer
+
 	// fecSend/fecRecv exist only after authenticated capability negotiation.
 	// Parity is best-effort; the existing DATA retransmit queue remains the
 	// reliability fallback when a block cannot be reconstructed.
@@ -1322,11 +1325,19 @@ func (s *clientSession) handleAck(ackSeq uint64) {
 		s.rttEst.Sample(time.Since(pkt.firstSent))
 	}
 	acknowledged := 0
+	srtt := s.rttEst.SRTT()
 	// Delete the ACKed prefix forward from the watermark (seqs are contiguous
-	// by construction — see the server-side comment for the hole fallback).
+	// by construction — see the server-side comment for the hole fallback). The
+	// first retransmitted frame this ACK covers may also prove an earlier RTO was
+	// spurious; that retraction has to land before acknowledged() below so the
+	// restored window is what grows, not the halved one.
+	spurious := false
 	for seq := s.lowestOutstanding; seq <= ackSeq; seq++ {
 		if pkt, ok := s.unacked[seq]; ok && s.fecSend != nil {
 			s.fecSend.observeAck(pkt.retries > 0)
+		}
+		if pkt, ok := s.unacked[seq]; ok && !spurious && s.flow != nil {
+			spurious = s.flow.undoIfSpurious(pkt, srtt)
 		}
 		if s.unacked[seq] != nil {
 			acknowledged++
@@ -1382,6 +1393,14 @@ func (s *clientSession) retransmitLoop() {
 		}
 		if probe {
 			s.sendControl(&UDPCFrame{Magic: s.client.magic, Version: UDPC_VERSION, Cmd: CMD_PING, SessionID: s.sid, Ack: s.currentAck()}, s.client.dialer.Send)
+		}
+		// A deferred ACK is held no longer than the peer's own suppression
+		// window, which is below the peer's RTO by construction.
+		if w := s.flushACK(); w > 0 && w < delay {
+			delay = w
+		}
+		if delay < time.Millisecond {
+			delay = time.Millisecond
 		}
 		timer.Reset(delay)
 		s.mu.Lock()
@@ -1454,7 +1473,7 @@ func (s *clientSession) handleData(frame *UDPCFrame) bool {
 			// Already delivered: the server is retransmitting because it lost
 			// our ACK, so re-ACK instead of dropping it.
 			s.recvMu.Unlock()
-			s.sendACK(expected - 1)
+			s.acknowledgeDelivered(expected - 1)
 			return true
 		}
 		if _, dup := s.recvQueue[frame.Seq]; dup {
@@ -1508,34 +1527,101 @@ func (s *clientSession) handleData(frame *UDPCFrame) bool {
 
 	// Ack the highest contiguous sequence delivered. Sent outside recvMu so a
 	// slow sendto cannot block the other spread sockets' intake.
-	s.sendACK(expected + uint64(len(run)) - 1)
+	s.acknowledgeDelivered(expected + uint64(len(run)) - 1)
 	return true
 }
 
-// sendACK acknowledges everything up to ackSeq. Sent once per delivered frame
+// acknowledgeDelivered ACKs ackSeq and then emits whatever the coalescer
+// deferred, so a delivery never leaves an ACK sitting until the retransmit
+// loop's next timer. That immediate flush is what makes the suppression window
+// safe for tests and for sessions whose loop is busy elsewhere.
+func (s *clientSession) acknowledgeDelivered(ackSeq uint64) {
+	s.sendACK(ackSeq)
+	s.flushACK()
+}
+
+// sendACK acknowledges everything up to ackSeq. Called once per delivered frame
 // and again whenever a duplicate shows up (its original ACK was lost), so the
-// server can stop retransmitting. Control frames ride the pooled send buffer.
+// server can stop retransmitting — but only when it has something the server has
+// not already learned, and never faster than ackCoalesceInterval apart. That is
+// what used to be one control datagram per received DATA record.
 func (s *clientSession) sendACK(ackSeq uint64) {
 	if s.isClosed() {
 		return
 	}
+	iv := ackCoalesceInterval(s.ackSRTT())
+	ack, urgent := ackSeq, false
 	if s.flow != nil && s.delivery != nil {
-		ack, bitmap, credit := s.delivery.snapshot()
-		f := &UDPCFrame{Magic: s.client.magic, Version: UDPC_VERSION, Cmd: CMD_SACK, SessionID: s.sid, Ack: ack, Data: encodeSACK(credit, bitmap[0], bitmap[1:]...)}
-		s.sendControl(f, s.client.dialer.Send)
+		var bitmap [8]uint64
+		ack, bitmap, _ = s.delivery.snapshot()
+		// A gap is the one piece of feedback that triggers the sender's fast
+		// repair, so it is never worth deferring for coalescing savings.
+		urgent = sackGaps(bitmap) >= ackGapUrgent
+	}
+	// Deferring is only safe when the retransmit loop exists to flush the
+	// advance inside the window. A session with no loop would hold an ACK until
+	// the peer timed out, so those bypass the window outright.
+	urgent = urgent || s.retryWake == nil
+	if !s.ackCoalesce.claim(ack, iv, urgent) {
+		// Deferred: wake the retransmit loop so it caps its sleep on the
+		// suppression window instead of holding this past the peer's RTO.
+		notifyRetry(s.retryWake)
 		return
 	}
-	ack := &UDPCFrame{
-		Magic: s.client.magic, Version: UDPC_VERSION, Cmd: CMD_ACK,
-		SessionID: s.sid, Ack: ackSeq, WindowSize: 65535,
+	s.emitFeedback(ack)
+}
+
+// flushACK emits an advance sendACK deferred into the suppression window and
+// returns how long until the next deferred advance may go out. The retransmit
+// loop caps its sleep on that value; no separate timer is needed.
+func (s *clientSession) flushACK() time.Duration {
+	if s.isClosed() {
+		return 0
 	}
-	s.sendControl(ack, s.client.dialer.Send)
+	ack, wait := s.ackCoalesce.flushDue(ackCoalesceInterval(s.ackSRTT()))
+	if ack != 0 {
+		s.emitFeedback(ack)
+	}
+	return wait
+}
+
+// ackSRTT tolerates a session built without an estimator (bare tests).
+func (s *clientSession) ackSRTT() time.Duration {
+	if s.rttEst == nil {
+		return 0
+	}
+	return s.rttEst.SRTT()
+}
+
+// emitFeedback sends one feedback datagram carrying the cumulative Ack ackSeq,
+// or one SACK when ARQ is negotiated, with no gating. Only sendACK and flushACK
+// reach it, so every datagram leaving here was explicitly authorised first.
+// sendControl records the value once the write succeeds; a failed write leaves
+// the claim uncommitted so a later delivery re-sends the same advance.
+func (s *clientSession) emitFeedback(ackSeq uint64) {
+	f := s.feedbackFrame(ackSeq)
+	s.sendControl(f, s.client.dialer.Send)
+}
+
+// feedbackFrame builds the record a claim authorises: a SACK when ARQ is
+// negotiated, in which case the snapshot's own cumulative Ack replaces ackSeq
+// because the bitmap is relative to it.
+func (s *clientSession) feedbackFrame(ackSeq uint64) *UDPCFrame {
+	if s.flow != nil && s.delivery != nil {
+		ack, bitmap, credit := s.delivery.snapshot()
+		return &UDPCFrame{Magic: s.client.magic, Version: UDPC_VERSION, Cmd: CMD_SACK, SessionID: s.sid, Ack: ack, Data: encodeSACK(credit, bitmap[0], bitmap[1:]...)}
+	}
+	return &UDPCFrame{Magic: s.client.magic, Version: UDPC_VERSION, Cmd: CMD_ACK, SessionID: s.sid, Ack: ackSeq, WindowSize: 65535}
 }
 
 // sendControl seals a control frame into a POOLED buffer and
 // hands it to send. The buffer returns to the pool before this call returns —
 // send must consume the bytes synchronously. Returns false when the session
 // lacks record protection or the packet-number space is exhausted.
+//
+// The frame's cumulative Ack is committed to the coalescer only after the write
+// succeeds, because committing a value that never reached the peer would
+// suppress the standalone ACK the peer still needs.
 func (s *clientSession) sendControl(f *UDPCFrame, send func([]byte) error) bool {
 	s.applyFECFeedback(f)
 	f.PacketNo = s.sendPacketNo.Add(1)
@@ -1552,10 +1638,15 @@ func (s *clientSession) sendControl(f *UDPCFrame, send func([]byte) error) bool 
 	if len(wire) == 0 {
 		return false
 	}
-	if err := send(wire); err != nil && !s.isClosed() {
+	err := send(wire)
+	sent := err == nil
+	if err != nil && !s.isClosed() {
 		s.client.logWarn("[Client] [Session 0x%08X] ❌ send control failed: %v", s.sid, err)
 	}
 	putFireAndForgetBuf(wire)
+	if sent {
+		s.ackCoalesce.commitSent(f.Ack)
+	}
 	return true
 }
 
@@ -1569,6 +1660,9 @@ func (s *clientSession) currentAck() uint64 {
 	return 0
 }
 
+// reackDuplicateData re-ACKs a duplicate, which proves our original ACK was
+// lost. sendACK rate-limits it to one datagram per suppression window, so a
+// burst of duplicates costs one control datagram instead of one each.
 func (s *clientSession) reackDuplicateData() {
 	if ack := s.currentAck(); ack > 0 {
 		s.sendACK(ack)

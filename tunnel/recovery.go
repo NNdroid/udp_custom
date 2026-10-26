@@ -22,11 +22,14 @@ type sendFlow struct {
 	ssthresh          int
 	growth            int
 	lastLoss          time.Time
-	feedbackNo        uint64
-	lastProbe         time.Time
-	fastRepairs       int
-	paceMu            sync.Mutex
-	nextSend          time.Time
+	// Window size before the most recent undoable loss() halving. Non-zero means
+	// undoLoss can revert that event.
+	lastLossCut int
+	feedbackNo  uint64
+	lastProbe   time.Time
+	fastRepairs int
+	paceMu      sync.Mutex
+	nextSend    time.Time
 }
 
 // initialCwnd is the flight size a fresh session starts with. It used to be 64
@@ -59,7 +62,12 @@ func (f *sendFlow) acknowledged(n int) {
 	}
 }
 
-func (f *sendFlow) loss(now time.Time, rtt time.Duration) {
+// loss halves the window once per RTT. undoable marks a cut made on the evidence
+// of an RTO firing, which is later proven wrong by undoLoss when the ACK turns
+// out to have predated the retransmit: the timeout was jitter, not loss. SACK
+// gaps are not marked, because three later admissions are stronger evidence than
+// a bare timeout.
+func (f *sendFlow) loss(now time.Time, rtt time.Duration, undoable bool) {
 	if rtt < 10*time.Millisecond {
 		rtt = 10 * time.Millisecond
 	}
@@ -67,9 +75,49 @@ func (f *sendFlow) loss(now time.Time, rtt time.Duration) {
 		return
 	}
 	f.lastLoss = now
+	if undoable && f.cwnd > f.lastLossCut {
+		f.lastLossCut = f.cwnd
+	}
 	f.ssthresh = max(2, f.cwnd/2)
 	f.cwnd = min(f.max, f.ssthresh)
 	f.growth = 0
+}
+
+// undoLoss reverts the most recent undoable halving. A retransmit whose ACK
+// lands inside one SRTT of the retransmit cannot have been answered by that
+// retransmit, so the timeout that produced it was spurious. Without this, a
+// jittery path whose RTO barely clears its own RTT halves the window on nearly
+// every window of traffic and the session never climbs out of collapse.
+//
+// ssthresh is deliberately left at the halved value: the window is restored to
+// where it was, but the flow stays in congestion avoidance, so the next genuine
+// loss still halves once.
+func (f *sendFlow) undoLoss() bool {
+	cut := f.lastLossCut
+	f.lastLossCut = 0
+	if cut <= f.cwnd {
+		return false
+	}
+	f.cwnd = min(f.max, cut)
+	f.growth = 0
+	return true
+}
+
+// undoIfSpurious retracts the last undoable halving when this ACK proves the
+// RTO that caused it was noise: the ACK landed inside one smoothed RTT of the
+// packet's most recent send, so it cannot be that send's answer. An earlier copy
+// of the same frame got through, which means the timeout was jitter.
+//
+// Returns true only if it actually reverted a halving, so a caller undoing at
+// most one event per ACK can stop looking.
+func (f *sendFlow) undoIfSpurious(p *unackedPkt, srtt time.Duration) bool {
+	if p == nil || p.retries == 0 || srtt <= 0 {
+		return false
+	}
+	if time.Since(p.sentTime) >= srtt {
+		return false
+	}
+	return f.undoLoss()
 }
 
 // Pace a small burst rather than creating one timer per datagram. All DATA,
@@ -164,7 +212,7 @@ func updateSACK(flow *sendFlow, outstanding map[uint64]*unackedPkt, f *UDPCFrame
 	// 15-retry budget at the guard cadence and abandon a live path in seconds.
 	p.rto = min(p.rto*3/2, rttMaxRTO)
 	flow.fastRepairs++
-	flow.loss(now, rtt)
+	flow.loss(now, rtt, false)
 	return p.wire, true
 }
 
@@ -237,7 +285,10 @@ func retryDue(outstanding map[uint64]*unackedPkt, now time.Time, maximumRTO time
 		wires = append(wires, p.wire)
 	}
 	if len(wires) > 0 && flow != nil {
-		flow.loss(now, rtt)
+		// An RTO firing is weak evidence: on a path whose RTO only barely clears
+		// its own RTT the timeout is usually jitter. Mark the cut undoable so
+		// handleAck can retract it once it proves the ACK predated the retransmit.
+		flow.loss(now, rtt, true)
 	}
 	return wires, false, max(time.Millisecond, next), probe && len(outstanding) > 0
 }

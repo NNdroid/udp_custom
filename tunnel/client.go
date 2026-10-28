@@ -359,8 +359,8 @@ func (c *Client) logError(format string, args ...any) {
 // of yielding a negative buffer size.
 func (c *Client) maxPayload() int { return effectivePayloadCap(c.maxPkt) }
 
-// maxPayload is the session's frame budget: the MTU probe converged it before
-// the pump started and it never changes for the session's lifetime.
+// maxPayload is the session's frame budget: the MTU probe converged it after
+// the handshake, and the idle re-probe keeps adjusting it as the path changes.
 func (s *clientSession) maxPayload() int {
 	cap := effectivePayloadCap(int(s.sendCap.Load()))
 	if s.fecSend != nil {
@@ -1106,11 +1106,11 @@ type clientSession struct {
 
 	// sendCap is the largest record this session may put on the wire. The MTU
 	// probe converges it right after the handshake and an idle re-probe may
-	// later LOWER it when the path degrades (a retransmission reuses its exact
-	// encoded bytes, so a lower cap only ever protects future frames — it is
-	// therefore applied with a shrink-only compare-and-swap and never raised
-	// under traffic). Written on the probe goroutines, read on every send.
-	// Zero = the ceiling (bare-literal sessions in tests).
+	// later LOWER it when the path degrades or raise it back when the path
+	// heals (a retransmission reuses its exact encoded bytes, so a changed cap
+	// only ever affects frames that are not yet encoded — every frame reads
+	// the cap once at encode time). Written on the probe goroutines, read on
+	// every send. Zero = the ceiling (bare-literal sessions in tests).
 	sendCap atomic.Int32
 
 	// probeReply receives the COPY of an MTU probe echo handed over by

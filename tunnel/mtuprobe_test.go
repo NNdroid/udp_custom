@@ -490,7 +490,7 @@ func TestLowerSendCapIsShrinkOnly(t *testing.T) {
 	if got := int(sess.sendCap.Load()); got != 1000 {
 		t.Fatalf("after second shrink sendCap = %d, want 1000", got)
 	}
-	// Raises are refused: only the setup path may grow the cap.
+	// Raises are refused: only raiseSendCap grows the cap.
 	sess.lowerSendCap(1400)
 	sess.lowerSendCap(9999)
 	if got := int(sess.sendCap.Load()); got != 1000 {
@@ -500,5 +500,175 @@ func TestLowerSendCapIsShrinkOnly(t *testing.T) {
 	sess.lowerSendCap(1000)
 	if got := int(sess.sendCap.Load()); got != 1000 {
 		t.Fatalf("after equal sendCap = %d, want 1000", got)
+	}
+}
+
+func TestRaiseSendCapIsGrowOnly(t *testing.T) {
+	sess := &clientSession{}
+	sess.sendCap.Store(800)
+
+	sess.raiseSendCap(1200)
+	if got := int(sess.sendCap.Load()); got != 1200 {
+		t.Fatalf("after raise sendCap = %d, want 1200", got)
+	}
+	// Shrinks are refused: only lowerSendCap shrinks the cap. (The ceiling is
+	// the caller's job — tryRaiseOneRung only ever offers verified ladder
+	// rungs at or below max_pkt.)
+	sess.raiseSendCap(1000)
+	if got := int(sess.sendCap.Load()); got != 1200 {
+		t.Fatalf("after refused shrink sendCap = %d, want 1200", got)
+	}
+	// Equal is a no-op.
+	sess.raiseSendCap(1200)
+	if got := int(sess.sendCap.Load()); got != 1200 {
+		t.Fatalf("after equal sendCap = %d, want 1200", got)
+	}
+}
+
+// TestLargestRungBelowAndNextRungAbove pin the ladder-navigation helpers the
+// idle re-probe walks with. The ladder is DESCENDING, and the old inline
+// loops broke on the first entry at-or-above the current size — finding
+// nothing below and slamming the session straight to the floor.
+func TestLargestRungBelowAndNextRungAbove(t *testing.T) {
+	ladder := mtuLadderFor(UDPC_MAX_PKT) // 1450 1392 1200 1000 800 548
+
+	cases := []struct {
+		cur, below, above int
+	}{
+		{1450, 1392, 0}, // ceiling rung: nothing above
+		{1392, 1200, 1450},
+		{1300, 1200, 1392}, // between rungs
+		{1200, 1000, 1392},
+		{1000, 800, 1200},
+		{801, 800, 1000},
+		{800, 548, 1000},
+		{548, 0, 800}, // floor rung: nothing below
+		{400, 0, 548},
+	}
+	for _, tc := range cases {
+		if got := largestRungBelow(ladder, tc.cur); got != tc.below {
+			t.Fatalf("largestRungBelow(ladder, %d) = %d, want %d", tc.cur, got, tc.below)
+		}
+		if got := nextLadderRungAbove(ladder, tc.cur); got != tc.above {
+			t.Fatalf("nextLadderRungAbove(ladder, %d) = %d, want %d", tc.cur, got, tc.above)
+		}
+	}
+}
+
+// backdateIdle makes the rig's session look quiet so reprobeIdleTick's
+// idle gate lets the probe through.
+func backdateIdle(t *testing.T, sess *clientSession) {
+	t.Helper()
+	stale := time.Now().Add(-mtuReprobeInterval)
+	sess.mu.Lock()
+	sess.lastActive = stale
+	sess.lastSent = stale
+	sess.mu.Unlock()
+}
+
+// A path that degrades from 1450-capable to 1000-capable must converge one
+// rung down, not slam to the never-fragment floor: the old walk-down loop
+// broke on the first ladder entry at-or-above the current cap, found nothing
+// below it, and dropped every session straight to 548.
+func TestReprobeIdleTickWalksDownOneRung(t *testing.T) {
+	withFastProbing(t)
+	pk := newProberKeyPair(t)
+	fake := newFakeProbeServer(t, pk.server)
+	fake.maxRecord.Store(1000) // 1450/1392/1200 unanswered, 1000 answers
+
+	cli, sess := newProberRig(t, fake, pk)
+	backdateIdle(t, sess)
+	sess.sendCap.Store(1450)
+
+	sess.reprobeIdleTick(mtuLadderFor(cli.maxPkt))
+
+	if got := int(sess.sendCap.Load()); got != 1000 {
+		t.Fatalf("after re-probe sendCap = %d, want 1000 (the largest answered rung)", got)
+	}
+	if commits := fake.waitForCommit(1000, time.Second); commits == nil {
+		t.Fatal("the shrunken cap was never committed to the server")
+	}
+}
+
+// A cap lowered by a transient loss burst must recover once the path heals:
+// an idle tick at the floor (the no-answer fallback) probes one rung up and,
+// when it round-trips, raises the cap and republishes it.
+func TestReprobeIdleTickRecoversFromFloor(t *testing.T) {
+	withFastProbing(t)
+	pk := newProberKeyPair(t)
+	fake := newFakeProbeServer(t, pk.server)
+	fake.maxRecord.Store(1450) // everything answers
+
+	cli, sess := newProberRig(t, fake, pk)
+	backdateIdle(t, sess)
+	// Simulate a session stranded at the floor by a blackout at setup time.
+	sess.sendCap.Store(int32(mtuProbeFloor))
+
+	sess.reprobeIdleTick(mtuLadderFor(cli.maxPkt))
+
+	// One rung per tick: 548 -> 800, committed so the server can follow.
+	if got := int(sess.sendCap.Load()); got != 800 {
+		t.Fatalf("after recovery tick sendCap = %d, want 800 (one rung up)", got)
+	}
+	if commits := fake.waitForCommit(800, time.Second); commits == nil {
+		t.Fatal("the raised cap was never committed to the server")
+	}
+}
+
+// A mid-session shrink is not permanent either: after dropping to 1000 the
+// next idle tick re-verifies the current size and climbs one rung back.
+func TestReprobeIdleTickClimbsAfterShrink(t *testing.T) {
+	withFastProbing(t)
+	pk := newProberKeyPair(t)
+	fake := newFakeProbeServer(t, pk.server)
+	fake.maxRecord.Store(1392) // 1450 fails, everything at or below 1392 works
+
+	cli, sess := newProberRig(t, fake, pk)
+	backdateIdle(t, sess)
+	sess.sendCap.Store(1000)
+
+	sess.reprobeIdleTick(mtuLadderFor(cli.maxPkt))
+
+	if got := int(sess.sendCap.Load()); got != 1200 {
+		t.Fatalf("after climb tick sendCap = %d, want 1200 (one rung up)", got)
+	}
+}
+
+// An idle re-probe must never raise past a size the path cannot carry.
+func TestReprobeIdleTickNeverRaisesAbovePath(t *testing.T) {
+	withFastProbing(t)
+	pk := newProberKeyPair(t)
+	fake := newFakeProbeServer(t, pk.server)
+	fake.maxRecord.Store(1000)
+
+	cli, sess := newProberRig(t, fake, pk)
+	backdateIdle(t, sess)
+	sess.sendCap.Store(1000)
+
+	sess.reprobeIdleTick(mtuLadderFor(cli.maxPkt))
+
+	if got := int(sess.sendCap.Load()); got != 1000 {
+		t.Fatalf("after tick sendCap = %d, want unchanged 1000 (1200 probe failed)", got)
+	}
+}
+
+// The probe must ignore the DIAL context: a DialTunnel caller whose context
+// covers only the dial (WithTimeout + defer cancel) cancels it right after
+// establishment, and without WithoutCancel every rung would fail and strand
+// the session at the no-answer floor for its whole lifetime.
+func TestConvergeFrameBudgetIgnoresCancelledDialContext(t *testing.T) {
+	withFastProbing(t)
+	pk := newProberKeyPair(t)
+	fake := newFakeProbeServer(t, pk.server)
+	fake.maxRecord.Store(1200)
+
+	cli, sess := newProberRig(t, fake, pk)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	cli.convergeFrameBudget(ctx, sess)
+
+	if got := int(sess.sendCap.Load()); got != 1200 {
+		t.Fatalf("session sendCap = %d, want 1200 (probe must survive a cancelled dial ctx)", got)
 	}
 }

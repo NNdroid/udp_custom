@@ -212,3 +212,38 @@ this design means both ends must be upgraded together for it to take effect.
 All four were resolved as recommended above; implemented per the §11 checklist.
 The change touches the wire protocol, so both ends (including myssh pulling the
 new tag) must upgrade together.
+
+---
+
+## 13. Addendum (2026-10-28 audit): the doc above predates the live behavior
+
+§1/§5's "cap is immutable within a session" is no longer true and the sections
+below describe the CURRENT algorithm (`tunnel/mtuprobe.go`):
+
+- **The cap is converged in the background.** `establish` starts the pumps at
+  the never-fragment floor immediately and `convergeFrameBudget` walks the
+  ladder concurrently; the floor is committed BEFORE the ladder so the server's
+  upstream gate opens at the first round trip instead of `mtuCommitWait`.
+- **Mid-session idle re-probe** (`reprobeIdle`, every 30 s while quiet):
+  verifies the current cap, shrinks it (commit included) when the size stops
+  round-tripping, and raises it one verified rung at a time when the path
+  heals. Both directions use per-record compare-and-swap on the cap; frames
+  already encoded keep their bytes, so resize is always safe.
+- **2026-10-28 audit fixes** (all regression-tested):
+  1. *Walk-down found nothing*: the idle re-probe's "next rung below" loop
+     broke on the first ladder entry at-or-above the current cap — the ladder
+     is descending, so it always yielded 0 and slammed the session straight to
+     the 548-byte floor instead of the largest still-working rung. Fixed via
+     `largestRungBelow`.
+  2. *Dial-context cancellation stranded sessions at the floor*: the probe
+     inherited the `DialTunnel` context, and the common WithTimeout+defer-cancel
+     pattern cancelled it right after establishment — every rung failed and
+     the session stayed at the no-answer fallback forever. The probe now runs
+     under `context.WithoutCancel` and aborts on `sess.closeChan` instead.
+  3. *No-answer fallback was permanent*: a session whose setup probe hit a
+     total blackout stayed at 548-byte records for its whole lifetime because
+     the idle re-probe skipped the floor. The re-probe now tries one verified
+     rung up per tick (`raiseSendCap` + commit), so the cap recovers.
+  4. *Stale echoes wasted probe attempts*: a late echo from a previous attempt
+     was handed to the next probe's channel and failed it; mismatched echoes
+     are now ignored while the deadline still bounds the wait.

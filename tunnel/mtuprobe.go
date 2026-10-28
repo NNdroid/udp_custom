@@ -191,8 +191,16 @@ func mtuStartCap(maxPkt int, probe bool) int {
 // path can carry. It runs AFTER the handshake, CONCURRENTLY with the DATA
 // pumps: the session already sends at the floor, so the cap only ever RAISES
 // here. Raising is safe under traffic (frames not yet encoded simply get more
-// room); the idle re-probe is the only path that may LOWER it.
+// room); the idle re-probe may also lower it, and raise it back the same way.
 func (c *Client) convergeFrameBudget(ctx context.Context, sess *clientSession) {
+	// The dial context must not reach the probe: a DialTunnel caller whose
+	// context covers only the dial (the usual WithTimeout+defer-cancel
+	// pattern) would cancel it right after establishment, fail every rung,
+	// and strand the session at the no-answer floor for its whole lifetime.
+	// The probe's lifetime is the SESSION's, so only sess.closeChan may abort
+	// it (see probeOnce).
+	ctx = context.WithoutCancel(ctx)
+
 	if !mtuProbeEnabled(c.cfg.MtuProbe) {
 		// Probing disabled means the operator pinned the cap. Publish it right
 		// away so the server does not spend its mtuCommitWait budget guessing:
@@ -254,8 +262,9 @@ func clampMtuCap(n, maxPkt int) int {
 // lowerSendCap applies a shrunken record cap. It is used only by the idle
 // re-probe, which is the one caller that may observe the path degrading after
 // traffic has already started: a shrink can never strand an in-flight frame
-// (its bytes were already sized by the larger cap), while a raise must not
-// happen here, because it would race the pump loops.
+// (its bytes were already sized by the larger cap). The raise direction is
+// raiseSendCap below, which the same idle re-probe uses to recover a cap that
+// was lowered by a transient loss burst.
 func (s *clientSession) lowerSendCap(n int) {
 	for {
 		cur := int(s.sendCap.Load())
@@ -268,14 +277,35 @@ func (s *clientSession) lowerSendCap(n int) {
 	}
 }
 
+// raiseSendCap grows the record cap back. The idle re-probe uses it to recover
+// from a shrink: the new size must have just round-tripped (a verified probe),
+// which is the same evidence the setup probe requires, and the pump loops read
+// the cap per record, so growing it only gives not-yet-encoded frames more
+// room — exactly the safety argument that lets the setup probe raise the cap
+// under live traffic.
+func (s *clientSession) raiseSendCap(n int) {
+	for {
+		cur := int(s.sendCap.Load())
+		if n <= cur {
+			return
+		}
+		if s.sendCap.CompareAndSwap(int32(cur), int32(n)) {
+			return
+		}
+	}
+}
+
 // reprobeIdle re-checks the path's record capacity while the session sits
 // idle. It probes only the current cap, so an active flow is never perturbed,
-// and it only ever shrinks the cap (see lowerSendCap).
+// and it may shrink the cap when the current size stops round-tripping — or
+// raise it back one rung at a time when a previously unreachable size starts
+// working again (a shrink from a transient loss burst must not be permanent).
 func (s *clientSession) reprobeIdle() {
 	c := s.client
 	if !mtuProbeEnabled(c.cfg.MtuProbe) {
 		return
 	}
+	ladder := mtuLadderFor(c.maxPkt)
 	ticker := time.NewTicker(mtuReprobeInterval)
 	defer ticker.Stop()
 	for {
@@ -287,52 +317,101 @@ func (s *clientSession) reprobeIdle() {
 		if s.isClosed() {
 			return
 		}
-		// Probe only when the session has been quiet: an active flow already
-		// tells us the path works, and probing one would just add noise.
-		if time.Since(s.lastActivity()) < mtuReprobeInterval/2 {
-			continue
-		}
-		cur := int(s.sendCap.Load())
-		if cur <= mtuInitialCap(c.maxPkt) {
-			continue // already at the floor: nothing to lose
-		}
+		s.reprobeIdleTick(ladder)
+	}
+}
+
+// reprobeIdleTick runs one idle re-probe cycle. Split from reprobeIdle so the
+// ladder walk is testable without waiting on the 30-second ticker.
+func (s *clientSession) reprobeIdleTick(ladder []int) {
+	c := s.client
+	// Probe only when the session has been quiet: an active flow already
+	// tells us the path works, and probing one would just add noise.
+	if time.Since(s.lastActivity()) < mtuReprobeInterval/2 {
+		return
+	}
+	floor := mtuInitialCap(c.maxPkt)
+	cur := int(s.sendCap.Load())
+	if cur > floor {
 		if probeOnce(context.Background(), s, cur) {
-			continue // still carries its current size
+			// The current size still carries. Opportunistically verify the
+			// next rung up: a cap lowered by a transient loss burst must be
+			// able to recover once the path heals, instead of sticking for
+			// the rest of the session.
+			s.tryRaiseOneRung(ladder, cur)
+			return
 		}
-		// The current size no longer round-trips. Walk down from just below it.
-		below := 0
-		for _, v := range mtuLadderFor(c.maxPkt) {
-			if v < cur {
-				below = v
-			} else {
-				break
-			}
-		}
-		for below > 0 && below > mtuInitialCap(c.maxPkt) {
+		// The current size no longer round-trips. Walk down from the largest
+		// rung STRICTLY below it. (The ladder is descending, so "first entry
+		// below cur" — not "break on the first entry at or above cur", which
+		// would find nothing and slam the session straight to the floor.)
+		below := largestRungBelow(ladder, cur)
+		for below > 0 && below > floor {
 			if probeOnce(context.Background(), s, below) {
 				break
 			}
-			next := 0
-			for _, v := range mtuLadderFor(c.maxPkt) {
-				if v < below {
-					next = v
-				} else {
-					break
-				}
-			}
-			below = next
+			below = largestRungBelow(ladder, below)
 		}
 		target := below
 		if target <= 0 {
-			target = mtuInitialCap(c.maxPkt)
+			target = floor
 		}
 		if target < cur {
 			s.lowerSendCap(target)
 			sendMtuCommit(s, target)
 			c.logWarn("[Client] [Session 0x%08X] 📏 [mtu] idle re-probe: path no longer carries %d-byte records; dropping to %d",
-				s.sid, cur, int(s.sendCap.Load()))
+				s.sid, cur, target)
+		}
+		return
+	}
+	// Already at the floor. The floor may be the no-answer fallback rather
+	// than a verified property of the path, so probe one rung up: a session
+	// that probed during a total blackout recovers instead of being stuck at
+	// 548-byte records forever.
+	s.tryRaiseOneRung(ladder, cur)
+}
+
+// tryRaiseOneRung probes the next ladder rung ABOVE cur and, when it round
+// trips, raises the session cap and republishes it to the server. The probe
+// echo proves BOTH directions can carry the new size, so the commit is as
+// verified as the setup probe's.
+func (s *clientSession) tryRaiseOneRung(ladder []int, cur int) {
+	c := s.client
+	next := nextLadderRungAbove(ladder, cur)
+	if next <= 0 || next > c.maxPkt {
+		return
+	}
+	if !probeOnce(context.Background(), s, next) {
+		return
+	}
+	s.raiseSendCap(next)
+	sendMtuCommit(s, next)
+	c.logInfo("[Client] [Session 0x%08X] 📏 [mtu] idle re-probe: path now carries %d-byte records; raising from %d",
+		s.sid, next, cur)
+}
+
+// largestRungBelow returns the largest ladder entry strictly below cur, or 0
+// when cur is at or below the last rung. The ladder is DESCENDING.
+func largestRungBelow(ladder []int, cur int) int {
+	for _, v := range ladder {
+		if v < cur {
+			return v
 		}
 	}
+	return 0
+}
+
+// nextLadderRungAbove returns the smallest ladder entry strictly above cur,
+// or 0 when cur is at or above the ceiling rung. The ladder is DESCENDING.
+func nextLadderRungAbove(ladder []int, cur int) int {
+	prev := 0
+	for _, v := range ladder {
+		if v <= cur {
+			return prev
+		}
+		prev = v
+	}
+	return prev
 }
 
 // probePath walks the ladder and returns the largest size that survived a
@@ -390,13 +469,26 @@ func probeOnce(ctx context.Context, sess *clientSession, size int) bool {
 
 	deadline := time.NewTimer(time.Duration(mtuProbeTimeout.Load()))
 	defer deadline.Stop()
-	select {
-	case got := <-ch:
-		return len(got) == len(payload) && string(got[:mtuProbeIDSize]) == string(payload[:mtuProbeIDSize])
-	case <-deadline.C:
-		return false
-	case <-ctx.Done():
-		return false
+	for {
+		select {
+		case got := <-ch:
+			// Only an echo of OUR probe counts. Anything else in the channel
+			// is a stale echo from an earlier attempt that outlived its
+			// deadline and was handed to this probe's slot: keep waiting
+			// rather than burning the attempt on it.
+			if len(got) == len(payload) && string(got[:mtuProbeIDSize]) == string(payload[:mtuProbeIDSize]) {
+				return true
+			}
+			continue
+		case <-deadline.C:
+			return false
+		case <-sess.closeChan:
+			// The session died mid-ladder: stop probing a peer that is gone
+			// instead of spending the remaining rungs' worth of timeouts.
+			return false
+		case <-ctx.Done():
+			return false
+		}
 	}
 }
 

@@ -43,6 +43,9 @@ type sendFlow struct {
 	// down to every new minimum and creeps up at 1/64 so a path change is
 	// tracked within a few seconds. Zero until the first sample.
 	minRTT time.Duration
+	// westwood gates the delivery-rate loss discrimination above. When false
+	// every loss takes the classic AIMD halving (pre-Westwood behaviour).
+	westwood bool
 }
 
 const (
@@ -74,12 +77,12 @@ const (
 // which means the extra in-flight frames cost nothing but room in `unacked`.
 const initialCwnd = 256
 
-func newSendFlow(maximum int, automatic bool) *sendFlow {
+func newSendFlow(maximum int, automatic bool, westwood bool) *sendFlow {
 	if automatic {
 		maximum = deliveryWindow
 	}
 	maximum = min(max(maximum, 1), deliveryWindow)
-	return &sendFlow{max: maximum, cwnd: min(initialCwnd, maximum), credit: deliveryWindow, ssthresh: maximum}
+	return &sendFlow{max: maximum, cwnd: min(initialCwnd, maximum), credit: deliveryWindow, ssthresh: maximum, westwood: westwood}
 }
 
 func (f *sendFlow) window() int { return min(f.cwnd, f.credit) }
@@ -171,7 +174,7 @@ func (f *sendFlow) loss(now time.Time, rtt time.Duration, undoable bool) {
 	if undoable && f.cwnd > f.lastLossCut {
 		f.lastLossCut = f.cwnd
 	}
-	if !f.congested(rtt) {
+	if f.westwood && !f.congested(rtt) {
 		if bdp := f.bdp(rtt); bdp >= 2 {
 			f.ssthresh = max(2, min(f.cwnd, bdp))
 			f.cwnd = min(f.max, f.ssthresh)

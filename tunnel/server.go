@@ -71,6 +71,19 @@ type ServerConfig struct {
 	// the corresponding handshake capability bit.
 	FEC *bool `json:"-"`
 
+	// FECExtParity allows the extended FEC parity encoding (deeper RS(8,8)
+	// buckets for deep weak networks). nil (field absent) = enabled: the
+	// server mirrors the client's FLAG_FEC_EXT_PARITY offer back in the ACK.
+	// false refuses the extension and keeps the standard 0-4 parity encoding
+	// even when the client offers it.
+	FECExtParity *bool `json:"-"`
+
+	// Westwood enables the delivery-rate loss discrimination in the recovery
+	// window: random wireless loss (SRTT near its floor) restores the window
+	// to the measured BDP instead of halving it. nil (field absent) = enabled;
+	// false restores classic AIMD halving on every loss.
+	Westwood *bool `json:"-"`
+
 	// PortRange is the UDP port range the firewall DNATs onto ListenAddr. It
 	// is the single source of truth for the client port range: the server
 	// uses it at runtime to validate that every recovered original-destination
@@ -1207,7 +1220,7 @@ func (s *Server) handleHandshake(remoteAddr netip.AddrPort, frame *UDPCFrame, or
 	// client advertised it in the SYN and the server accepts it here (and
 	// echoes it in the ACK below), so neither side ever sends parity m>4 to a
 	// peer that would misparse it as m<=4 with a bogus index.
-	frameKeys.fecExt = fecNegotiated && frame.Flags&FLAG_FEC_EXT_PARITY != 0
+	frameKeys.fecExt = fecNegotiated && fecEnabled(s.cfg.FECExtParity) && frame.Flags&FLAG_FEC_EXT_PARITY != 0
 	frameKeys.recovery = fecEnabled(s.cfg.Recovery) && frame.Flags&FLAG_RECOVERY_CAPABLE != 0
 
 	sess := &ServerSession{
@@ -1229,7 +1242,7 @@ func (s *Server) handleHandshake(remoteAddr netip.AddrPort, frame *UDPCFrame, or
 	}
 	sess.unackedCond = sync.NewCond(&sess.unackedMu)
 	if frameKeys.recovery {
-		sess.flow = newSendFlow(s.sendWindow, s.cfg.SendWindow <= 0)
+		sess.flow = newSendFlow(s.sendWindow, s.cfg.SendWindow <= 0, fecEnabled(s.cfg.Westwood))
 	}
 	if frameKeys.fec {
 		sess.fecRecv = newFECReceiverExt(frameKeys.fecExt)

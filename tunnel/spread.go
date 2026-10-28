@@ -62,8 +62,9 @@ type SpreadDialer struct {
 	fixedPaths int           // chosen remote-port subset size; 0 = whole range
 	// pq scores remote ports from receive-side evidence (server
 	// retransmissions on the mirrored port) and biases selection toward the
-	// healthy ones; nil disables weighting (tests, single-port ranges).
-	pq        *pathQuality
+	// healthy ones; nil disables weighting (tests, single-port ranges, or a
+	// disabled PathQuality config).
+	pq        PathScorer
 	closed    int32
 	closeOnce sync.Once
 	listenUDP UDPListenFunc
@@ -312,6 +313,12 @@ func (d *SpreadDialer) pickPort(idx int) int {
 // PathScorer exposes the receive-driven scorer so the client can feed it
 // outcomes; nil when weighting is disabled.
 func (d *SpreadDialer) PathScorer() PathScorer { return d.pq }
+
+// SetPathScorer replaces (or, with nil, disables) the path-quality weighting.
+// It exists so embedders can turn the built-in scorer off via configuration.
+// Call it BEFORE the first datagram is sent: pickPort reads d.pq on the send
+// path without a lock, so swapping it mid-flight is not safe.
+func (d *SpreadDialer) SetPathScorer(s PathScorer) { d.pq = s }
 
 // sendAtPort performs one datagram write and repairs a permanently failed
 // local socket in-place. The retry uses the SAME destination port: only the

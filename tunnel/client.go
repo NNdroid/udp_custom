@@ -104,6 +104,32 @@ type ClientConfig struct {
 	// advertises support, so mixed-version deployments remain wire-compatible.
 	FEC *bool `json:"-"`
 
+	// PathQuality enables the receive-driven per-port loss scorer that biases
+	// port selection toward healthier remote ports (see pathquality.go).
+	// nil (field absent) = enabled; false spreads uniformly again, which is
+	// the pre-weaknet behaviour and the escape hatch if the weighting ever
+	// misbehaves on an unusual NAT topology.
+	PathQuality *bool `json:"-"`
+
+	// FECExtParity offers FLAG_FEC_EXT_PARITY in the handshake: when both
+	// peers agree, the FEC parity encoding unlocks deeper RS(8,8) buckets for
+	// deep weak networks. nil (field absent) = enabled; false keeps the
+	// standard 0-4 parity encoding (an old server ignores the flag either way,
+	// so the default is safe during a mixed-version rollout).
+	FECExtParity *bool `json:"-"`
+
+	// FECLossMemo carries the previous session's final FEC loss estimate into
+	// the next session (5-minute TTL), so the first blocks after a reconnect
+	// do not have to re-learn the path's loss from scratch. nil (field absent)
+	// = enabled; false starts every session with a clean estimate.
+	FECLossMemo *bool `json:"-"`
+
+	// Westwood enables the delivery-rate loss discrimination in the recovery
+	// window: random wireless loss (SRTT near its floor) restores the window
+	// to the measured BDP instead of halving it. nil (field absent) = enabled;
+	// false restores classic AIMD halving on every loss.
+	Westwood *bool `json:"-"`
+
 	// Logger receives diagnostic output. When nil, the LogLevel string decides
 	// verbosity on the standard logger; an injected Logger wins over LogLevel
 	// entirely. Embedders wanting silence pass Nop.
@@ -266,6 +292,9 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	if !fecEnabled(cfg.PathQuality) {
+		dialer.SetPathScorer(nil)
+	}
 	logger := resolveLogger(cfg.Logger, cfg.LogLevel)
 	maxPkt := resolveMaxPkt(cfg.MaxPkt, logger)
 	logger.Infof("📏 [mtu] %s", describeMaxPkt(maxPkt))
@@ -287,12 +316,21 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		logLevel:    clientLogLevel,
 		maxPkt:      maxPkt,
 		probeCache:  &mtuProbeCache{},
-		fecLossMemo: &fecLossMemo{},
+		fecLossMemo: newClientFECLossMemo(cfg.FECLossMemo),
 		dialer:      dialer,
 		events:      newEventBus[ClientEvent](128),
 		pendingAcks: make(map[[clientNonceSize]byte]*pendingHandshake),
 		closeChan:   make(chan struct{}),
 	}, nil
+}
+
+// newClientFECLossMemo returns the cross-session loss memo, or nil when the
+// operator disabled the cold-start carry-over via FECLossMemo.
+func newClientFECLossMemo(v *bool) *fecLossMemo {
+	if !fecEnabled(v) {
+		return nil
+	}
+	return &fecLossMemo{}
 }
 
 func (c *Client) logDebug(format string, args ...any) {
@@ -774,14 +812,16 @@ func (c *Client) establish(ctx context.Context, target string, conn net.Conn) (*
 	}
 	sess.unackedCond = sync.NewCond(&sess.unackedMu)
 	if frameKeys.recovery {
-		sess.flow = newSendFlow(c.cfg.SendWindow, c.autoWindow)
+		sess.flow = newSendFlow(c.cfg.SendWindow, c.autoWindow, fecEnabled(c.cfg.Westwood))
 	}
 	if frameKeys != nil && frameKeys.fec {
 		sess.fecRecv = newFECReceiverExt(frameKeys.fecExt)
 		sess.fecSend = newFECSenderExt(sess.sendFECParity, frameKeys.fecExt)
-		if v, ok := c.fecLossMemo.get(); ok {
-			sess.fecSend.seedLoss(v)
-			c.logDebug("[Client] [Session 0x%08X] 🧩 FEC seeded from previous session: loss=%.1f%%", sid, v*100)
+		if memo := c.fecLossMemo; memo != nil {
+			if v, ok := memo.get(); ok {
+				sess.fecSend.seedLoss(v)
+				c.logDebug("[Client] [Session 0x%08X] 🧩 FEC seeded from previous session: loss=%.1f%%", sid, v*100)
+			}
 		}
 		c.logInfo("[Client] [Session 0x%08X] 🧩 adaptive Reed-Solomon FEC negotiated", sid)
 	}
@@ -889,7 +929,9 @@ func (c *Client) handshake(ctx context.Context, target string) (uint32, *NoiseSe
 	}
 	if fecEnabled(c.cfg.FEC) {
 		synFlags |= FLAG_FEC_CAPABLE
-		synFlags |= FLAG_FEC_EXT_PARITY
+		if fecEnabled(c.cfg.FECExtParity) {
+			synFlags |= FLAG_FEC_EXT_PARITY
+		}
 	}
 	syn := SealFrameMAC(&UDPCFrame{
 		Magic: c.magic, Version: UDPC_VERSION, Flags: synFlags,
@@ -1135,8 +1177,10 @@ func (s *clientSession) close() {
 		if s.fecSend != nil {
 			// Capture BEFORE close: the estimate is what the next session
 			// should inherit, provided this session saw enough traffic.
-			if v, ok := s.fecSend.memoSnapshot(); ok {
-				s.client.fecLossMemo.put(v)
+			if memo := s.client.fecLossMemo; memo != nil {
+				if v, ok := s.fecSend.memoSnapshot(); ok {
+					memo.put(v)
+				}
 			}
 			s.fecSend.close()
 		}

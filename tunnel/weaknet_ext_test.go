@@ -8,10 +8,29 @@ import (
 // --- ③-2: Westwood delivery-rate restore + delay-gradient discrimination ---
 
 func newTestFlow() *sendFlow {
-	f := newSendFlow(512, false)
+	f := newSendFlow(512, false, true)
 	f.cwnd = 256
 	f.ssthresh = 512
 	return f
+}
+
+// TestSendFlowWestwoodDisabledHalvesAlways covers the westwood=false config
+// gate: with the discrimination turned off even floor-level SRTT loss takes
+// the classic halving, restoring the pre-weaknet behaviour.
+func TestSendFlowWestwoodDisabledHalvesAlways(t *testing.T) {
+	f := newSendFlow(512, false, false)
+	f.cwnd = 256
+	f.ssthresh = 512
+	f.minRTT = 50 * time.Millisecond
+	f.rate = 1000
+	f.rateAt = time.Now()
+
+	// Same setup as TestSendFlowRandomLossRestoresBDP, but Westwood is off:
+	// the BDP restore branch must be skipped and the window plain-halves.
+	f.loss(time.Now(), 50*time.Millisecond, false)
+	if f.cwnd != 128 {
+		t.Fatalf("westwood=off random-loss cwnd = %d, want classic halving 128", f.cwnd)
+	}
 }
 
 func TestSendFlowRandomLossRestoresBDP(t *testing.T) {

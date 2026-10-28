@@ -10,7 +10,7 @@ import (
 func TestSACKRepairsOnlyGapAndRejectsStaleFeedback(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		now := time.Now()
-		flow := newSendFlow(256, false)
+		flow := newSendFlow(256, false, true)
 		out := make(map[uint64]*unackedPkt)
 		for i := uint64(1); i <= 4; i++ {
 			out[i] = &unackedPkt{wire: []byte{byte(i)}, sentTime: now, rto: 200 * time.Millisecond}
@@ -45,7 +45,7 @@ func TestSACKRepairsOnlyGapAndRejectsStaleFeedback(t *testing.T) {
 }
 
 func TestAdaptiveWindowLimitsAndLoss(t *testing.T) {
-	f := newSendFlow(256, true)
+	f := newSendFlow(256, true, true)
 	for i := 0; i < 32; i++ {
 		f.acknowledged(64)
 	}
@@ -60,7 +60,7 @@ func TestAdaptiveWindowLimitsAndLoss(t *testing.T) {
 	if f.window() != 0 {
 		t.Fatal("zero receive credit ignored")
 	}
-	f = newSendFlow(16, false)
+	f = newSendFlow(16, false, true)
 	f.acknowledged(1000)
 	if f.cwnd != 16 {
 		t.Fatal("explicit cap ignored")
@@ -68,7 +68,7 @@ func TestAdaptiveWindowLimitsAndLoss(t *testing.T) {
 }
 
 func TestUndoLossRetractsSpuriousTimeout(t *testing.T) {
-	f := newSendFlow(deliveryWindow, true)
+	f := newSendFlow(deliveryWindow, true, true)
 	for i := 0; i < 32; i++ {
 		f.acknowledged(64)
 	}
@@ -117,7 +117,7 @@ func TestUndoLossRetractsSpuriousTimeout(t *testing.T) {
 }
 
 func TestSACKCoversFullReceiveWindowAndLostCreditUpdate(t *testing.T) {
-	f := newSendFlow(256, true)
+	f := newSendFlow(256, true, true)
 	out := map[uint64]*unackedPkt{512: {wire: []byte("last")}}
 	frame := &UDPCFrame{PacketNo: 1, Data: encodeSACK(1, 0, 0, 0, 0, 0, 0, 0, uint64(1)<<63)}
 	if _, valid := updateSACK(f, out, frame, 512, 0); !valid || !out[512].sacked {
@@ -142,7 +142,7 @@ func TestSACKMalformedFeedbackDoesNotChangeSender(t *testing.T) {
 		{PacketNo: 1, Data: encodeSACK(100, 1<<4)},
 		{PacketNo: 1, Data: encodeSACK(deliveryWindow+1, 0)},
 	} {
-		f := newSendFlow(256, true)
+		f := newSendFlow(256, true, true)
 		out := map[uint64]*unackedPkt{1: {wire: []byte("retained")}}
 		if _, valid := updateSACK(f, out, frame, 4, 0); valid {
 			t.Fatal("accepted malformed feedback")

@@ -102,6 +102,26 @@ type Config struct {
 	// Recovery enables negotiated selective ACK, adaptive window and pacing.
 	// Absent = enabled. False retains the legacy cumulative-ACK wire behavior.
 	Recovery *bool `json:"recovery,omitempty"`
+
+	// PathQuality is client-only: enables the receive-driven per-port loss
+	// scorer that biases port selection toward healthier remote ports.
+	// Absent = enabled; set false to spread uniformly (pre-weaknet behaviour).
+	PathQuality *bool `json:"path_quality,omitempty"`
+	// FECExtParity offers/allows the extended FEC parity encoding (deeper
+	// RS(8,8) buckets for deep weak networks). Absent = enabled on both ends;
+	// set false on the client to stop offering it, on the server to refuse it
+	// even when offered. Either side refusing falls back to the standard
+	// 0-4 parity encoding.
+	FECExtParity *bool `json:"fec_ext_parity,omitempty"`
+	// FECLossMemo is client-only: carries the previous session's final FEC
+	// loss estimate into the next session (5-minute TTL) so reconnects do not
+	// re-learn the path's loss from scratch. Absent = enabled.
+	FECLossMemo *bool `json:"fec_loss_memo,omitempty"`
+	// Westwood enables delivery-rate loss discrimination in the recovery
+	// window: random wireless loss restores the window to the measured BDP
+	// instead of halving it. Absent = enabled on both ends; set false to
+	// restore classic AIMD halving on every loss.
+	Westwood *bool `json:"westwood,omitempty"`
 }
 
 func (c *Config) UnmarshalJSON(data []byte) error {
@@ -231,6 +251,11 @@ func runClientMode(cfg *Config, magicStr, lvl string, sendWindow int) {
 		MtuProbe:   cfg.MtuProbe,
 		FEC:        cfg.FEC,
 		Recovery:   cfg.Recovery,
+
+		PathQuality:  cfg.PathQuality,
+		FECExtParity: cfg.FECExtParity,
+		FECLossMemo:  cfg.FECLossMemo,
+		Westwood:     cfg.Westwood,
 	}
 
 	// Optional Noise_NK encryption, keyed by the server's static public key.
@@ -327,6 +352,8 @@ func runFromConfig(path string) {
 		MtuProbe:       cfg.MtuProbe,
 		FEC:            cfg.FEC,
 		Recovery:       cfg.Recovery,
+		FECExtParity:   cfg.FECExtParity,
+		Westwood:       cfg.Westwood,
 	}
 
 	srv, err := tunnel.NewServer(srvCfg)

@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -141,6 +142,11 @@ type Client struct {
 	// probeCache memoizes the MTU probe result for the server's path, so only
 	// the first session (or the first after the TTL) pays for the ladder walk.
 	probeCache *mtuProbeCache
+
+	// fecLossMemo carries the last session's FEC loss estimate into the next
+	// one, so a reconnect on a lossy path starts emitting parity immediately
+	// instead of spending its first seconds in pure retransmission mode.
+	fecLossMemo *fecLossMemo
 
 	// events delivers ClientEvent notifications to the embedder's handler on
 	// a dedicated goroutine (never on the receive path). nil bus = no events.
@@ -281,6 +287,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		logLevel:    clientLogLevel,
 		maxPkt:      maxPkt,
 		probeCache:  &mtuProbeCache{},
+		fecLossMemo: &fecLossMemo{},
 		dialer:      dialer,
 		events:      newEventBus[ClientEvent](128),
 		pendingAcks: make(map[[clientNonceSize]byte]*pendingHandshake),
@@ -616,12 +623,12 @@ func (c *Client) recvFromSocket(conn *net.UDPConn) error {
 			if err := decodeUDPCFrame(pkt.data, c.magic, &frame); err != nil {
 				continue
 			}
-			c.dispatch(&frame)
+			c.dispatch(&frame, pkt.from.Port())
 		}
 	}
 }
 
-func (c *Client) dispatch(frame *UDPCFrame) {
+func (c *Client) dispatch(frame *UDPCFrame, srcPort uint16) {
 	if frame.Cmd == CMD_HANDSHAKE_ACK {
 		if frame.SessionID == 0 || frame.PacketNo != 0 || frame.Seq != 0 || frame.Ack != 0 || len(frame.Data) < ackPayloadBase {
 			return
@@ -692,7 +699,7 @@ func (c *Client) dispatch(frame *UDPCFrame) {
 		if sess.fecRecv != nil {
 			sess.deliverRecoveredFEC(sess.fecRecv.onData(frame.Seq, frame.Data))
 		}
-		if !sess.handleData(frame) {
+		if !sess.handleData(frame, srcPort) {
 			sess.replayFilter.Remove(frame.PacketNo)
 		}
 	case CMD_FEC:
@@ -770,8 +777,12 @@ func (c *Client) establish(ctx context.Context, target string, conn net.Conn) (*
 		sess.flow = newSendFlow(c.cfg.SendWindow, c.autoWindow)
 	}
 	if frameKeys != nil && frameKeys.fec {
-		sess.fecRecv = newFECReceiver()
-		sess.fecSend = newFECSender(sess.sendFECParity)
+		sess.fecRecv = newFECReceiverExt(frameKeys.fecExt)
+		sess.fecSend = newFECSenderExt(sess.sendFECParity, frameKeys.fecExt)
+		if v, ok := c.fecLossMemo.get(); ok {
+			sess.fecSend.seedLoss(v)
+			c.logDebug("[Client] [Session 0x%08X] 🧩 FEC seeded from previous session: loss=%.1f%%", sid, v*100)
+		}
 		c.logInfo("[Client] [Session 0x%08X] 🧩 adaptive Reed-Solomon FEC negotiated", sid)
 	}
 	// seq counters start at 1: sendSeq/recvSeq semantics are "next sequence
@@ -878,6 +889,7 @@ func (c *Client) handshake(ctx context.Context, target string) (uint32, *NoiseSe
 	}
 	if fecEnabled(c.cfg.FEC) {
 		synFlags |= FLAG_FEC_CAPABLE
+		synFlags |= FLAG_FEC_EXT_PARITY
 	}
 	syn := SealFrameMAC(&UDPCFrame{
 		Magic: c.magic, Version: UDPC_VERSION, Flags: synFlags,
@@ -954,6 +966,7 @@ func (c *Client) handshake(ctx context.Context, target string) (uint32, *NoiseSe
 						return 0, nil, nil, "", fmt.Errorf("session cipher init: %w", err)
 					}
 					frameKeys.fec = fecEnabled(c.cfg.FEC) && ack.Flags&FLAG_FEC_CAPABLE != 0
+					frameKeys.fecExt = frameKeys.fec && ack.Flags&FLAG_FEC_EXT_PARITY != 0
 					frameKeys.recovery = fecEnabled(c.cfg.Recovery) && ack.Flags&FLAG_RECOVERY_CAPABLE != 0
 					timer.Stop()
 					return ack.SessionID, nil, frameKeys, granted, nil
@@ -966,6 +979,7 @@ func (c *Client) handshake(ctx context.Context, target string) (uint32, *NoiseSe
 				c.logInfo("[Client] 🔐 Noise_NK established (channel binding %x…)", sess.HandshakeHash[:4])
 				frameKeys := &FrameKeys{Send: sess.SendCipher, Recv: sess.RecvCipher}
 				frameKeys.fec = fecEnabled(c.cfg.FEC) && ack.Flags&FLAG_FEC_CAPABLE != 0
+				frameKeys.fecExt = frameKeys.fec && ack.Flags&FLAG_FEC_EXT_PARITY != 0
 				frameKeys.recovery = fecEnabled(c.cfg.Recovery) && ack.Flags&FLAG_RECOVERY_CAPABLE != 0
 				timer.Stop()
 				return ack.SessionID, sess, frameKeys, granted, nil
@@ -1119,6 +1133,11 @@ func (s *clientSession) close() {
 			s.delivery.close()
 		}
 		if s.fecSend != nil {
+			// Capture BEFORE close: the estimate is what the next session
+			// should inherit, provided this session saw enough traffic.
+			if v, ok := s.fecSend.memoSnapshot(); ok {
+				s.client.fecLossMemo.put(v)
+			}
 			s.fecSend.close()
 		}
 		s.unackedMu.Lock()
@@ -1126,6 +1145,28 @@ func (s *clientSession) close() {
 			s.unackedCond.Broadcast()
 		}
 		s.unackedMu.Unlock()
+		// Per-path loss summary for this session's lifetime: the observability
+		// half of receive-driven path scoring. Loss is the EWMA the scorer
+		// actually uses for weighting, so this table shows exactly what the
+		// selector believes about each port.
+		if pq, ok := s.client.dialer.PathScorer().(*pathQuality); ok && pq != nil {
+			scores := pq.snapshot()
+			if len(scores) > 0 {
+				ports := make([]int, 0, len(scores))
+				for p := range scores {
+					ports = append(ports, p)
+				}
+				sort.Slice(ports, func(i, j int) bool { return scores[ports[i]] > scores[ports[j]] })
+				const maxReport = 16
+				if len(ports) > maxReport {
+					ports = ports[:maxReport]
+				}
+				s.client.logDebug("[Client] [Session 0x%08X] 📉 path loss (worst first):", s.sid)
+				for _, p := range ports {
+					s.client.logDebug("[Client] [Session 0x%08X]   port %5d  loss %5.1f%%", s.sid, p, scores[p]*100)
+				}
+			}
+		}
 		close(s.closeChan)
 		if s.conn != nil {
 			// Tell the server to tear the session down; best effort.
@@ -1322,7 +1363,12 @@ func (s *clientSession) handleAck(ackSeq uint64) {
 	}
 	// Cumulative, mirroring the server: everything up to ackSeq is delivered.
 	if pkt, ok := s.unacked[ackSeq]; ok && pkt.retries == 0 && !pkt.queued {
-		s.rttEst.Sample(time.Since(pkt.firstSent))
+		sample := time.Since(pkt.firstSent)
+		s.rttEst.Sample(sample)
+		// Same sample feeds the Westwood min-RTT baseline in the flow.
+		if s.flow != nil {
+			s.flow.observeRTT(sample)
+		}
 	}
 	acknowledged := 0
 	srtt := s.rttEst.SRTT()
@@ -1452,10 +1498,28 @@ func (s *clientSession) keepAliveLoop() {
 // Lock ordering: recvMu (reorder state) is NEVER held across the application
 // write or the ACK send — both can block (net.Pipe back-pressure, sendto).
 // deliverMu keeps runs in order across spread-socket receive loops.
-func (s *clientSession) handleData(frame *UDPCFrame) bool {
+// observePath feeds one server-DATA outcome into the spread dialer's path
+// scorer. srcPort is the port the server replied FROM, which (by the origdst
+// mirror) is the port the client addressed; fresh=true means the frame was
+// new data, false means the server had to retransmit it. srcPort 0 (locally
+// synthesized frames, FEC-recovered payloads) is never observed.
+func (s *clientSession) observePath(srcPort uint16, fresh bool) {
+	if srcPort == 0 {
+		return
+	}
+	if sc := s.client.dialer.PathScorer(); sc != nil {
+		sc.Observe(int(srcPort), !fresh)
+	}
+}
+
+func (s *clientSession) handleData(frame *UDPCFrame, srcPort uint16) bool {
 	if s.delivery != nil {
 		s.touch()
-		return s.delivery.offer(frame.Seq, frame.Data)
+		fresh, ok := s.delivery.offerObserved(frame.Seq, frame.Data)
+		if ok {
+			s.observePath(srcPort, fresh)
+		}
+		return ok
 	}
 	if frame.Seq == 0 {
 		return true
@@ -1473,11 +1537,13 @@ func (s *clientSession) handleData(frame *UDPCFrame) bool {
 			// Already delivered: the server is retransmitting because it lost
 			// our ACK, so re-ACK instead of dropping it.
 			s.recvMu.Unlock()
+			s.observePath(srcPort, false)
 			s.acknowledgeDelivered(expected - 1)
 			return true
 		}
 		if _, dup := s.recvQueue[frame.Seq]; dup {
 			s.recvMu.Unlock()
+			s.observePath(srcPort, false)
 			return true
 		}
 		if len(s.recvQueue) >= 512 {
@@ -1486,10 +1552,12 @@ func (s *clientSession) handleData(frame *UDPCFrame) bool {
 		}
 		s.recvQueue[frame.Seq] = append([]byte(nil), payload...)
 		s.touch()
+		s.observePath(srcPort, true)
 		s.recvMu.Unlock()
 		return true
 	}
 	s.touch()
+	s.observePath(srcPort, true)
 
 	type pending struct {
 		seq     uint64
@@ -1721,7 +1789,8 @@ func (s *clientSession) deliverRecoveredFEC(recovered []fecRecovered) {
 			Magic: s.client.magic, Version: UDPC_VERSION, Cmd: CMD_DATA,
 			SessionID: s.sid, Seq: r.Seq, Data: r.Payload,
 		}
-		_ = s.handleData(f)
+		// Recovered locally, not a network arrival: srcPort 0 skips scoring.
+		_ = s.handleData(f, 0)
 	}
 }
 

@@ -214,7 +214,7 @@ func TestClientConcurrentDuplicateDeliveredOnce(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			sess.handleData(frame)
+			sess.handleData(frame, 0)
 		}()
 	}
 	close(start)

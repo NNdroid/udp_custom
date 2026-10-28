@@ -1203,6 +1203,11 @@ func (s *Server) handleHandshake(remoteAddr netip.AddrPort, frame *UDPCFrame, or
 		}
 	}
 	frameKeys.fec = fecNegotiated
+	// Extended parity needs BOTH ends to have authenticated the flag: the
+	// client advertised it in the SYN and the server accepts it here (and
+	// echoes it in the ACK below), so neither side ever sends parity m>4 to a
+	// peer that would misparse it as m<=4 with a bogus index.
+	frameKeys.fecExt = fecNegotiated && frame.Flags&FLAG_FEC_EXT_PARITY != 0
 	frameKeys.recovery = fecEnabled(s.cfg.Recovery) && frame.Flags&FLAG_RECOVERY_CAPABLE != 0
 
 	sess := &ServerSession{
@@ -1227,8 +1232,8 @@ func (s *Server) handleHandshake(remoteAddr netip.AddrPort, frame *UDPCFrame, or
 		sess.flow = newSendFlow(s.sendWindow, s.cfg.SendWindow <= 0)
 	}
 	if frameKeys.fec {
-		sess.fecRecv = newFECReceiver()
-		sess.fecSend = newFECSender(sess.sendFECParity)
+		sess.fecRecv = newFECReceiverExt(frameKeys.fecExt)
+		sess.fecSend = newFECSenderExt(sess.sendFECParity, frameKeys.fecExt)
 	}
 	// seq counters start at 1: first frame uses seq 1. sendPacketNo starts
 	// at 0 (its first AddUint64 returns 1).
@@ -1260,6 +1265,9 @@ func (s *Server) handleHandshake(remoteAddr netip.AddrPort, frame *UDPCFrame, or
 	}
 	if fecNegotiated {
 		ackFlags |= FLAG_FEC_CAPABLE
+		if frameKeys.fecExt {
+			ackFlags |= FLAG_FEC_EXT_PARITY
+		}
 	}
 	ackFrame := &UDPCFrame{
 		Magic:      s.cfg.Magic,
@@ -1798,7 +1806,12 @@ func (sess *ServerSession) handleAck(ackSeq uint64) {
 	if pkt, ok := sess.unacked[ackSeq]; ok && pkt.retries == 0 && !pkt.queued {
 		// Karn's rule: only sample RTT from a frame that was never
 		// retransmitted; the RTT of a retransmitted one is not trustworthy.
-		sess.rttEst.Sample(time.Since(pkt.firstSent))
+		sample := time.Since(pkt.firstSent)
+		sess.rttEst.Sample(sample)
+		// Same sample feeds the Westwood min-RTT baseline in the flow.
+		if sess.flow != nil {
+			sess.flow.observeRTT(sample)
+		}
 	}
 	// Seqs are handed out by a single atomic counter and every sent frame is
 	// inserted, so the map is the contiguous range [lowest..highest] (up to an

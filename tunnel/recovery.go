@@ -30,7 +30,41 @@ type sendFlow struct {
 	fastRepairs int
 	paceMu      sync.Mutex
 	nextSend    time.Time
+
+	// Westwood-style delivery-rate estimate, in frames per second. Loss-based
+	// AIMD misreads a lossy-but-uncongested path: every random wireless drop
+	// halves the window even though the bottleneck queue is empty, and the
+	// session never climbs back. loss() consults this estimate and the
+	// min-RTT baseline to tell the two regimes apart — see loss.
+	rate    float64
+	rateAt  time.Time
+	rateAcc int
+	// minRTT is a slowly-drifting floor over observed RTT samples: it snaps
+	// down to every new minimum and creeps up at 1/64 so a path change is
+	// tracked within a few seconds. Zero until the first sample.
+	minRTT time.Duration
 }
+
+const (
+	// rateWindow is the sampling interval for the delivery-rate EWMA. Shorter
+	// windows track bursts that a BDP-sized window cannot sustain anyway.
+	rateWindow = 100 * time.Millisecond
+	// rateIdle invalidates the estimate: without ACKs for this long the
+	// measured rate no longer describes the path's current state, and a loss
+	// right after an idle period must fall back to the safe halving.
+	rateIdle = 2 * time.Second
+	// rateAlpha is the EWMA weight of each new per-window sample.
+	rateAlpha = 0.25
+	// minRTTDrift is the denominator of the slow upward drift applied to the
+	// RTT floor between genuine new minima: fast enough to follow a path
+	// change within a few RTTs of traffic, slow enough that jittery samples
+	// cannot lift the floor away from the real minimum.
+	minRTTDrift = 64
+	// congestedFactor is the SRTT inflation that marks a loss as congestion:
+	// below it the bottleneck queue is (near) empty and the drop was random
+	// wireless loss, above it the queue is being built up by this flow.
+	congestedFactor = 2
+)
 
 // initialCwnd is the flight size a fresh session starts with. It used to be 64
 // frames, which capped upload at 64*record/RTT (about 7 Mbps at 100 ms RTT)
@@ -50,7 +84,58 @@ func newSendFlow(maximum int, automatic bool) *sendFlow {
 
 func (f *sendFlow) window() int { return min(f.cwnd, f.credit) }
 
+// observeRTT maintains the min-RTT baseline from one RTT sample. It snaps to
+// every new minimum and drifts up slowly otherwise, so the congestion test in
+// loss() reflects the path's current empty-queue latency, not a stale early
+// outlier.
+func (f *sendFlow) observeRTT(sample time.Duration) {
+	if sample <= 0 {
+		return
+	}
+	if f.minRTT <= 0 || sample < f.minRTT {
+		f.minRTT = sample
+		return
+	}
+	f.minRTT += (sample - f.minRTT) / minRTTDrift
+}
+
+// sampleRate folds n newly acknowledged frames into the delivery-rate EWMA.
+// The rate is what Westwood restores the window to on non-congestion loss, so
+// it must describe sustainable throughput, not a single ACK burst: samples
+// integrate over at least rateWindow.
+func (f *sendFlow) sampleRate(n int, now time.Time) {
+	if n <= 0 {
+		return
+	}
+	if f.rateAt.IsZero() {
+		f.rateAt = now
+		f.rateAcc = n
+		return
+	}
+	elapsed := now.Sub(f.rateAt)
+	if elapsed > rateIdle {
+		// Stale: start a fresh window rather than diluting the estimate.
+		f.rate = 0
+		f.rateAt = now
+		f.rateAcc = n
+		return
+	}
+	f.rateAcc += n
+	if elapsed < rateWindow {
+		return
+	}
+	inst := float64(f.rateAcc) / elapsed.Seconds()
+	if f.rate <= 0 {
+		f.rate = inst
+	} else {
+		f.rate += (inst - f.rate) * rateAlpha
+	}
+	f.rateAt = now
+	f.rateAcc = 0
+}
+
 func (f *sendFlow) acknowledged(n int) {
+	f.sampleRate(n, time.Now())
 	if f.cwnd < f.ssthresh {
 		f.cwnd = min(f.max, f.cwnd+n)
 		return
@@ -62,11 +147,19 @@ func (f *sendFlow) acknowledged(n int) {
 	}
 }
 
-// loss halves the window once per RTT. undoable marks a cut made on the evidence
-// of an RTO firing, which is later proven wrong by undoLoss when the ACK turns
-// out to have predated the retransmit: the timeout was jitter, not loss. SACK
-// gaps are not marked, because three later admissions are stronger evidence than
-// a bare timeout.
+// loss halves the window once per RTT on CONGESTION loss. undoable marks a cut
+// made on the evidence of an RTO firing, which is later proven wrong by
+// undoLoss when the ACK turns out to have predated the retransmit: the timeout
+// was jitter, not loss. SACK gaps are not marked, because three later
+// admissions are stronger evidence than a bare timeout.
+//
+// Losses that arrive WITHOUT queue buildup are treated differently (Westwood
+// style): on a lossy wireless path the bottleneck queue is empty — SRTT sits
+// at its floor — so a halving would just abandon bandwidth nobody is fighting
+// us for. There the window is restored to the measured BDP (delivery rate ×
+// SRTT) instead, never above the current window. Losses with the SRTT at
+// least congestedFactor above the min-RTT floor, or without a usable rate
+// estimate, keep the classic halving.
 func (f *sendFlow) loss(now time.Time, rtt time.Duration, undoable bool) {
 	if rtt < 10*time.Millisecond {
 		rtt = 10 * time.Millisecond
@@ -78,9 +171,37 @@ func (f *sendFlow) loss(now time.Time, rtt time.Duration, undoable bool) {
 	if undoable && f.cwnd > f.lastLossCut {
 		f.lastLossCut = f.cwnd
 	}
+	if !f.congested(rtt) {
+		if bdp := f.bdp(rtt); bdp >= 2 {
+			f.ssthresh = max(2, min(f.cwnd, bdp))
+			f.cwnd = min(f.max, f.ssthresh)
+			f.growth = 0
+			return
+		}
+	}
 	f.ssthresh = max(2, f.cwnd/2)
 	f.cwnd = min(f.max, f.ssthresh)
 	f.growth = 0
+}
+
+// congested reports whether SRTT inflation marks this loss as congestion.
+// Without a baseline yet the conservative answer is yes.
+func (f *sendFlow) congested(rtt time.Duration) bool {
+	return f.minRTT <= 0 || rtt >= f.minRTT*congestedFactor
+}
+
+// bdp converts the delivery-rate estimate into a frame count for the given
+// RTT. A stale estimate returns 0: after rateIdle without ACKs the number
+// describes a path that may no longer exist.
+func (f *sendFlow) bdp(rtt time.Duration) int {
+	if f.rate <= 0 || f.rateAt.IsZero() || time.Since(f.rateAt) > rateIdle {
+		return 0
+	}
+	n := int(f.rate * rtt.Seconds())
+	if n < 0 {
+		return 0
+	}
+	return n
 }
 
 // undoLoss reverts the most recent undoable halving. A retransmit whose ACK

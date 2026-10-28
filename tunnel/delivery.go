@@ -35,29 +35,38 @@ func newOrderedDelivery(limit int, done <-chan struct{}, write func([]byte) erro
 }
 
 func (d *orderedDelivery) offer(seq uint64, payload []byte) bool {
+	_, ok := d.offerObserved(seq, payload)
+	return ok
+}
+
+// offerObserved is offer with loss attribution for the receive-driven path
+// scorer: fresh reports whether the frame carried NEW data. A duplicate
+// sequence (<= delivered prefix, or already pending) means the server
+// retransmitted — the original copy was lost on that path.
+func (d *orderedDelivery) offerObserved(seq uint64, payload []byte) (fresh bool, ok bool) {
 	if seq == 0 {
-		return false
+		return false, false
 	}
 	d.mu.Lock()
 	if d.closed {
 		d.mu.Unlock()
-		return false
+		return false, false
 	}
 	ack := d.delivered.Load()
 	if seq <= ack {
 		d.mu.Unlock()
 		d.ack(ack)
-		return true
+		return false, true
 	}
 	if _, ok := d.pending[seq]; ok {
 		d.mu.Unlock()
-		return true
+		return false, true
 	}
 	// Reserve the gap's slot even when later packets arrive first. Bound both
 	// the number of frames and the sequence distance from the delivered prefix.
 	if seq-ack > uint64(d.limit) || len(d.pending) >= d.limit {
 		d.mu.Unlock()
-		return false
+		return false, false
 	}
 	d.pending[seq] = append([]byte(nil), payload...)
 	_, hasNext := d.pending[ack+1]
@@ -70,7 +79,7 @@ func (d *orderedDelivery) offer(seq uint64, payload []byte) bool {
 	if gap {
 		d.ack(ack)
 	}
-	return true
+	return true, true
 }
 
 func (d *orderedDelivery) snapshot() (ack uint64, bitmap [8]uint64, credit uint16) {

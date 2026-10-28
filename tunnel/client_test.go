@@ -458,12 +458,12 @@ func TestClientFiltersForgedHandshakeACKBeforeCandidateQueue(t *testing.T) {
 		return frame
 	}
 	for i := 0; i < 32; i++ {
-		client.dispatch(frameFor(&wrong.AckMAC))
+		client.dispatch(frameFor(&wrong.AckMAC), 0)
 	}
 	if len(ch) != 0 {
 		t.Fatal("forged ACK reached the bounded handshake queue")
 	}
-	client.dispatch(frameFor(&keys.AckMAC))
+	client.dispatch(frameFor(&keys.AckMAC), 0)
 	if len(ch) != 1 {
 		t.Fatal("authenticated ACK did not reach the handshake queue")
 	}

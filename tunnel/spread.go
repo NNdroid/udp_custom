@@ -60,9 +60,13 @@ type SpreadDialer struct {
 	socks      []*spreadSocket
 	rr         atomic.Uint64 // round-robin cursor over sockets
 	fixedPaths int           // chosen remote-port subset size; 0 = whole range
-	closed     int32
-	closeOnce  sync.Once
-	listenUDP  UDPListenFunc
+	// pq scores remote ports from receive-side evidence (server
+	// retransmissions on the mirrored port) and biases selection toward the
+	// healthy ones; nil disables weighting (tests, single-port ranges).
+	pq        *pathQuality
+	closed    int32
+	closeOnce sync.Once
+	listenUDP UDPListenFunc
 
 	// generation increments whenever a failed socket is replaced. Higher
 	// layers use it to invalidate path-dependent state (notably the MTU probe
@@ -131,6 +135,7 @@ func newSpreadDialer(serverAddr string, numSockets, numPaths int, listenUDP UDPL
 		serverHost: host,
 		serverIP:   serverIP, serverAddr: destAddr,
 		pr: pr, socks: make([]*spreadSocket, 0, numSockets), fixedPaths: fixedPaths,
+		pq:        newPathQuality(),
 		listenUDP: listenUDP,
 	}
 	for i := 0; i < numSockets; i++ {
@@ -285,14 +290,28 @@ func (d *SpreadDialer) acceptsRemote(addr netip.AddrPort) bool {
 // Next picks the next (socketIndex, remotePort) pair WITHOUT sending anything.
 // Exposed for tests and for clients that want to batch their writes.
 // Socket indices rotate round-robin; the port comes from that socket's own
-// random selector.
+// random selector, weighted by the receive-driven path scorer.
 func (d *SpreadDialer) Next() (int, int) {
 	if len(d.socks) == 0 || atomic.LoadInt32(&d.closed) == 1 {
 		return -1, 0
 	}
 	idx := int(d.rr.Add(1)-1) % len(d.socks)
-	return idx, d.socks[idx].sel.Next()
+	return idx, d.pickPort(idx)
 }
+
+// pickPort draws one remote port for socket idx through its selector,
+// applying path-quality weighting when a scorer is attached.
+func (d *SpreadDialer) pickPort(idx int) int {
+	sel := d.socks[idx].sel
+	if d.pq != nil {
+		return sel.NextWeighted(d.pq)
+	}
+	return sel.Next()
+}
+
+// PathScorer exposes the receive-driven scorer so the client can feed it
+// outcomes; nil when weighting is disabled.
+func (d *SpreadDialer) PathScorer() PathScorer { return d.pq }
 
 // sendAtPort performs one datagram write and repairs a permanently failed
 // local socket in-place. The retry uses the SAME destination port: only the
@@ -358,7 +377,7 @@ func (d *SpreadDialer) SendAt(idx int, frame []byte) error {
 	if idx < 0 || idx >= len(d.socks) {
 		return fmt.Errorf("spread: socket index %d out of range (have %d)", idx, len(d.socks))
 	}
-	port := d.socks[idx].sel.Next()
+	port := d.pickPort(idx)
 	return d.sendAtPort(idx, port, frame)
 }
 

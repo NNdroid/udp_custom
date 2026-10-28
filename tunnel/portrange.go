@@ -306,6 +306,51 @@ func (s *PortSelector) Next() int {
 	return s.pr.PortAt(idx)
 }
 
+// NextWeighted biases port choice with a PathScorer using rejection sampling:
+// draw a uniform candidate, accept it with probability Weight(port), retry a
+// bounded number of times, then accept the last draw regardless. This is O(1)
+// per call, allocation-free, and keeps the selector's own RNG (no shared
+// state with other sockets). The result is not an exactly proportional sample
+// of the weighted distribution, but it concentrates traffic on healthy ports
+// with the right asymptotics and always keeps the scorer's floor share of
+// probe traffic flowing to bad ports. The attempt bound is high enough that
+// even a range where most ports score badly still routes the overwhelming
+// majority of packets to the healthy minority.
+func (s *PortSelector) NextWeighted(scorer PathScorer) int {
+	if s.pr == nil || s.pr.total == 0 {
+		return 0
+	}
+	if scorer == nil {
+		return s.Next()
+	}
+	const maxAttempts = 16
+	port := s.drawUniform()
+	w := scorer.Weight(port)
+	if w >= 1 {
+		return port
+	}
+	for i := 1; i < maxAttempts; i++ {
+		s.mu.Lock()
+		accept := s.rng.Float64() < w
+		s.mu.Unlock()
+		if accept {
+			return port
+		}
+		port = s.drawUniform()
+		w = scorer.Weight(port)
+	}
+	return port
+}
+
+// drawUniform picks one uniformly random port from the range. The RNG lock is
+// held only for the Intn call, as in Next.
+func (s *PortSelector) drawUniform() int {
+	s.mu.Lock()
+	idx := s.rng.Intn(s.pr.total)
+	s.mu.Unlock()
+	return s.pr.PortAt(idx)
+}
+
 // portRangeOf parses a port-range spec (either bare "lo-hi" or "host:lo-hi")
 // into a *PortRange, returning nil when it cannot be parsed.
 // PortRangeOf is the exported form used by the CLI shell to parse the

@@ -28,6 +28,15 @@ const (
 	// a real burst before its first retransmit.
 	fecBootstrapLossRate = 0.005
 
+	// fecMemoMinBlocks gates the session-to-session loss memo: below this many
+	// emitted FEC blocks the ARQ sample size is too small to trust as a
+	// bootstrap for the NEXT session, so the estimate is discarded.
+	fecMemoMinBlocks = 32
+	// fecLossMemoTTL bounds how long a previous session's loss estimate may
+	// seed a new one. Path conditions change faster than MTU does, so this is
+	// deliberately shorter than mtuProbeCacheTTL.
+	fecLossMemoTTL = 5 * time.Minute
+
 	// CMD_FEC reuses authenticated header fields instead of spending payload
 	// bytes on metadata. Seq is the block's first DATA sequence; Flags packs
 	// k/m/parity-index. Bits 0..1 are reserved by protocol-wide FEC capability
@@ -39,6 +48,15 @@ const (
 	fecIndexShift  = 9
 	fecIndexMask   = uint16(0x3 << fecIndexShift) // parity index, 0..3
 	fecMetaMask    = fecDataMask | fecParityMask | fecIndexMask
+
+	// Extended-parity encoding, negotiated via FLAG_FEC_EXT_PARITY. CMD_FEC
+	// frames carry no other flags, so bits 2 and 3 are free there: bit 2 is
+	// the high bit of ParityShards-1 (m 5..8), bit 3 the high bit of Index
+	// (4..7). RS(8,8) tolerates losing half the block's shards — beyond that
+	// only ARQ can help anyway.
+	fecParityExtFlag      = uint16(1 << 2)
+	fecIndexExtFlag       = uint16(1 << 3)
+	fecParityShardsExtMax = 8
 )
 
 // fecEnabled follows the same nil-means-enabled convention as MTU probing.
@@ -147,6 +165,32 @@ func (a *fecAdaptiveLoss) loss() float64 {
 }
 
 func fecParityForLoss(loss float64) int {
+	return fecParityForLossExt(loss, false)
+}
+
+// fecParityForLossExt picks the parity count for the observed loss. Peers that
+// negotiated FLAG_FEC_EXT_PARITY unlock deeper buckets: RS(8,8) spends 50%
+// overhead to survive losing half a block's shards, which is the deepest loss
+// regime where parity still beats waiting for ARQ.
+func fecParityForLossExt(loss float64, ext bool) int {
+	if ext {
+		switch {
+		case loss < 0.005:
+			return 0
+		case loss < 0.025:
+			return 1
+		case loss < 0.06:
+			return 2
+		case loss < 0.12:
+			return 3
+		case loss < 0.20:
+			return 4
+		case loss < 0.30:
+			return 6
+		default:
+			return 8
+		}
+	}
 	switch {
 	case loss < 0.005:
 		return 0
@@ -172,40 +216,81 @@ type fecParityShard struct {
 	ParityShards int
 	Index        int
 	Data         []byte
+	// Ext marks shard produced by a sender whose peer negotiated the extended
+	// parity encoding; applyToFrame then sets bits 2/3 of the CMD_FEC flags.
+	Ext bool
 }
 
 // applyToFrame stores FEC block metadata in authenticated header fields. Data
 // is the raw parity shard and therefore exactly the RS shard size; no outer FEC
 // envelope is needed.
 func (p fecParityShard) applyToFrame(f *UDPCFrame) bool {
+	maxParity := fecParityShardsMax
+	if p.Ext {
+		maxParity = fecParityShardsExtMax
+	}
 	if f == nil || p.BaseSeq == 0 || p.DataShards < 1 || p.DataShards > fecDataShardsMax ||
-		p.ParityShards < 1 || p.ParityShards > fecParityShardsMax ||
+		p.ParityShards < 1 || p.ParityShards > maxParity ||
 		p.Index < 0 || p.Index >= p.ParityShards || len(p.Data) < fecLengthPrefixSize ||
 		len(p.Data) > UDPC_MAX_DATA {
 		return false
 	}
 	f.Seq = p.BaseSeq
 	f.Flags &^= fecMetaMask
-	f.Flags |= uint16(p.DataShards-1) << fecDataShift
-	f.Flags |= uint16(p.ParityShards-1) << fecParityShift
-	f.Flags |= uint16(p.Index) << fecIndexShift
+	if p.Ext {
+		f.Flags &^= fecParityExtFlag | fecIndexExtFlag
+	}
+	// The m and index fields are 2 bits wide on the wire; the extension adds
+	// their high bit elsewhere in the flags. Masking the low bits is what
+	// keeps m-1=7 (0b111) from spilling into the index field's bit 9.
+	f.Flags |= uint16((p.DataShards-1)&7) << fecDataShift
+	f.Flags |= uint16((p.ParityShards-1)&3) << fecParityShift
+	f.Flags |= uint16(p.Index&3) << fecIndexShift
+	if p.Ext {
+		if p.ParityShards-1 >= 4 {
+			f.Flags |= fecParityExtFlag
+		}
+		if p.Index >= 4 {
+			f.Flags |= fecIndexExtFlag
+		}
+	}
 	f.Data = p.Data
 	return true
 }
 
 func parseFECParityFrame(frame *UDPCFrame) (fecParityShard, error) {
+	return parseFECParityFrameExt(frame, false)
+}
+
+// parseFECParityFrameExt decodes CMD_FEC metadata. ext must be the negotiated
+// FLAG_FEC_EXT_PARITY outcome for the session: without it bits 2/3 are treated
+// as zero, so frames from pre-extension peers parse identically, and a new
+// sender never emits extended metadata to a peer that did not negotiate it.
+func parseFECParityFrameExt(frame *UDPCFrame, ext bool) (fecParityShard, error) {
 	if frame == nil || frame.Cmd != CMD_FEC || frame.Seq == 0 || len(frame.Data) < fecLengthPrefixSize {
 		return fecParityShard{}, fmt.Errorf("invalid fec frame")
+	}
+	m1 := int((frame.Flags & fecParityMask) >> fecParityShift)
+	idx := int((frame.Flags & fecIndexMask) >> fecIndexShift)
+	maxParity := fecParityShardsMax
+	if ext {
+		maxParity = fecParityShardsExtMax
+		if frame.Flags&fecParityExtFlag != 0 {
+			m1 += 4
+		}
+		if frame.Flags&fecIndexExtFlag != 0 {
+			idx += 4
+		}
 	}
 	p := fecParityShard{
 		BaseSeq:      frame.Seq,
 		DataShards:   int((frame.Flags&fecDataMask)>>fecDataShift) + 1,
-		ParityShards: int((frame.Flags&fecParityMask)>>fecParityShift) + 1,
-		Index:        int((frame.Flags & fecIndexMask) >> fecIndexShift),
+		ParityShards: m1 + 1,
+		Index:        idx,
 		Data:         append([]byte(nil), frame.Data...),
 	}
 	if p.DataShards < 1 || p.DataShards > fecDataShardsMax ||
-		p.ParityShards < 1 || p.ParityShards > fecParityShardsMax ||
+		p.ParityShards < 1 || p.ParityShards > maxParity ||
 		p.Index < 0 || p.Index >= p.ParityShards {
 		return fecParityShard{}, fmt.Errorf("invalid fec metadata")
 	}
@@ -222,6 +307,9 @@ type fecSender struct {
 	closed   bool
 	blocks   uint64
 	adaptive fecAdaptiveLoss
+	// extParity mirrors the negotiated FLAG_FEC_EXT_PARITY outcome: parity may
+	// exceed fecParityShardsMax and CMD_FEC flags carry the extension bits.
+	extParity bool
 
 	encodeMu sync.Mutex
 	codecs   map[uint16]reedsolomon.Encoder
@@ -229,10 +317,64 @@ type fecSender struct {
 }
 
 var fecSourcesPool = sync.Pool{New: func() any { p := make([]fecSourceShard, 0, fecDataShardsMax); return &p }}
-var fecSlabPool = sync.Pool{New: func() any { p := make([]byte, (fecDataShardsMax+fecParityShardsMax)*UDPC_MAX_DATA); return &p }}
+var fecSlabPool = sync.Pool{New: func() any { p := make([]byte, (fecDataShardsMax+fecParityShardsExtMax)*UDPC_MAX_DATA); return &p }}
 
 func newFECSender(emit func(fecParityShard)) *fecSender {
-	return &fecSender{emit: emit, codecs: make(map[uint16]reedsolomon.Encoder)}
+	return newFECSenderExt(emit, false)
+}
+
+func newFECSenderExt(emit func(fecParityShard), extParity bool) *fecSender {
+	return &fecSender{emit: emit, codecs: make(map[uint16]reedsolomon.Encoder), extParity: extParity}
+}
+
+// fecLossMemo carries one session's final ARQ loss estimate into the next
+// session on the same Client. Without it every session starts its estimator
+// at zero, so on a genuinely lossy path the first seconds run in pure
+// retransmission mode until the EWMA converges — exactly the reconnect
+// window a weak network hits hardest. The seed washes out as fresh samples
+// arrive (observeOutcome is an EWMA over outcomes), so a stale or wrong
+// value self-corrects within a few hundred packets.
+type fecLossMemo struct {
+	mu    sync.Mutex
+	value float64
+	at    time.Time
+}
+
+func (m *fecLossMemo) put(loss float64) {
+	m.mu.Lock()
+	m.value = loss
+	m.at = time.Now()
+	m.mu.Unlock()
+}
+
+func (m *fecLossMemo) get() (float64, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.at.IsZero() || time.Since(m.at) > fecLossMemoTTL {
+		return 0, false
+	}
+	return m.value, true
+}
+
+// memoSnapshot reports the sender's own ARQ-based loss estimate and whether
+// enough blocks have flowed for it to mean anything (the remote component is
+// deliberately excluded: it mixes in peer recovery feedback, which depends on
+// the parity the sender itself emitted).
+func (s *fecSender) memoSnapshot() (float64, bool) {
+	s.mu.Lock()
+	blocks := s.blocks
+	s.mu.Unlock()
+	if blocks < fecMemoMinBlocks {
+		return 0, false
+	}
+	return s.adaptive.local.loss(), true
+}
+
+// seedLoss pre-loads the local loss estimator with a previous session's
+// estimate at full weight, so the very first parity decision of a new session
+// already reflects the remembered path quality.
+func (s *fecSender) seedLoss(loss float64) {
+	s.adaptive.local.observeValue(loss, 1.0)
 }
 
 func (s *fecSender) codec(dataShards, parityShards, shardSize int) (reedsolomon.Encoder, error) {
@@ -346,7 +488,7 @@ func (s *fecSender) emitBlock(block []fecSourceShard) {
 	blockNo := s.blocks
 	s.mu.Unlock()
 
-	parityShards := fecParityForLoss(s.adaptive.loss())
+	parityShards := fecParityForLossExt(s.adaptive.loss(), s.extParity)
 	// Bootstrap with one parity shard for a few blocks so a new path can
 	// measure recoverable loss before its first ARQ timeout. Clean paths then
 	// naturally fall to zero parity.
@@ -367,8 +509,12 @@ func (s *fecSender) emitBlock(block []fecSourceShard) {
 	if parityShards <= 0 {
 		return
 	}
-	if parityShards > fecParityShardsMax {
-		parityShards = fecParityShardsMax
+	maxParity := fecParityShardsMax
+	if s.extParity {
+		maxParity = fecParityShardsExtMax
+	}
+	if parityShards > maxParity {
+		parityShards = maxParity
 	}
 
 	maxPayload := 0
@@ -418,6 +564,7 @@ func (s *fecSender) emitBlock(block []fecSourceShard) {
 			ParityShards: parityShards,
 			Index:        i,
 			Data:         parity,
+			Ext:          s.extParity,
 		})
 	}
 }
@@ -462,13 +609,21 @@ type fecReceiver struct {
 	blocks    map[uint64]*fecRecvBlock
 	codecs    map[uint16]reedsolomon.Encoder
 	loss      fecLossEstimator
+	// extParity mirrors the negotiated FLAG_FEC_EXT_PARITY outcome: parity
+	// metadata may use the extended k/m/index encoding.
+	extParity bool
 }
 
 func newFECReceiver() *fecReceiver {
+	return newFECReceiverExt(false)
+}
+
+func newFECReceiverExt(extParity bool) *fecReceiver {
 	return &fecReceiver{
-		recent: make(map[uint64][]byte),
-		blocks: make(map[uint64]*fecRecvBlock),
-		codecs: make(map[uint16]reedsolomon.Encoder),
+		recent:    make(map[uint64][]byte),
+		blocks:    make(map[uint64]*fecRecvBlock),
+		codecs:    make(map[uint16]reedsolomon.Encoder),
+		extParity: extParity,
 	}
 }
 
@@ -525,7 +680,7 @@ func (r *fecReceiver) onData(seq uint64, payload []byte) []fecRecovered {
 }
 
 func (r *fecReceiver) onParityFrame(frame *UDPCFrame) []fecRecovered {
-	p, err := parseFECParityFrame(frame)
+	p, err := parseFECParityFrameExt(frame, r.extParity)
 	if err != nil {
 		return nil
 	}

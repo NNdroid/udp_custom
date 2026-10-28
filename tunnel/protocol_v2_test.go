@@ -339,7 +339,7 @@ func TestProtocolV2ClientRejectsForgedControlBeforeStateMutation(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			client.dispatch(parsed)
+			client.dispatch(parsed, 0)
 		}
 	}
 	if len(sess.unacked) != 1 {

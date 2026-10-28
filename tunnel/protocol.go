@@ -48,6 +48,13 @@ const (
 	FLAG_FEC_CAPABLE      = uint16(1 << 0)
 	FLAG_FEC_FEEDBACK     = uint16(1 << 1)
 	FLAG_RECOVERY_CAPABLE = uint16(1 << 2)
+	// FLAG_FEC_EXT_PARITY negotiates the extended parity encoding: on CMD_FEC
+	// frames bit 2 becomes the high bit of ParityShards-1 (m up to 8) and bit 3
+	// the high bit of Index (up to 7). Both peers must authenticate the flag
+	// during the handshake, so old peers — which keep these bits zero — parse
+	// every new frame exactly as before, and a new peer never sends extended
+	// metadata to one that did not negotiate it.
+	FLAG_FEC_EXT_PARITY = uint16(1 << 3)
 
 	// Magic(4)+Version(1)+Cmd(1)+Flags(2)+SessionID(4)+PacketNo(8)+
 	// Seq(8)+Ack(8)+Window(2)+PayloadLen(2), followed by payload and a fixed
@@ -245,7 +252,10 @@ type FrameKeys struct {
 	// fec is set only when BOTH peers authenticated FLAG_FEC_CAPABLE during
 	// the handshake. Keeping it on the derived session state avoids changing
 	// the public handshake API while making mixed-version rollout safe.
-	fec      bool
+	fec bool
+	// fecExt additionally negotiated FLAG_FEC_EXT_PARITY: the peer parses the
+	// extended k/m/index encoding, so parity may exceed 4 on deep-loss paths.
+	fecExt   bool
 	recovery bool
 }
 

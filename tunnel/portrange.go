@@ -18,11 +18,22 @@ import (
 type SelectorMode int
 
 const (
-	// SelectorRandom picks an independent uniformly-random port for every packet.
+	// SelectorRandom deals ports from a shuffle bag: the whole candidate set
+	// is Fisher-Yates shuffled, consumed one port per packet in sequence, and
+	// reshuffled once exhausted. Every round therefore hits every port exactly
+	// once (perfect short-term coverage, unlike iid sampling's P*ln(P)
+	// coupon-collector tail), while independent reshuffles between rounds keep
+	// the sequence unpredictable.
 	SelectorRandom SelectorMode = iota
 	// SelectorRoundRobin steps through the port list in sorted order, wrapping around.
 	SelectorRoundRobin
 )
+
+// shuffleBagMaxPorts caps how large a candidate set a per-socket shuffle bag
+// may hold. A full-range spread (paths=0) wider than this falls back to plain
+// iid sampling: a bag of 65k ports x 32 sockets would cost megabytes of
+// per-socket memory for no practical gain — long-run uniformity is identical.
+const shuffleBagMaxPorts = 4096
 
 // ParseServerAddrWithRange parses a server address that may carry a UDP
 // destination-port range, e.g.:
@@ -261,16 +272,26 @@ type PortSelector struct {
 	rr   atomic.Uint64
 	rng  *rand.Rand
 	mu   sync.Mutex
+
+	// Shuffle-bag state for SelectorRandom when the range fits in memory.
+	// bag holds every port of the range in shuffled order; bagPos marks the
+	// next entry. nil = iid fallback (round-robin mode or oversized range).
+	bag    []uint16
+	bagPos int
 }
 
 // NewPortSelector creates a selector over pr. The RNG seed is drawn from
 // crypto/rand so the random spread does not start from a predictable sequence.
 func NewPortSelector(pr *PortRange, mode SelectorMode) *PortSelector {
-	return &PortSelector{
+	s := &PortSelector{
 		pr:   pr,
 		mode: mode,
 		rng:  rand.New(rand.NewSource(randomSeed())),
 	}
+	if mode == SelectorRandom && pr != nil && pr.total > 0 && pr.total <= shuffleBagMaxPorts {
+		s.fillBag()
+	}
+	return s
 }
 
 var fallbackSeed atomic.Uint64
@@ -285,9 +306,24 @@ func randomSeed() int64 {
 	return time.Now().UnixNano() ^ int64(fallbackSeed.Add(1))
 }
 
+// fillBag expands the range into the shuffle bag (called once, under no lock,
+// before the selector is published).
+func (s *PortSelector) fillBag() {
+	bag := make([]uint16, 0, s.pr.total)
+	for _, iv := range s.pr.intervals {
+		for p := iv.lo; p <= iv.hi; p++ {
+			bag = append(bag, uint16(p))
+		}
+	}
+	s.rng.Shuffle(len(bag), func(i, j int) { bag[i], bag[j] = bag[j], bag[i] })
+	s.bag = bag
+}
+
 // Next returns the destination port for the next outgoing packet. It is cheap
-// and safe for concurrent use. Random mode gives an independent port each call;
-// RoundRobin mode cycles through all ports in order.
+// and safe for concurrent use. Random mode deals from a shuffle bag: each
+// round covers every port exactly once, then reshuffles; oversized ranges
+// fall back to an independent uniform draw per call. RoundRobin mode cycles
+// through all ports in order.
 //
 // IMPORTANT: this must be called per packet, NOT once at connect time. The whole
 // point is to vary the destination port on every datagram so the path's
@@ -300,10 +336,25 @@ func (s *PortSelector) Next() int {
 		i := s.rr.Add(1) - 1
 		return s.pr.PortAt(int(i % uint64(s.pr.total)))
 	}
+	return s.nextUniform()
+}
+
+// nextUniform draws the next candidate under the selector's RNG lock. With a
+// shuffle bag it pops the next entry, reshuffling when the bag is exhausted;
+// without one (oversized range) it is a plain iid draw.
+func (s *PortSelector) nextUniform() int {
 	s.mu.Lock()
-	idx := s.rng.Intn(s.pr.total)
-	s.mu.Unlock()
-	return s.pr.PortAt(idx)
+	defer s.mu.Unlock()
+	if s.bag == nil {
+		return s.pr.PortAt(s.rng.Intn(s.pr.total))
+	}
+	if s.bagPos >= len(s.bag) {
+		s.rng.Shuffle(len(s.bag), func(i, j int) { s.bag[i], s.bag[j] = s.bag[j], s.bag[i] })
+		s.bagPos = 0
+	}
+	port := int(s.bag[s.bagPos])
+	s.bagPos++
+	return port
 }
 
 // NextWeighted biases port choice with a PathScorer using rejection sampling:
@@ -316,6 +367,11 @@ func (s *PortSelector) Next() int {
 // probe traffic flowing to bad ports. The attempt bound is high enough that
 // even a range where most ports score badly still routes the overwhelming
 // majority of packets to the healthy minority.
+//
+// Candidates come from the same shuffle bag as Next (when the range fits):
+// draws within a round are without replacement, so rejection sampling never
+// re-tries the same bad port twice in one pass and the bag keeps draining
+// evenly across rounds.
 func (s *PortSelector) NextWeighted(scorer PathScorer) int {
 	if s.pr == nil || s.pr.total == 0 {
 		return 0
@@ -324,7 +380,7 @@ func (s *PortSelector) NextWeighted(scorer PathScorer) int {
 		return s.Next()
 	}
 	const maxAttempts = 16
-	port := s.drawUniform()
+	port := s.nextUniform()
 	w := scorer.Weight(port)
 	if w >= 1 {
 		return port
@@ -336,19 +392,10 @@ func (s *PortSelector) NextWeighted(scorer PathScorer) int {
 		if accept {
 			return port
 		}
-		port = s.drawUniform()
+		port = s.nextUniform()
 		w = scorer.Weight(port)
 	}
 	return port
-}
-
-// drawUniform picks one uniformly random port from the range. The RNG lock is
-// held only for the Intn call, as in Next.
-func (s *PortSelector) drawUniform() int {
-	s.mu.Lock()
-	idx := s.rng.Intn(s.pr.total)
-	s.mu.Unlock()
-	return s.pr.PortAt(idx)
 }
 
 // portRangeOf parses a port-range spec (either bare "lo-hi" or "host:lo-hi")

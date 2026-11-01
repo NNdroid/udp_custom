@@ -56,6 +56,16 @@ const (
 	// metadata to one that did not negotiate it.
 	FLAG_FEC_EXT_PARITY = uint16(1 << 3)
 
+	// FLAG_WIDE_WINDOW negotiates delivery windows beyond the wire-safe
+	// 512-frame baseline (see deliveryWindow / deliveryWindowWide). The SACK
+	// bitmap stays 512 bits wide for wire compatibility; only the advertised
+	// credit and the flight cap grow. Old peers ignore this flag and keep the
+	// 512-frame window, and a new peer only advertises the wider credit when
+	// BOTH ends authenticated the flag during the handshake — so a mixed
+	// deployment behaves exactly as before instead of seeing SACKs rejected
+	// over the stale credit ceiling.
+	FLAG_WIDE_WINDOW = uint16(1 << 4)
+
 	// Magic(4)+Version(1)+Cmd(1)+Flags(2)+SessionID(4)+PacketNo(8)+
 	// Seq(8)+Ack(8)+Window(2)+PayloadLen(2), followed by payload and a fixed
 	// 16-byte authentication tag.
@@ -255,8 +265,12 @@ type FrameKeys struct {
 	fec bool
 	// fecExt additionally negotiated FLAG_FEC_EXT_PARITY: the peer parses the
 	// extended k/m/index encoding, so parity may exceed 4 on deep-loss paths.
-	fecExt   bool
-	recovery bool
+	fecExt bool
+	// wideWindow negotiated FLAG_WIDE_WINDOW: both ends accept delivery credit
+	// beyond the 512-frame wire baseline, so the session may fly up to
+	// deliveryWindowWide frames.
+	wideWindow bool
+	recovery   bool
 }
 
 type PSKHandshakeKeys struct {

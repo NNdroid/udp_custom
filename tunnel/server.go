@@ -84,6 +84,12 @@ type ServerConfig struct {
 	// false restores classic AIMD halving on every loss.
 	Westwood *bool `json:"-"`
 
+	// WideWindow accepts FLAG_WIDE_WINDOW from clients and lets those
+	// sessions fly up to 2048 frames with wider delivery credit. Sessions
+	// against older clients keep the 512-frame baseline. nil (field absent) =
+	// enabled; false rejects the flag.
+	WideWindow *bool `json:"-"`
+
 	// PortRange is the UDP port range the firewall DNATs onto ListenAddr. It
 	// is the single source of truth for the client port range: the server
 	// uses it at runtime to validate that every recovered original-destination
@@ -781,7 +787,7 @@ func newServer(cfg ServerConfig, dial TargetDialer, injected *net.UDPConn) (*Ser
 		synLimiter:   newSynLimiter(5, 20),
 		handshakeSem: make(chan struct{}, 64),
 		sendWindow:   defaultSendWindow,
-		maxRecvQueue: 512,
+		maxRecvQueue: deliveryWindowWide,
 	}
 	if cfg.SendWindow > 0 {
 		srv.sendWindow = cfg.SendWindow
@@ -1222,6 +1228,7 @@ func (s *Server) handleHandshake(remoteAddr netip.AddrPort, frame *UDPCFrame, or
 	// peer that would misparse it as m<=4 with a bogus index.
 	frameKeys.fecExt = fecNegotiated && fecEnabled(s.cfg.FECExtParity) && frame.Flags&FLAG_FEC_EXT_PARITY != 0
 	frameKeys.recovery = fecEnabled(s.cfg.Recovery) && frame.Flags&FLAG_RECOVERY_CAPABLE != 0
+	frameKeys.wideWindow = fecEnabled(s.cfg.WideWindow) && frame.Flags&FLAG_WIDE_WINDOW != 0
 
 	sess := &ServerSession{
 		server:        s,
@@ -1242,7 +1249,7 @@ func (s *Server) handleHandshake(remoteAddr netip.AddrPort, frame *UDPCFrame, or
 	}
 	sess.unackedCond = sync.NewCond(&sess.unackedMu)
 	if frameKeys.recovery {
-		sess.flow = newSendFlow(s.sendWindow, s.cfg.SendWindow <= 0, fecEnabled(s.cfg.Westwood))
+		sess.flow = newSendFlow(s.sendWindow, s.cfg.SendWindow <= 0, fecEnabled(s.cfg.Westwood), frameKeys.wideWindow)
 	}
 	if frameKeys.fec {
 		sess.fecRecv = newFECReceiverExt(frameKeys.fecExt)
@@ -1252,7 +1259,7 @@ func (s *Server) handleHandshake(remoteAddr netip.AddrPort, frame *UDPCFrame, or
 	// at 0 (its first AddUint64 returns 1).
 	sess.sendSeq.Store(1)
 	sess.recvSeq.Store(1)
-	limit := min(s.maxRecvQueue, deliveryWindow)
+	limit := min(s.maxRecvQueue, deliveryLimitFor(frameKeys.wideWindow))
 	sess.delivery = newOrderedDelivery(limit, sess.closeChan, func(p []byte) error {
 		if sess.upstream != nil {
 			_ = sess.upstream.SetWriteDeadline(time.Now().Add(targetWriteTimeout))
@@ -1275,6 +1282,9 @@ func (s *Server) handleHandshake(remoteAddr netip.AddrPort, frame *UDPCFrame, or
 	ackFlags := uint16(0)
 	if frameKeys.recovery {
 		ackFlags |= FLAG_RECOVERY_CAPABLE
+	}
+	if frameKeys.wideWindow {
+		ackFlags |= FLAG_WIDE_WINDOW
 	}
 	if fecNegotiated {
 		ackFlags |= FLAG_FEC_CAPABLE
@@ -2784,14 +2794,14 @@ func (sess *ServerSession) handleSACK(f *UDPCFrame) {
 		return
 	}
 	sess.unackedMu.Lock()
-	wire, valid := updateSACK(sess.flow, sess.unacked, f, sess.sendSeq.Load()-1, sess.rttEst.SRTT())
+	wires, valid := updateSACK(sess.flow, sess.unacked, f, sess.sendSeq.Load()-1, sess.rttEst.SRTT())
 	sess.unackedCond.Broadcast()
 	sess.unackedMu.Unlock()
 	notifyRetry(sess.retryWake)
 	if valid && f.Ack > 0 {
 		sess.handleAck(f.Ack)
 	}
-	if wire != nil {
+	for _, wire := range wires {
 		if sess.tx != nil {
 			sess.tx.bestEffort(wire)
 		} else {

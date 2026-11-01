@@ -130,6 +130,13 @@ type ClientConfig struct {
 	// false restores classic AIMD halving on every loss.
 	Westwood *bool `json:"-"`
 
+	// WideWindow negotiates FLAG_WIDE_WINDOW so sessions may fly up to 2048
+	// frames instead of the wire-safe 512 baseline — the window is the BDP
+	// ceiling and 512 caps throughput at high RTT. Requires a peer that also
+	// advertises the flag; against older peers the session silently keeps the
+	// 512-frame window. nil (field absent) = enabled; false never proposes it.
+	WideWindow *bool `json:"-"`
+
 	// Logger receives diagnostic output. When nil, the LogLevel string decides
 	// verbosity on the standard logger; an injected Logger wins over LogLevel
 	// entirely. Embedders wanting silence pass Nop.
@@ -811,8 +818,9 @@ func (c *Client) establish(ctx context.Context, target string, conn net.Conn) (*
 		rttEst:     newDefaultRTTEstimator(),
 	}
 	sess.unackedCond = sync.NewCond(&sess.unackedMu)
+	wideWindow := frameKeys != nil && frameKeys.wideWindow
 	if frameKeys.recovery {
-		sess.flow = newSendFlow(c.cfg.SendWindow, c.autoWindow, fecEnabled(c.cfg.Westwood))
+		sess.flow = newSendFlow(c.cfg.SendWindow, c.autoWindow, fecEnabled(c.cfg.Westwood), wideWindow)
 	}
 	if frameKeys != nil && frameKeys.fec {
 		sess.fecRecv = newFECReceiverExt(frameKeys.fecExt)
@@ -835,7 +843,7 @@ func (c *Client) establish(ctx context.Context, target string, conn net.Conn) (*
 	// reuses its exact encoded bytes), so the cap is conservative until the
 	// probe proves otherwise. It only ever rises here.
 	sess.sendCap.Store(int32(mtuStartCap(c.maxPkt, mtuProbeEnabled(c.cfg.MtuProbe))))
-	sess.delivery = newOrderedDelivery(deliveryWindow, sess.closeChan, func(p []byte) error { return writeAll(sess.conn, p) }, func(err error) { sess.closeWithReason("application write failed: " + err.Error()) }, sess.sendACK)
+	sess.delivery = newOrderedDelivery(deliveryLimitFor(wideWindow), sess.closeChan, func(p []byte) error { return writeAll(sess.conn, p) }, func(err error) { sess.closeWithReason("application write failed: " + err.Error()) }, sess.sendACK)
 	sess.retryWake = make(chan struct{}, 1)
 	sess.initTransmitter()
 	c.sessions.Store(sid, sess)
@@ -927,6 +935,9 @@ func (c *Client) handshake(ctx context.Context, target string) (uint32, *NoiseSe
 	if fecEnabled(c.cfg.Recovery) {
 		synFlags |= FLAG_RECOVERY_CAPABLE
 	}
+	if fecEnabled(c.cfg.WideWindow) {
+		synFlags |= FLAG_WIDE_WINDOW
+	}
 	if fecEnabled(c.cfg.FEC) {
 		synFlags |= FLAG_FEC_CAPABLE
 		if fecEnabled(c.cfg.FECExtParity) {
@@ -1010,6 +1021,7 @@ func (c *Client) handshake(ctx context.Context, target string) (uint32, *NoiseSe
 					frameKeys.fec = fecEnabled(c.cfg.FEC) && ack.Flags&FLAG_FEC_CAPABLE != 0
 					frameKeys.fecExt = frameKeys.fec && ack.Flags&FLAG_FEC_EXT_PARITY != 0
 					frameKeys.recovery = fecEnabled(c.cfg.Recovery) && ack.Flags&FLAG_RECOVERY_CAPABLE != 0
+					frameKeys.wideWindow = fecEnabled(c.cfg.WideWindow) && ack.Flags&FLAG_WIDE_WINDOW != 0
 					timer.Stop()
 					return ack.SessionID, nil, frameKeys, granted, nil
 				}
@@ -1023,6 +1035,7 @@ func (c *Client) handshake(ctx context.Context, target string) (uint32, *NoiseSe
 				frameKeys.fec = fecEnabled(c.cfg.FEC) && ack.Flags&FLAG_FEC_CAPABLE != 0
 				frameKeys.fecExt = frameKeys.fec && ack.Flags&FLAG_FEC_EXT_PARITY != 0
 				frameKeys.recovery = fecEnabled(c.cfg.Recovery) && ack.Flags&FLAG_RECOVERY_CAPABLE != 0
+				frameKeys.wideWindow = fecEnabled(c.cfg.WideWindow) && ack.Flags&FLAG_WIDE_WINDOW != 0
 				timer.Stop()
 				return ack.SessionID, sess, frameKeys, granted, nil
 			case <-timer.C:
@@ -1863,14 +1876,14 @@ func (s *clientSession) handleSACK(f *UDPCFrame) {
 		return
 	}
 	s.unackedMu.Lock()
-	wire, valid := updateSACK(s.flow, s.unacked, f, s.sendSeq.Load()-1, s.rttEst.SRTT())
+	wires, valid := updateSACK(s.flow, s.unacked, f, s.sendSeq.Load()-1, s.rttEst.SRTT())
 	s.unackedCond.Broadcast()
 	s.unackedMu.Unlock()
 	notifyRetry(s.retryWake)
 	if valid && f.Ack > 0 {
 		s.handleAck(f.Ack)
 	}
-	if wire != nil {
+	for _, wire := range wires {
 		if s.tx != nil {
 			s.tx.bestEffort(wire)
 		} else {

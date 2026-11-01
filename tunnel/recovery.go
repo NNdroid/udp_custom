@@ -77,12 +77,16 @@ const (
 // which means the extra in-flight frames cost nothing but room in `unacked`.
 const initialCwnd = 256
 
-func newSendFlow(maximum int, automatic bool, westwood bool) *sendFlow {
-	if automatic {
-		maximum = deliveryWindow
+func newSendFlow(maximum int, automatic bool, westwood bool, wide bool) *sendFlow {
+	ceiling := deliveryWindow
+	if wide {
+		ceiling = deliveryWindowWide
 	}
-	maximum = min(max(maximum, 1), deliveryWindow)
-	return &sendFlow{max: maximum, cwnd: min(initialCwnd, maximum), credit: deliveryWindow, ssthresh: maximum, westwood: westwood}
+	if automatic {
+		maximum = ceiling
+	}
+	maximum = min(max(maximum, 1), ceiling)
+	return &sendFlow{max: maximum, cwnd: min(initialCwnd, maximum), credit: ceiling, ssthresh: maximum, westwood: westwood}
 }
 
 func (f *sendFlow) window() int { return min(f.cwnd, f.credit) }
@@ -160,9 +164,10 @@ func (f *sendFlow) acknowledged(n int) {
 // style): on a lossy wireless path the bottleneck queue is empty — SRTT sits
 // at its floor — so a halving would just abandon bandwidth nobody is fighting
 // us for. There the window is restored to the measured BDP (delivery rate ×
-// SRTT) instead, never above the current window. Losses with the SRTT at
-// least congestedFactor above the min-RTT floor, or without a usable rate
-// estimate, keep the classic halving.
+// SRTT) instead, never above the current window, and only when that BDP is
+// materially BELOW it (a dead band holds the window when the two are close —
+// see the branch). Losses with the SRTT at least congestedFactor above the
+// min-RTT floor, or without a usable rate estimate, keep the classic halving.
 func (f *sendFlow) loss(now time.Time, rtt time.Duration, undoable bool) {
 	if rtt < 10*time.Millisecond {
 		rtt = 10 * time.Millisecond
@@ -176,6 +181,20 @@ func (f *sendFlow) loss(now time.Time, rtt time.Duration, undoable bool) {
 	}
 	if f.westwood && !f.congested(rtt) {
 		if bdp := f.bdp(rtt); bdp >= 2 {
+			// Dead band: when the measured BDP sits within 1/8 of the current
+			// window, the flight is already right-sized and the drop was
+			// incidental (random wireless loss). Trimming to the BDP here is
+			// subtly wrong: the delivery rate under random loss is
+			// cwnd*(1-p)/RTT, so rate*RTT is biased BELOW the true BDP by
+			// exactly the loss fraction. Cutting to it on every loss event
+			// removes (1-p) of the window per RTT while congestion avoidance
+			// only adds one frame per RTT — a sustained p% random-loss path
+			// would spiral toward the floor instead of holding its bandwidth.
+			// Only a BDP clearly below the window (a policer or shallow buffer
+			// absorbing oversend) justifies the cut.
+			if bdp >= f.cwnd-f.cwnd/8 {
+				return
+			}
 			f.ssthresh = max(2, min(f.cwnd, bdp))
 			f.cwnd = min(f.max, f.ssthresh)
 			f.growth = 0
@@ -289,7 +308,18 @@ func encodeSACK(credit uint16, bitmap uint64, extra ...uint64) []byte {
 
 // updateSACK rejects feedback outside the sent sequence range. Authenticated
 // but reordered control records cannot regress receive credit.
-func updateSACK(flow *sendFlow, outstanding map[uint64]*unackedPkt, f *UDPCFrame, highest uint64, rtt time.Duration) (wire []byte, valid bool) {
+// sackFastRepairMax bounds how many holes ONE SACK feedback may repair. The
+// head-of-line-only repair this replaces needed one SACK round trip per hole,
+// so a burst that punched five consecutive gaps trickled back at half an RTT
+// per frame — exactly the loss shape a weak network throws hardest.
+const sackFastRepairMax = 3
+
+// updateSACK processes one SACK feedback frame: it admits the advertised
+// out-of-order frames as selectively acknowledged and returns up to
+// sackFastRepairMax wire buffers for the oldest still-missing frames inside
+// the feedback horizon. Rejected (stale/corrupt) feedback reports valid=false
+// and repairs nothing.
+func updateSACK(flow *sendFlow, outstanding map[uint64]*unackedPkt, f *UDPCFrame, highest uint64, rtt time.Duration) (wires [][]byte, valid bool) {
 	if flow == nil || len(f.Data) < 2 || len(f.Data) > sackPayloadSize || (len(f.Data)-2)%8 != 0 || f.Ack > highest || f.PacketNo <= flow.feedbackNo {
 		return nil, false
 	}
@@ -303,8 +333,12 @@ func updateSACK(flow *sendFlow, outstanding map[uint64]*unackedPkt, f *UDPCFrame
 		count += bits.OnesCount64(words[i])
 	}
 	credit := int(binary.BigEndian.Uint16(f.Data))
-	if credit > deliveryWindow {
-		return nil, false
+	// Clamp, never reject: credit beyond our ceiling is either a wide peer on
+	// a wider window (harmless — window() already min()s against the flow
+	// cap) or a corrupt frame. Rejecting the whole SACK over it would silently
+	// disable fast repair, which is how mixed versions used to stall.
+	if credit > deliveryWindowWide {
+		credit = deliveryWindowWide
 	}
 	flow.feedbackNo = f.PacketNo
 	flow.credit = credit
@@ -322,22 +356,45 @@ func updateSACK(flow *sendFlow, outstanding map[uint64]*unackedPkt, f *UDPCFrame
 	if count < 3 {
 		return nil, true
 	}
-	seq := f.Ack + 1
-	p := outstanding[seq]
 	now := time.Now()
 	guard := max(5*time.Millisecond, rtt/4)
-	if p == nil || p.sacked || now.Sub(p.sentTime) < guard || p.retries >= clientMaxRetries {
+	// Repair the OLDEST holes first, up to sackFastRepairMax. The candidate
+	// scan covers the same horizon the bitmap does (one admission bit per
+	// sequence above f.Ack).
+	var due []retryFrame
+	for seq := f.Ack + 1; seq <= f.Ack+512 && seq <= highest; seq++ {
+		p := outstanding[seq]
+		if p == nil || p.sacked || p.queued {
+			// queued = still sitting in the transmit queue, not yet on the
+			// wire: repairing it here would double-send and burn retry budget
+			// on a frame that was never lost.
+			continue
+		}
+		if now.Sub(p.sentTime) < guard || p.retries >= clientMaxRetries {
+			continue
+		}
+		due = append(due, retryFrame{seq, p.wire})
+		if len(due) >= sackFastRepairMax {
+			break
+		}
+	}
+	if len(due) == 0 {
 		return nil, true
 	}
-	p.retries++
-	p.sentTime = now
-	// Advance the same backoff ladder retryDue does: a fast repair burns one
-	// retry like anything else, so leaving rto alone would consume the whole
-	// 15-retry budget at the guard cadence and abandon a live path in seconds.
-	p.rto = min(p.rto*3/2, rttMaxRTO)
-	flow.fastRepairs++
+	wires = make([][]byte, 0, len(due))
+	for _, d := range due {
+		p := outstanding[d.seq]
+		p.retries++
+		p.sentTime = now
+		// Advance the same backoff ladder retryDue does: a fast repair burns one
+		// retry like anything else, so leaving rto alone would consume the whole
+		// 15-retry budget at the guard cadence and abandon a live path in seconds.
+		p.rto = min(p.rto*3/2, rttMaxRTO)
+		wires = append(wires, p.wire)
+	}
+	flow.fastRepairs += len(wires)
 	flow.loss(now, rtt, false)
-	return p.wire, true
+	return wires, true
 }
 
 type retryFrame struct {

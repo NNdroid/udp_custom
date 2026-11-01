@@ -6,7 +6,33 @@ import (
 	"time"
 )
 
+// deliveryWindow is the wire-safe baseline flight cap, in frames. The SACK
+// bitmap is 512 bits wide (one admission per bit), so 512 needs no protocol
+// extension at all; anything beyond it requires FLAG_WIDE_WINDOW (see
+// deliveryWindowWide).
 const deliveryWindow = 512
+
+// deliveryWindowWide is the flight cap for sessions that negotiated
+// FLAG_WIDE_WINDOW. The window IS the BDP ceiling: 512 frames of ~1450 bytes
+// caps throughput at 24 Mbps at 250 ms RTT and 15 Mbps at 400 ms — exactly
+// the high-RTT links weak networks run on. 2048 frames (~3 MB of wire
+// buffers per session in the worst case) lifts the ceiling to ~95 Mbps at
+// 250 ms. The SACK bitmap stays 512 bits: a short bitmap is legal (it only
+// describes the head of the outstanding range) and keeps the wire format
+// identical to the baseline.
+const deliveryWindowWide = 2048
+
+// deliveryLimitFor returns the ordered-delivery limit (and thus the credit
+// this end advertises) for a session. Only a negotiated wide session may
+// advertise credit beyond deliveryWindow: an old peer validates incoming
+// credit against the 512 ceiling and would reject every SACK from us
+// otherwise, silently disabling its own fast repair.
+func deliveryLimitFor(wide bool) int {
+	if wide {
+		return deliveryWindowWide
+	}
+	return deliveryWindow
+}
 
 // orderedDelivery owns every accepted payload until the sole writer completes
 // it. Admission, order, and memory limits are independent of socket readers.
@@ -26,8 +52,8 @@ type orderedDelivery struct {
 }
 
 func newOrderedDelivery(limit int, done <-chan struct{}, write func([]byte) error, fail func(error), ack func(uint64)) *orderedDelivery {
-	if limit <= 0 || limit > deliveryWindow {
-		limit = deliveryWindow
+	if limit <= 0 || limit > deliveryWindowWide {
+		limit = deliveryWindowWide
 	}
 	d := &orderedDelivery{pending: make(map[uint64][]byte), limit: limit, wake: make(chan struct{}, 1), done: done, write: write, fail: fail, ack: ack}
 	go d.run()
@@ -86,8 +112,14 @@ func (d *orderedDelivery) snapshot() (ack uint64, bitmap [8]uint64, credit uint1
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	ack = d.delivered.Load()
+	// The bitmap has room for 512 admissions regardless of how wide the
+	// delivery limit is: a wide session may hold far more pending frames, and
+	// indexing past the bitmap would panic. Frames beyond the last bitmap bit
+	// are simply not described here — the SACK covers its head, the peer's RTO
+	// covers the rest.
+	const bitmapBits = uint64(8 * 64)
 	for seq := range d.pending {
-		if seq > ack && seq-ack <= deliveryWindow {
+		if seq > ack && seq-ack <= bitmapBits {
 			bit := seq - ack - 1
 			bitmap[bit/64] |= uint64(1) << (bit % 64)
 		}

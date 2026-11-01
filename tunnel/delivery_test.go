@@ -104,3 +104,44 @@ func TestDelayedACKSinglePairAndClose(t *testing.T) {
 		}
 	})
 }
+
+// TestSnapshotNeverOverrunsBitmap: a wide session may hold far more pending
+// frames than the 512-bit SACK bitmap can describe. snapshot must clamp its
+// scan to the bitmap instead of indexing past it.
+func TestSnapshotNeverOverrunsBitmap(t *testing.T) {
+	done := make(chan struct{})
+	defer close(done)
+	d := newOrderedDelivery(deliveryWindowWide, done, func([]byte) error { return nil }, func(error) {}, func(uint64) {})
+	ack, bitmap, credit := d.snapshot()
+	if ack != 0 || credit != deliveryWindowWide {
+		t.Fatalf("empty snapshot ack=%d credit=%d", ack, credit)
+	}
+	d.mu.Lock()
+	d.pending[5] = []byte("head")   // within the bitmap: bit 4
+	d.pending[1000] = []byte("far") // beyond the bitmap: must be ignored, not panic
+	d.pending[2048] = []byte("farther")
+	d.mu.Unlock()
+	ack, bitmap, credit = d.snapshot()
+	if bitmap[0] != 1<<4 {
+		t.Fatalf("bitmap[0] = %#x, want %#x", bitmap[0], uint64(1<<4))
+	}
+	for i := 1; i < len(bitmap); i++ {
+		if bitmap[i] != 0 {
+			t.Fatalf("bitmap[%d] = %#x, want 0 (out-of-range admissions must be skipped)", i, bitmap[i])
+		}
+	}
+	if credit != deliveryWindowWide-3 {
+		t.Fatalf("credit = %d, want %d", credit, deliveryWindowWide-3)
+	}
+}
+
+// TestDeliveryLimitFor: only a negotiated wide session may advertise credit
+// beyond the 512-frame wire baseline (an old peer would reject it).
+func TestDeliveryLimitFor(t *testing.T) {
+	if got := deliveryLimitFor(false); got != deliveryWindow {
+		t.Fatalf("baseline limit = %d, want %d", got, deliveryWindow)
+	}
+	if got := deliveryLimitFor(true); got != deliveryWindowWide {
+		t.Fatalf("wide limit = %d, want %d", got, deliveryWindowWide)
+	}
+}

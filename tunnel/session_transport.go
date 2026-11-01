@@ -310,29 +310,55 @@ func (s *ServerSession) sendToSessionBatch(wires [][]byte) error {
 	return nil
 }
 
+// batchItem is one queued wire buffer with the destination port the shuffle
+// bag selected for it; repair preserves that exact port.
+type batchItem struct {
+	wire []byte
+	port int
+}
+
+// batchScratch is the per-call workspace of sendBatch, pooled because the
+// transmit queue fires many batches per second per session and the map plus
+// two scratch slices were pure GC pressure on the hot path.
+type batchScratch struct {
+	groups map[int][]batchItem
+	data   [][]byte
+	dst    []netip.AddrPort
+}
+
+var batchScratchPool = sync.Pool{New: func() any {
+	return &batchScratch{groups: make(map[int][]batchItem, 8)}
+}}
+
 // sendBatch selects the same n:n tuples as Send and groups frames by source
 // socket. Repair preserves each selected destination port and never resends a
 // prefix that sendmmsg already accepted.
 func (d *SpreadDialer) sendBatch(wires [][]byte) error {
-	type selected struct {
-		wire []byte
-		port int
-	}
-	groups := make(map[int][]selected)
+	sc := batchScratchPool.Get().(*batchScratch)
+	defer func() {
+		for k := range sc.groups {
+			delete(sc.groups, k)
+		}
+		batchScratchPool.Put(sc)
+	}()
 	for _, wire := range wires {
 		idx, port := d.Next()
 		if idx < 0 {
 			return ErrNoRoute
 		}
-		groups[idx] = append(groups[idx], selected{wire, port})
+		sc.groups[idx] = append(sc.groups[idx], batchItem{wire, port})
 	}
 	var firstErr error
-	for idx, group := range groups {
+	for idx, group := range sc.groups {
 		d.destMu.RLock()
 		addr := d.serverAddr
 		d.destMu.RUnlock()
-		data := make([][]byte, len(group))
-		dst := make([]netip.AddrPort, len(group))
+		if cap(sc.data) < len(group) {
+			sc.data = make([][]byte, len(group))
+			sc.dst = make([]netip.AddrPort, len(group))
+		}
+		data := sc.data[:len(group)]
+		dst := sc.dst[:len(group)]
 		for i, p := range group {
 			data[i] = p.wire
 			dst[i] = netip.AddrPortFrom(addr, uint16(p.port))

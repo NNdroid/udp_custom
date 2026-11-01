@@ -15,6 +15,7 @@
     "fec": "Adaptive Reed-Solomon forward error correction. true/absent = negotiate FEC with capable clients; false = pure ARQ. FEC uses blocks of up to 8 DATA shards, adapts 0-4 parity shards from smoothed local/remote loss estimates, flushes partial blocks after 15ms, and leaves the existing ARQ retransmission path as the final reliability fallback.",
     "fec_ext_parity": "Allow the extended FEC parity encoding negotiated via FLAG_FEC_EXT_PARITY: deeper RS(8,8) buckets that spend 50% overhead tolerating heavy loss on deep weak networks. true/absent = mirror the client's offer back; false = refuse the extension and keep the standard 0-4 parity encoding even when the client offers it.",
     "westwood": "Westwood-style congestion discrimination in the recovery window: a loss whose SRTT sits near its min-RTT floor is random wireless loss and restores the window to the measured BDP instead of halving it; only SRTT inflation (real congestion) halves. true/absent = enabled; false restores classic AIMD halving on every loss.",
+    "wide_window": "Negotiates 2048-frame delivery windows when the client also supports them (FLAG_WIDE_WINDOW). The window is the BDP ceiling: the 512-frame baseline caps throughput at about 24 Mbps on a 250 ms RTT link, which is exactly what high-RTT weak networks run into. Sessions against older clients always keep the 512-frame baseline. true/absent = enabled; false rejects the flag.",
     "log_level": "Logging verbosity: debug, info, warn, error",
     "max_pkt": "Largest v2 record (40-byte header + payload + 16-byte tag) this server puts on the wire, i.e. the UDP payload size. 0/absent = 1450, which produces a 1478-byte IPv4 datagram and assumes a 1500-byte path MTU. Lower it when the server sits behind a link with a smaller MTU (1420 is typical of WireGuard and similar tunnels), where IPv4 fragments are dropped and large frames stall while small ones keep working: 1200 survives any path with MTU >= 1248, 548 never fragments on IPv4. Values above 1450 are clamped. Lowering it on one side alone is always safe; the peer never needs reconfiguring."
   },
@@ -37,6 +38,7 @@
   "fec": true,
   "fec_ext_parity": true,
   "westwood": true,
+  "wide_window": true,
   "max_pkt": 1450,
   "magic": "UDPC",
   "privkey": "",

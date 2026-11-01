@@ -122,6 +122,11 @@ type Config struct {
 	// instead of halving it. Absent = enabled on both ends; set false to
 	// restore classic AIMD halving on every loss.
 	Westwood *bool `json:"westwood,omitempty"`
+	// WideWindow negotiates 2048-frame delivery windows (vs the 512-frame
+	// wire baseline) when BOTH ends support it. The window is the BDP
+	// ceiling: 512 frames caps throughput at ~24 Mbps on a 250 ms RTT link.
+	// Absent = enabled; set false to keep the 512-frame baseline always.
+	WideWindow *bool `json:"wide_window,omitempty"`
 }
 
 func (c *Config) UnmarshalJSON(data []byte) error {
@@ -256,6 +261,7 @@ func runClientMode(cfg *Config, magicStr, lvl string, sendWindow int) {
 		FECExtParity: cfg.FECExtParity,
 		FECLossMemo:  cfg.FECLossMemo,
 		Westwood:     cfg.Westwood,
+		WideWindow:   cfg.WideWindow,
 	}
 
 	// Optional Noise_NK encryption, keyed by the server's static public key.
@@ -354,6 +360,7 @@ func runFromConfig(path string) {
 		Recovery:       cfg.Recovery,
 		FECExtParity:   cfg.FECExtParity,
 		Westwood:       cfg.Westwood,
+		WideWindow:     cfg.WideWindow,
 	}
 
 	srv, err := tunnel.NewServer(srvCfg)

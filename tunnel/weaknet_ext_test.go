@@ -8,7 +8,7 @@ import (
 // --- ③-2: Westwood delivery-rate restore + delay-gradient discrimination ---
 
 func newTestFlow() *sendFlow {
-	f := newSendFlow(512, false, true)
+	f := newSendFlow(512, false, true, false)
 	f.cwnd = 256
 	f.ssthresh = 512
 	return f
@@ -18,7 +18,7 @@ func newTestFlow() *sendFlow {
 // gate: with the discrimination turned off even floor-level SRTT loss takes
 // the classic halving, restoring the pre-weaknet behaviour.
 func TestSendFlowWestwoodDisabledHalvesAlways(t *testing.T) {
-	f := newSendFlow(512, false, false)
+	f := newSendFlow(512, false, false, false)
 	f.cwnd = 256
 	f.ssthresh = 512
 	f.minRTT = 50 * time.Millisecond
@@ -248,5 +248,38 @@ func TestFECExtMetadataBounds(t *testing.T) {
 	}
 	if got.ParityShards != 8 || got.Index != 5 {
 		t.Fatalf("ext parse: m=%d idx=%d, want 8/5", got.ParityShards, got.Index)
+	}
+}
+
+// TestSendFlowNearBDPLossHoldsWindow pins the dead band that keeps sustained
+// random loss from spiraling the window toward the floor. The delivery-rate
+// BDP under random loss is biased below the true BDP by the loss fraction
+// (rate = cwnd*(1-p)/RTT), so when it sits within 1/8 of the window the loss
+// is incidental and the window must be HELD, not trimmed to the biased
+// estimate on every event.
+func TestSendFlowNearBDPLossHoldsWindow(t *testing.T) {
+	f := newTestFlow()
+	f.minRTT = 50 * time.Millisecond
+	f.rate = 5000 // BDP = 5000/s * 50ms = 250, inside 256-256/8 = 224? no: 250 >= 224
+	f.rateAt = time.Now()
+
+	f.loss(time.Now(), 50*time.Millisecond, false)
+	if f.cwnd != 256 {
+		t.Fatalf("near-BDP random-loss cwnd = %d, want held 256 (dead band)", f.cwnd)
+	}
+}
+
+// TestSendFlowFarBelowBDPStillRestores guards the other side of the dead
+// band: a BDP clearly below the window (policer/shallow-buffer oversend)
+// still takes the Westwood restore.
+func TestSendFlowFarBelowBDPStillRestores(t *testing.T) {
+	f := newTestFlow()
+	f.minRTT = 50 * time.Millisecond
+	f.rate = 2000 // BDP = 100, well below the 224 dead-band edge
+	f.rateAt = time.Now()
+
+	f.loss(time.Now(), 50*time.Millisecond, false)
+	if f.cwnd != 100 {
+		t.Fatalf("far-below-BDP cwnd = %d, want restored 100", f.cwnd)
 	}
 }

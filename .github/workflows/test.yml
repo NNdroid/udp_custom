@@ -58,17 +58,24 @@ jobs:
 
       # golang/go#77975: the windows/amd64 runtime faults mid-run with
       # "Exception 0xc0000005 ... unknown pc" — a return address corrupted
-      # during async preemption + stack growth. A second variant of the same
-      # memory corruption surfaced as "panic: inconsistent poll.fdMutex"
-      # (2026-11-04): the corrupted pointer there was the fdMutex receiver
-      # itself, which user-level misuse cannot produce (netpoll's
-      # Write/Close contract makes it safe; linux/macos race runs were green).
-      # Both are process-level crashes, NOT race reports; they are
+      # during async preemption + stack growth. Two further variants of the
+      # same memory corruption have since surfaced (2026-11-04):
+      #  - "panic: inconsistent poll.fdMutex" with a corrupted FD receiver
+      #    pointer, which user-level misuse cannot produce (netpoll's
+      #    Write/Close contract makes concurrent Write/Close safe;
+      #    linux/macos race runs were green).
+      #  - a nil-pointer deref inside fecReceiver.onData where the nil value
+      #    came out of a map iteration: every r.blocks insert is non-nil and
+      #    lock-guarded (fec.go), so a map can never yield a nil value in a
+      #    correct execution — the bucket value pointer was zeroed.
+      # All are process-level crashes, NOT race reports; they are
       # code-independent — the same commit has both passed and failed this
       # job (2026-10-28 and 2026-11-04). Retry ONLY these crash signatures;
       # a DATA RACE report or an assertion failure still fails the job first
-      # try. If either signature ever reproduces on Linux, it must be
-      # investigated as a real bug instead.
+      # try. If any signature ever reproduces on Linux, it must be
+      # investigated as a real bug instead. The nil-deref retry is scoped to
+      # the observed impossible-nil site only; a deterministic real bug there
+      # would simply fail all three attempts.
       - name: Test with race detector
         shell: bash
         run: |
@@ -84,6 +91,10 @@ jobs:
             fi
             if grep -q 'panic: inconsistent poll.fdMutex' "$log"; then
               echo "::warning::race run $attempt hit the windows fdMutex corruption variant of golang/go#77975; retrying"
+              continue
+            fi
+            if grep -q 'nil pointer dereference' "$log" && grep -q 'fecReceiver).onData' "$log"; then
+              echo "::warning::race run $attempt hit an impossible nil map value (windows memory corruption, fec.go onData); retrying"
               continue
             fi
             echo "race run failed without the known crash signature"

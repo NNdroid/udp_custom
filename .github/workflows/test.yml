@@ -102,8 +102,33 @@ jobs:
           go-version-file: go.mod
           check-latest: true
 
+      # ubuntu-latest rolled to Ubuntu 26.04, where qemu-user-static became a
+      # VIRTUAL package with no installation candidate ("has no installation
+      # candidate", providers qemu-user-binfmt / qemu-user-binfmt-hwe). Older
+      # images still ship -static. Install whichever name this image actually
+      # has instead of pinning one and breaking on every runner roll.
       - name: Install qemu-user (execute 32-bit test binaries)
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-user-static
+        run: |
+          sudo apt-get update
+          for pkg in qemu-user-binfmt qemu-user-binfmt-hwe qemu-user-static; do
+            if apt-cache policy "$pkg" 2>/dev/null | grep -q 'Candidate: [0-9]'; then
+              echo "installing $pkg"
+              sudo apt-get install -y --no-install-recommends "$pkg"
+              break
+            fi
+          done
+          # Handlers register through systemd-binfmt; poke the unit in case it
+          # already ran with an empty /usr/lib/binfmt.d.
+          sudo systemctl restart systemd-binfmt 2>/dev/null || true
+          echo "registered qemu handlers:" && (ls /proc/sys/fs/binfmt_misc/ | grep qemu || true)
+
+      # Fail here, with a readable message, when the handler did not register.
+      # The symptom further down would be a bare "Exec format error" from the
+      # first test binary, which says nothing about binfmt.
+      - name: Verify qemu executes a 386 binary
+        run: |
+          GOARCH=386 go test -c -o /tmp/smoke.test ./tunnel/
+          /tmp/smoke.test -test.list 'TestOrderedDelivery'
 
       - name: Vet (386 + arm, compile-time check)
         run: |
@@ -139,8 +164,20 @@ jobs:
           go-version-file: go.mod
           check-latest: true
 
+      # Same package-name drift as the 32-bit test job above (Ubuntu 26.04
+      # turned qemu-user-static into a virtual package).
       - name: Install qemu-user (execute 32-bit binaries)
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-user-static
+        run: |
+          sudo apt-get update
+          for pkg in qemu-user-binfmt qemu-user-binfmt-hwe qemu-user-static; do
+            if apt-cache policy "$pkg" 2>/dev/null | grep -q 'Candidate: [0-9]'; then
+              echo "installing $pkg"
+              sudo apt-get install -y --no-install-recommends "$pkg"
+              break
+            fi
+          done
+          sudo systemctl restart systemd-binfmt 2>/dev/null || true
+          echo "registered qemu handlers:" && (ls /proc/sys/fs/binfmt_misc/ | grep qemu || true)
 
       - name: Throughput benchmarks 386 (Target x protocol)
         run: >

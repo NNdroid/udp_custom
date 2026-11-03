@@ -145,3 +145,52 @@ func TestDeliveryLimitFor(t *testing.T) {
 		t.Fatalf("wide limit = %d, want %d", got, deliveryWindowWide)
 	}
 }
+
+// TestOrderedDeliveryFeedsPeerWhileWriterStalls: a local reader that stops
+// consuming must not silence the feedback path. Nothing has been delivered, so
+// the peer's cumulative ACK cannot advance — correctly — but staying silent
+// makes the peer's RTO ladder fire on frames we are already holding, collapse
+// a window that was never congested, and starve its own upload behind it. The
+// per-frame feedback keeps telling the peer what is buffered, and the credit
+// snapshot it carries makes the peer settle at what we can accept.
+func TestOrderedDeliveryFeedsPeerWhileWriterStalls(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		done := make(chan struct{})
+		gate := make(chan struct{})
+		var mu sync.Mutex
+		var acks []uint64
+		d := newOrderedDelivery(8, done,
+			func([]byte) error { <-gate; return nil },
+			func(err error) { t.Error(err) },
+			func(seq uint64) { mu.Lock(); acks = append(acks, seq); mu.Unlock() })
+		defer func() { d.close(); close(done) }()
+
+		if !d.offer(1, []byte("A")) {
+			t.Fatal("admission failed")
+		}
+		synctest.Wait() // the sole writer is now parked inside write()
+		time.Sleep(2 * stallFeedbackInterval)
+
+		mu.Lock()
+		before := len(acks)
+		mu.Unlock()
+		for seq := uint64(2); seq <= 5; seq++ {
+			if !d.offer(seq, []byte("xxxxxxxx")) {
+				t.Fatalf("admission of %d failed", seq)
+			}
+		}
+		synctest.Wait()
+
+		mu.Lock()
+		after := len(acks)
+		mu.Unlock()
+		if after <= before {
+			t.Fatalf("no feedback while the writer was blocked (acks=%v)", acks)
+		}
+		// Credit must count the frames we are holding: limit 8, 5 buffered.
+		if _, _, credit := d.snapshot(); credit != 3 {
+			t.Fatalf("credit = %d, want 3 (8-5 buffered)", credit)
+		}
+		close(gate)
+	})
+}

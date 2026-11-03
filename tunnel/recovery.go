@@ -46,6 +46,13 @@ type sendFlow struct {
 	// westwood gates the delivery-rate loss discrimination above. When false
 	// every loss takes the classic AIMD halving (pre-Westwood behaviour).
 	westwood bool
+	// restartTo asks the next ACK to re-enter slow start, and how far to climb
+	// exponentially before falling back to congestion avoidance. It is set by
+	// a loss that was diagnosed as NOT queue buildup — or as nothing at all
+	// because there is no RTT baseline yet. Without it a cut recovers one frame
+	// per RTT, which at 50 ms RTT is 20 frames per second: a single loss on a
+	// fresh session looks exactly like a stalled page.
+	restartTo int
 }
 
 const (
@@ -69,13 +76,29 @@ const (
 	congestedFactor = 2
 )
 
-// initialCwnd is the flight size a fresh session starts with. It used to be 64
-// frames, which capped upload at 64*record/RTT (about 7 Mbps at 100 ms RTT)
-// and took ~450 RTTs to climb to the window cap; TCP opens connections with a
-// much larger window for exactly this reason. Web traffic is bursty, so the
-// window spends most of its life below ssthresh and grows additively anyway,
-// which means the extra in-flight frames cost nothing but room in `unacked`.
+// initialCwnd is the flight size a fresh session starts with.
+//
+// 256 frames is fine — but only because it is PACED. It used to be sent
+// unpaced: waitBurst returned immediately while the RTT estimator had no
+// sample, so a fresh session dumped the whole window (about 300 KB) into one
+// instant. That burst overruns an ordinary receive buffer, and the resulting
+// loss lands exactly when it hurts most — before the first delivery-rate
+// sample exists, so the flow cannot tell random loss from congestion and takes
+// the classic halving. The window then crawled back one frame per RTT, which
+// is what made a fresh bulk transfer stall at single-digit Mbps.
+//
+// Keeping the window large keeps the first flight useful (a web response and
+// the first few RTTs of a bulk transfer never wait for slow start); pacing the
+// opening window is what makes it safe. See bootstrapPaceRTT.
 const initialCwnd = 256
+
+// bootstrapPaceRTT is the RTT used to pace the very first window, before the
+// estimator has any sample — and an unknown RTT is not a reason to skip pacing.
+// It is deliberately short: spreading the opening window over a full guessed
+// RTT would delay a small transfer by that guess, while 20 ms keeps the burst
+// rate (~15 Mbps) low enough that no receive buffer is overrun and fast enough
+// not to be felt.
+const bootstrapPaceRTT = 20 * time.Millisecond
 
 func newSendFlow(maximum int, automatic bool, westwood bool, wide bool) *sendFlow {
 	ceiling := deliveryWindow
@@ -143,6 +166,13 @@ func (f *sendFlow) sampleRate(n int, now time.Time) {
 
 func (f *sendFlow) acknowledged(n int) {
 	f.sampleRate(n, time.Now())
+	if f.restartTo > 0 {
+		// The last cut was defensive (or made blind, before any RTT sample):
+		// climb back exponentially to where the window already worked, then
+		// resume congestion avoidance from there.
+		f.ssthresh = max(f.cwnd, min(f.max, f.restartTo))
+		f.restartTo = 0
+	}
 	if f.cwnd < f.ssthresh {
 		f.cwnd = min(f.max, f.cwnd+n)
 		return
@@ -160,14 +190,24 @@ func (f *sendFlow) acknowledged(n int) {
 // was jitter, not loss. SACK gaps are not marked, because three later
 // admissions are stronger evidence than a bare timeout.
 //
-// Losses that arrive WITHOUT queue buildup are treated differently (Westwood
-// style): on a lossy wireless path the bottleneck queue is empty — SRTT sits
-// at its floor — so a halving would just abandon bandwidth nobody is fighting
-// us for. There the window is restored to the measured BDP (delivery rate ×
-// SRTT) instead, never above the current window, and only when that BDP is
-// materially BELOW it (a dead band holds the window when the two are close —
-// see the branch). Losses with the SRTT at least congestedFactor above the
-// min-RTT floor, or without a usable rate estimate, keep the classic halving.
+// Three cases, told apart by the RTT baseline and the delivery-rate estimate:
+//
+//   - No baseline yet (the opening burst). A drop here says nothing about the
+//     queue, so cut but re-probe at once ("blind").
+//   - SRTT sitting at its floor with Westwood enabled (a lossy path whose
+//     bottleneck queue is empty). Trim by at most a quarter and re-probe: a
+//     halving would abandon bandwidth nobody is fighting us for ("trim").
+//   - SRTT inflated at least congestedFactor above the floor, i.e. a queue we
+//     built. Classic AIMD halving, and no fast restart ("halve").
+//
+// The 1/4 dead band and the 1/4 cut floor are load-bearing, not cosmetic. The
+// delivery rate is measured while our own window is the limiter, so rate*RTT
+// is ALWAYS slightly below cwnd (EWMA lag + the loss fraction itself). Cutting
+// to it on every loss therefore shrank the window a little on every event
+// while congestion avoidance added one frame per RTT: cwnd ratcheted from 256
+// down to single digits over a few seconds, throughput fell with it, and the
+// falling rate pulled the next target down again. A path with one unlucky
+// opening burst never recovered.
 func (f *sendFlow) loss(now time.Time, rtt time.Duration, undoable bool) {
 	if rtt < 10*time.Millisecond {
 		rtt = 10 * time.Millisecond
@@ -179,31 +219,37 @@ func (f *sendFlow) loss(now time.Time, rtt time.Duration, undoable bool) {
 	if undoable && f.cwnd > f.lastLossCut {
 		f.lastLossCut = f.cwnd
 	}
-	if f.westwood && !f.congested(rtt) {
-		if bdp := f.bdp(rtt); bdp >= 2 {
-			// Dead band: when the measured BDP sits within 1/8 of the current
-			// window, the flight is already right-sized and the drop was
-			// incidental (random wireless loss). Trimming to the BDP here is
-			// subtly wrong: the delivery rate under random loss is
-			// cwnd*(1-p)/RTT, so rate*RTT is biased BELOW the true BDP by
-			// exactly the loss fraction. Cutting to it on every loss event
-			// removes (1-p) of the window per RTT while congestion avoidance
-			// only adds one frame per RTT — a sustained p% random-loss path
-			// would spiral toward the floor instead of holding its bandwidth.
-			// Only a BDP clearly below the window (a policer or shallow buffer
-			// absorbing oversend) justifies the cut.
-			if bdp >= f.cwnd-f.cwnd/8 {
-				return
-			}
-			f.ssthresh = max(2, min(f.cwnd, bdp))
-			f.cwnd = min(f.max, f.ssthresh)
-			f.growth = 0
+	pre := f.cwnd
+	floor := max(2, f.cwnd-f.cwnd/4)
+	target := max(2, f.cwnd/2)
+	restartTo := 0
+	switch {
+	case f.minRTT <= 0:
+		// No RTT baseline yet. congested() answers "yes" here purely out of
+		// caution, but a loss during the opening burst is far more likely to be
+		// a full receive buffer at line rate than a queue we built. Cut, then
+		// re-probe immediately: without the restart the window recovers one
+		// frame per RTT, which is slower than the connection that dropped it.
+		restartTo = pre
+	case f.westwood && !f.congested(rtt):
+		// SRTT at its floor: the bottleneck queue is empty, so the drop was
+		// random rather than a queue we built. Trim by at most a quarter, and
+		// hold entirely when the measured BDP is already within that quarter.
+		bdp := f.bdp(rtt)
+		if bdp >= floor {
 			return
 		}
+		if bdp >= 2 {
+			target = max(bdp, floor)
+		} else {
+			target = floor
+		}
+		restartTo = f.max
 	}
-	f.ssthresh = max(2, f.cwnd/2)
+	f.ssthresh = max(2, min(f.cwnd, target))
 	f.cwnd = min(f.max, f.ssthresh)
 	f.growth = 0
+	f.restartTo = restartTo
 }
 
 // congested reports whether SRTT inflation marks this loss as congestion.
@@ -265,9 +311,13 @@ func (f *sendFlow) undoIfSpurious(p *unackedPkt, srtt time.Duration) bool {
 
 // Pace a small burst rather than creating one timer per datagram. All DATA,
 // repair DATA and FEC share this budget; control feedback is never held here.
+//
+// An unknown RTT is NOT a reason to skip pacing: that turned the opening
+// window into one unpaced burst (see initialCwnd). It is paced against a
+// deliberately short bootstrap RTT instead.
 func (f *sendFlow) waitBurst(n, window int, rtt time.Duration, done <-chan struct{}) bool {
 	if rtt <= 0 {
-		return true
+		rtt = bootstrapPaceRTT
 	}
 	f.paceMu.Lock()
 	now := time.Now()

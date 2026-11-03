@@ -37,10 +37,19 @@ const (
 
 const (
 	clientMaxHandshakeAttempts = 8
-	clientHandshakeBackoff     = 400 * time.Millisecond
-	clientKeepAliveInterval    = 15 * time.Second
-	clientRecvTimeout          = 210 * time.Second // > server's 180s weak-network idle cleanup
-	clientMaxRetries           = 15
+	// clientHandshakeBackoff is the wait before the FIRST SYN retry, doubled on
+	// each subsequent attempt and capped by clientHandshakeBackoffMax. It used
+	// to grow linearly from 400 ms (400, 800, 1200, …), so losing one SYN cost
+	// 400 ms — eight round trips on a 50 ms path — right at the moment the user
+	// is waiting for a page to start loading. Nothing is known about the path
+	// before the first ACK, so the first wait stays comfortably above a slow
+	// mobile RTT; the duplicates a short-lived path would cause are one small
+	// control datagram.
+	clientHandshakeBackoff    = 300 * time.Millisecond
+	clientHandshakeBackoffMax = 2 * time.Second
+	clientKeepAliveInterval   = 15 * time.Second
+	clientRecvTimeout         = 210 * time.Second // > server's 180s weak-network idle cleanup
+	clientMaxRetries          = 15
 
 	// uplinkCoalesceWindow bounds how long a partial record waits for more
 	// bytes from the local application before it is sent. Web traffic is made
@@ -977,7 +986,7 @@ func (c *Client) handshake(ctx context.Context, target string) (uint32, *NoiseSe
 		if err := c.dialer.SendAt(0, syn); err != nil {
 			c.logDebug("[Client] 📤 Handshake attempt %d send failed: %v", attempt, err)
 		}
-		timeout := clientHandshakeBackoff * time.Duration(attempt)
+		timeout := min(clientHandshakeBackoff<<(attempt-1), clientHandshakeBackoffMax)
 		timer := time.NewTimer(timeout)
 		waiting := true
 		for waiting {

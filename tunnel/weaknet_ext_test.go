@@ -33,21 +33,32 @@ func TestSendFlowWestwoodDisabledHalvesAlways(t *testing.T) {
 	}
 }
 
-func TestSendFlowRandomLossRestoresBDP(t *testing.T) {
+func TestSendFlowRandomLossTrimsTowardBDP(t *testing.T) {
 	f := newTestFlow()
 	f.minRTT = 50 * time.Millisecond
 	f.rate = 1000 // 1000 frames/s
 	f.rateAt = time.Now()
 
 	// Loss with the SRTT at the floor: no queue buildup, so the drop was
-	// random wireless loss. BDP = 1000/s * 50ms = 50 frames — the window
-	// shrinks to the BDP instead of blindly halving to 128.
+	// random wireless loss. The window heads for the measured BDP (50 frames)
+	// but by at most a quarter per event: rate*RTT is sampled while our own
+	// window is the limiter, so it sits below the truth by construction, and
+	// cutting straight to it on every drop ratchets the window to the floor.
 	f.loss(time.Now(), 50*time.Millisecond, false)
-	if f.cwnd != 50 {
-		t.Fatalf("random-loss cwnd = %d, want BDP 50 (blind halving would give 128)", f.cwnd)
+	if f.cwnd != 192 {
+		t.Fatalf("first trim cwnd = %d, want 256-64 = 192", f.cwnd)
 	}
-	if f.ssthresh != 50 {
-		t.Fatalf("ssthresh = %d, want 50", f.ssthresh)
+	if f.restartTo != f.max {
+		t.Fatalf("restartTo = %d, want a full re-probe to %d", f.restartTo, f.max)
+	}
+	// Repeated events walk down until the dead band holds.
+	for i := 0; i < 8; i++ {
+		f.lastLoss = time.Time{} // bypass the once-per-RTT limiter
+		f.rateAt = time.Now()
+		f.loss(time.Now(), 50*time.Millisecond, false)
+	}
+	if f.cwnd < 50 || f.cwnd > 70 {
+		t.Fatalf("converged cwnd = %d, want the BDP neighbourhood (~50)", f.cwnd)
 	}
 }
 
@@ -83,17 +94,22 @@ func TestSendFlowCongestedLossStillHalves(t *testing.T) {
 	}
 }
 
-func TestSendFlowStaleRateFallsBackToHalving(t *testing.T) {
+func TestSendFlowStaleRateTrimsAndReprobes(t *testing.T) {
 	f := newTestFlow()
 	f.minRTT = 50 * time.Millisecond
 	f.rate = 1000
 	f.rateAt = time.Now().Add(-3 * time.Second) // older than rateIdle
 
-	// Without recent ACKs the rate no longer describes the path; the safe
-	// halving is the only defensible answer.
+	// Without recent ACKs the rate no longer describes the path, but the SRTT
+	// floor still says no queue is building here. Trim a quarter and re-probe
+	// (TCP's restart-after-idle): halving and then recovering one frame per RTT
+	// is the worst of both worlds.
 	f.loss(time.Now(), 50*time.Millisecond, false)
-	if f.cwnd != 128 {
-		t.Fatalf("stale-rate cwnd = %d, want halved 128", f.cwnd)
+	if f.cwnd != 192 {
+		t.Fatalf("stale-rate cwnd = %d, want 256-64 = 192", f.cwnd)
+	}
+	if f.restartTo != f.max {
+		t.Fatalf("restartTo = %d, want a full re-probe to %d", f.restartTo, f.max)
 	}
 }
 
@@ -118,8 +134,8 @@ func TestSendFlowWestwoodUndoStillWorks(t *testing.T) {
 	// revertible by undoLoss — the spurious-timeout machinery is orthogonal
 	// to which branch shrank the window.
 	f.loss(time.Now(), 50*time.Millisecond, true)
-	if f.cwnd != 50 {
-		t.Fatalf("pre-undo cwnd = %d, want 50", f.cwnd)
+	if f.cwnd != 192 {
+		t.Fatalf("pre-undo cwnd = %d, want 192", f.cwnd)
 	}
 	if !f.undoLoss() {
 		t.Fatal("undoLoss returned false")
@@ -272,14 +288,26 @@ func TestSendFlowNearBDPLossHoldsWindow(t *testing.T) {
 // TestSendFlowFarBelowBDPStillRestores guards the other side of the dead
 // band: a BDP clearly below the window (policer/shallow-buffer oversend)
 // still takes the Westwood restore.
-func TestSendFlowFarBelowBDPStillRestores(t *testing.T) {
+func TestSendFlowFarBelowBDPConvergesDownward(t *testing.T) {
 	f := newTestFlow()
 	f.minRTT = 50 * time.Millisecond
-	f.rate = 2000 // BDP = 100, well below the 224 dead-band edge
+	f.rate = 2000 // BDP = 100 frames, well below the dead-band edge
 	f.rateAt = time.Now()
 
 	f.loss(time.Now(), 50*time.Millisecond, false)
-	if f.cwnd != 100 {
-		t.Fatalf("far-below-BDP cwnd = %d, want restored 100", f.cwnd)
+	if f.cwnd != 192 {
+		t.Fatalf("first event cwnd = %d, want a quarter off 256 = 192", f.cwnd)
+	}
+	for i := 0; i < 8; i++ {
+		f.lastLoss = time.Time{}
+		f.rateAt = time.Now()
+		f.loss(time.Now(), 50*time.Millisecond, false)
+	}
+	// The 1/4 dead band stops the walk once the window is within a quarter of
+	// the BDP (108 is the first such value). Holding there is the point: the
+	// old straight-to-BDP jump is the shape that ran away, because the BDP it
+	// aimed at was produced by the window it then shrank.
+	if f.cwnd < 100 || f.cwnd > 133 {
+		t.Fatalf("converged cwnd = %d, want 100..133 (BDP 100, 1/4 dead band)", f.cwnd)
 	}
 }

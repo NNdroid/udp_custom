@@ -36,7 +36,10 @@ func deliveryLimitFor(wide bool) int {
 
 // orderedDelivery owns every accepted payload until the sole writer completes
 // it. Admission, order, and memory limits are independent of socket readers.
-// ACK means delivered, not merely copied into a queue.
+// ACK means delivered, not merely copied into a queue — but SELECTIVE
+// acknowledgement of what is buffered keeps flowing while the application
+// write is blocked (see feedbackWhileStalled), because silence there is read
+// as loss.
 type orderedDelivery struct {
 	mu        sync.Mutex
 	pending   map[uint64][]byte
@@ -49,6 +52,44 @@ type orderedDelivery struct {
 	fail      func(error)
 	ack       func(uint64)
 	delayed   delayedACK
+	// writeStarted is the Unix-nano time the in-flight write() began, or 0 when
+	// no write is running. A write that has been in flight for longer than
+	// stallFeedbackInterval means the local reader is not consuming, and
+	// silence from us would then be read as loss by the peer.
+	writeStarted atomic.Int64
+	// lastStallACK rate-limits the feedback sent from that state.
+	lastStallACK atomic.Int64
+}
+
+// stallFeedbackInterval bounds how often a stalled writer emits standalone
+// feedback, and how long a write must be blocked before it counts as stalled.
+// It only runs while the application is not consuming, so the extra control
+// traffic is a few small frames per second of stall, and it stops the moment
+// the reader catches up.
+const stallFeedbackInterval = 10 * time.Millisecond
+
+// feedbackWhileStalled reports what is already buffered while the application
+// write is blocked. Without it a session whose local reader pauses simply goes
+// silent: the peer's cumulative ACK cannot advance (correctly — we have not
+// delivered anything), so its RTO ladder fires on frames we are holding, cuts
+// a window that was never congested, and its retransmissions find no room in
+// that shrunken window. The result is a session that suspends its own upload
+// because its download reader paused. This feedback carries the credit
+// snapshot, so the peer settles at the buffer we can accept instead.
+func (d *orderedDelivery) feedbackWhileStalled() {
+	now := time.Now().UnixNano()
+	last := d.lastStallACK.Load()
+	if now-last < int64(stallFeedbackInterval) || !d.lastStallACK.CompareAndSwap(last, now) {
+		return
+	}
+	d.ack(d.delivered.Load())
+}
+
+// stalled reports whether the sole writer has been blocked so long that the
+// peer must be told what we are holding.
+func (d *orderedDelivery) stalled() bool {
+	start := d.writeStarted.Load()
+	return start != 0 && time.Now().UnixNano()-start > int64(stallFeedbackInterval)
 }
 
 func newOrderedDelivery(limit int, done <-chan struct{}, write func([]byte) error, fail func(error), ack func(uint64)) *orderedDelivery {
@@ -98,6 +139,12 @@ func (d *orderedDelivery) offerObserved(seq uint64, payload []byte) (fresh bool,
 	_, hasNext := d.pending[ack+1]
 	gap := seq > ack+1 && !hasNext
 	d.mu.Unlock()
+	if d.stalled() {
+		// The writer is parked on the local reader; keep the peer informed of
+		// what we hold so it repairs real holes instead of timing out frames
+		// that are already here.
+		d.feedbackWhileStalled()
+	}
 	select {
 	case d.wake <- struct{}{}:
 	default:
@@ -148,7 +195,10 @@ func (d *orderedDelivery) run() {
 				return
 			default:
 			}
-			if err := d.write(payload); err != nil {
+			d.writeStarted.Store(time.Now().UnixNano())
+			err := d.write(payload)
+			d.writeStarted.Store(0)
+			if err != nil {
 				d.fail(err)
 				return
 			}

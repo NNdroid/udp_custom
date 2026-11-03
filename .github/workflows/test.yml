@@ -56,8 +56,41 @@ jobs:
           go-version-file: go.mod
           check-latest: true
 
+      # golang/go#77975: the windows/amd64 runtime faults mid-run with
+      # "Exception 0xc0000005 ... unknown pc" — a return address corrupted
+      # during async preemption + stack growth. A second variant of the same
+      # memory corruption surfaced as "panic: inconsistent poll.fdMutex"
+      # (2026-11-04): the corrupted pointer there was the fdMutex receiver
+      # itself, which user-level misuse cannot produce (netpoll's
+      # Write/Close contract makes it safe; linux/macos race runs were green).
+      # Both are process-level crashes, NOT race reports; they are
+      # code-independent — the same commit has both passed and failed this
+      # job (2026-10-28 and 2026-11-04). Retry ONLY these crash signatures;
+      # a DATA RACE report or an assertion failure still fails the job first
+      # try. If either signature ever reproduces on Linux, it must be
+      # investigated as a real bug instead.
       - name: Test with race detector
-        run: go test -count=1 -race ./...
+        shell: bash
+        run: |
+          set -o pipefail
+          for attempt in 1 2 3; do
+            log=$(mktemp)
+            if go test -count=1 -race ./... | tee "$log"; then
+              exit 0
+            fi
+            if grep -q 'Exception 0xc0000005' "$log" && grep -q 'unknown pc' "$log"; then
+              echo "::warning::race run $attempt hit the golang/go#77975 windows runtime fault; retrying"
+              continue
+            fi
+            if grep -q 'panic: inconsistent poll.fdMutex' "$log"; then
+              echo "::warning::race run $attempt hit the windows fdMutex corruption variant of golang/go#77975; retrying"
+              continue
+            fi
+            echo "race run failed without the known crash signature"
+            exit 1
+          done
+          echo "race runs exhausted: every attempt crashed the runtime"
+          exit 1
 
   test-macos:
     name: Test (macos, race)

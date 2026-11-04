@@ -115,18 +115,18 @@ install_config() {
 
   if [ ! -f "${config_file}" ]; then
     if [ "${mode}" == "client" ]; then
-      if [ -f "./config.client.json" ]; then
-        cp "./config.client.json" "${config_file}"
+      if [ -f "./config.client.example.json" ]; then
+        cp "./config.client.example.json" "${config_file}"
       else
-        echo -e "${CYAN}--> Fetching config.client.json from GitHub...${PLAIN}"
-        curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPO}/master/config.client.json" -o "${config_file}" || true
+        echo -e "${CYAN}--> Fetching config.client.example.json from GitHub...${PLAIN}"
+        curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPO}/master/config.client.example.json" -o "${config_file}" || true
       fi
     else
-      if [ -f "./config.server.json" ]; then
-        cp "./config.server.json" "${config_file}"
+      if [ -f "./config.server.example.json" ]; then
+        cp "./config.server.example.json" "${config_file}"
       else
-        echo -e "${CYAN}--> Fetching config.server.json from GitHub...${PLAIN}"
-        curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPO}/master/config.server.json" -o "${config_file}" || true
+        echo -e "${CYAN}--> Fetching config.server.example.json from GitHub...${PLAIN}"
+        curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPO}/master/config.server.example.json" -o "${config_file}" || true
       fi
     fi
     echo -e "${GREEN}--> Created ${mode} configuration at ${config_file}${PLAIN}"

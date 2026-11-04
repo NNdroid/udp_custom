@@ -155,7 +155,7 @@ app ──tcp──► udp_custom client (listen) ──udp_custom over UDP─�
 ```
 
 ```bash
-# /etc/udp_custom/config.client.json   (see config.client.json)
+# /etc/udp_custom/config.client.json   (repo template: config.client.example.json)
 {
   "mode": "client",
   "listen": "127.0.0.1:1080",
@@ -305,7 +305,7 @@ which is what makes a CGNAT / symmetric NAT accept it.
 - **Load balancing:** the client spreads writes across the N chosen ports (and, with
   `sockets` > 1, across N local sockets too) and the server fans replies back per
   path; keepalive traffic follows the active spread selection.
-- **N=32** is a good default (see `config.server.json`).
+- **N=32** is a good default (see `config.server.example.json`).
 
 > The earlier direct-bind multi-path design (server binding N ports and advertising
 > them in the ACK) was abandoned: it could not recover from a behind-CGNAT

@@ -36,3 +36,10 @@ bin/
 .workbuddy/
 .zcode/
 PROTOCOL_V2.md
+
+# Deployed configurations carry real PSKs — only the *.example.json
+# templates are tracked. Deployed files live outside the repo (and, if kept
+# locally, must never be committed).
+config.json
+config.*.json
+!config.*.example.json

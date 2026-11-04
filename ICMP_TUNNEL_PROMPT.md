@@ -51,7 +51,7 @@ scope.
 # Hard constraints (violation ⇒ rework)
 
 1. Configuration must come only from -c <file>. No environment variables, no
-   auto-scanning config.server.json, no default-path fallbacks.
+   auto-scanning config.server.example.json, no default-path fallbacks.
 2. All code comments and logs must be English; no mojibake.
 3. No new third-party dependencies (stdlib + golang.org/x/crypto + existing
    go.mod).
@@ -128,7 +128,7 @@ scope.
 - Tests: tunnel/icmp_test.go with an injected fake transport, green in non-root
   environments; tunnel/icmp_raw_linux_test.go (//go:build linux) against real
   loopback, needs root, t.Skip when the capability is missing.
-- Config templates config.server.json / config.client.json with the new fields;
+- Config templates config.server.example.json / config.client.example.json with the new fields;
   README gains an "ICMP transport profile" section; PROTOCOL_V2.md gains a
   "Transport profiles" section stating the record format is
   transport-independent.

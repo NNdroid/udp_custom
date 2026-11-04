@@ -159,14 +159,13 @@ func (d *orderedDelivery) snapshot() (ack uint64, bitmap [8]uint64, credit uint1
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	ack = d.delivered.Load()
-	// The bitmap has room for 512 admissions regardless of how wide the
-	// delivery limit is: a wide session may hold far more pending frames, and
-	// indexing past the bitmap would panic. Frames beyond the last bitmap bit
-	// are simply not described here — the SACK covers its head, the peer's RTO
-	// covers the rest.
-	const bitmapBits = uint64(8 * 64)
+	// The bitmap has room for sackBitmapBits admissions regardless of how wide
+	// the delivery limit is: a wide session may hold far more pending frames,
+	// and indexing past the bitmap would panic. Frames beyond the last bitmap
+	// bit are simply not described here — the SACK covers its head, the peer's
+	// RTO covers the rest.
 	for seq := range d.pending {
-		if seq > ack && seq-ack <= bitmapBits {
+		if seq > ack && seq-ack <= sackBitmapBits {
 			bit := seq - ack - 1
 			bitmap[bit/64] |= uint64(1) << (bit % 64)
 		}

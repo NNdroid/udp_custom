@@ -10,6 +10,11 @@ import (
 
 const sackPayloadSize = 66 // receive credit (2), up to 512 admission bits (64)
 
+// sackBitmapBits is the SACK bitmap horizon: one admission bit per sequence
+// above the cumulative Ack, eight 64-bit words. The repair scan in updateSACK
+// covers the same horizon, as does the delivery-side bitmap snapshot.
+const sackBitmapBits = uint64(8 * 64)
+
 // idleRetryDelay is how long the retransmit loop sleeps when nothing is
 // outstanding. It bounds how long a submission on an empty window waits before
 // being noticed, and it is the ceiling on the loop's idle polling rate.
@@ -22,11 +27,16 @@ type sendFlow struct {
 	ssthresh          int
 	growth            int
 	lastLoss          time.Time
-	// Window size before the most recent undoable loss() halving. Non-zero means
+	// Window size before the most recent undoable loss() cut. loss() records
+	// it unconditionally per undoable cut and clears it on every completed
+	// non-undoable cut, so undoLoss can only ever revert THE most recent
+	// cut — never a stale, higher value from further back. Non-zero means
 	// undoLoss can revert that event.
 	lastLossCut int
 	feedbackNo  uint64
 	lastProbe   time.Time
+	// fastRepairs is a diagnostic counter of fast-repair retransmissions; the
+	// weak-net pipeline test reads it to tell repair paths apart.
 	fastRepairs int
 	paceMu      sync.Mutex
 	nextSend    time.Time
@@ -216,10 +226,16 @@ func (f *sendFlow) loss(now time.Time, rtt time.Duration, undoable bool) {
 		return
 	}
 	f.lastLoss = now
-	if undoable && f.cwnd > f.lastLossCut {
-		f.lastLossCut = f.cwnd
-	}
 	pre := f.cwnd
+	if undoable {
+		// Record THIS cut's starting point unconditionally. The old
+		// `cwnd > lastLossCut` guard kept a stale, higher value from an earlier
+		// undoable cut, and a later non-undoable cut left it intact — an undo
+		// then bounced the window ABOVE its pre-cut level and wiped the
+		// legitimate reduction in between. undoLoss may only ever revert the
+		// most recent cut.
+		f.lastLossCut = pre
+	}
 	floor := max(2, f.cwnd-f.cwnd/4)
 	target := max(2, f.cwnd/2)
 	restartTo := 0
@@ -250,6 +266,12 @@ func (f *sendFlow) loss(now time.Time, rtt time.Duration, undoable bool) {
 	f.cwnd = min(f.max, f.ssthresh)
 	f.growth = 0
 	f.restartTo = restartTo
+	if !undoable {
+		// A definitive cut invalidates any earlier undoable cut point: with the
+		// window already reduced for real there is nothing legitimate left to
+		// undo.
+		f.lastLossCut = 0
+	}
 }
 
 // congested reports whether SRTT inflation marks this loss as congestion.
@@ -370,7 +392,9 @@ const sackFastRepairMax = 3
 // the feedback horizon. Rejected (stale/corrupt) feedback reports valid=false
 // and repairs nothing.
 func updateSACK(flow *sendFlow, outstanding map[uint64]*unackedPkt, f *UDPCFrame, highest uint64, rtt time.Duration) (wires [][]byte, valid bool) {
-	if flow == nil || len(f.Data) < 2 || len(f.Data) > sackPayloadSize || (len(f.Data)-2)%8 != 0 || f.Ack > highest || f.PacketNo <= flow.feedbackNo {
+	// highest == 0 means nothing was sent yet (Seq starts at 1); callers derive
+	// it as sendSeq-1, which would underflow the horizon math below.
+	if flow == nil || highest == 0 || len(f.Data) < 2 || len(f.Data) > sackPayloadSize || (len(f.Data)-2)%8 != 0 || f.Ack > highest || f.PacketNo <= flow.feedbackNo {
 		return nil, false
 	}
 	var words [8]uint64
@@ -412,7 +436,7 @@ func updateSACK(flow *sendFlow, outstanding map[uint64]*unackedPkt, f *UDPCFrame
 	// scan covers the same horizon the bitmap does (one admission bit per
 	// sequence above f.Ack).
 	var due []retryFrame
-	for seq := f.Ack + 1; seq <= f.Ack+512 && seq <= highest; seq++ {
+	for seq := f.Ack + 1; seq <= f.Ack+sackBitmapBits && seq <= highest; seq++ {
 		p := outstanding[seq]
 		if p == nil || p.sacked || p.queued {
 			// queued = still sitting in the transmit queue, not yet on the
@@ -436,9 +460,10 @@ func updateSACK(flow *sendFlow, outstanding map[uint64]*unackedPkt, f *UDPCFrame
 		p := outstanding[d.seq]
 		p.retries++
 		p.sentTime = now
-		// Advance the same backoff ladder retryDue does: a fast repair burns one
-		// retry like anything else, so leaving rto alone would consume the whole
-		// 15-retry budget at the guard cadence and abandon a live path in seconds.
+		// Advance the same backoff ladder retryDue does. This does not change
+		// the fast-repair guard itself (that stays at rtt/4): it keeps the RTO
+		// path from stacking another retransmission of the same frame on top
+		// of the fast repair while the hole is still unfilled.
 		p.rto = min(p.rto*3/2, rttMaxRTO)
 		wires = append(wires, p.wire)
 	}

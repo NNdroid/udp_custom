@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -143,12 +144,27 @@ func generateNftables(internalAddr string, pr *tunnel.PortRange) {
 	fmt.Println("# \"⚠️ Could not enable IP_RECVORIGDSTADDR\" at startup.")
 }
 
-func atoiPort(s string) int {
+func atoiPort(s string) (int, error) {
 	p, err := strconv.Atoi(strings.TrimSpace(s))
 	if err != nil || p < 1 || p > 65535 {
-		return 36712
+		return 0, fmt.Errorf("invalid port %q (want 1-65535)", s)
 	}
-	return p
+	return p, nil
+}
+
+// requireFlagsParsed fails hard when the flag set rejected the arguments.
+// flag.ContinueOnError prints the offending flag itself; the exit matters
+// because a typo'd --range would otherwise silently fall through to the
+// legacy FULL-UDP-port redirect output — applying that rule would swallow
+// every UDP service on the box (DNS, WireGuard, ...), not just the tunnel.
+func requireFlagsParsed(fs *flag.FlagSet, err error) {
+	if err == nil {
+		return
+	}
+	if errors.Is(err, flag.ErrHelp) {
+		os.Exit(0)
+	}
+	os.Exit(2)
 }
 
 // resolveRangeSpec reads --range / -c and returns the parsed tunnel.PortRange.
@@ -157,9 +173,15 @@ func resolveRangeSpec(args []string, fs *flag.FlagSet) (pr *tunnel.PortRange) {
 	rangeSpec := fs.Lookup("range").Value.String()
 	cfgPath := fs.Lookup("c").Value.String()
 	if rangeSpec == "" && cfgPath != "" {
-		if fileCfg, e := loadConfigFile(cfgPath); e == nil && fileCfg.PortRange != "" {
-			rangeSpec = fileCfg.PortRange
+		// An explicitly given -c that fails to load must not silently degrade
+		// the output to built-in defaults: the operator would share/install
+		// rules for the wrong node.
+		fileCfg, e := loadConfigFile(cfgPath)
+		if e != nil {
+			fmt.Fprintf(os.Stderr, "Cannot load -c %q: %v\n", cfgPath, e)
+			os.Exit(1)
 		}
+		rangeSpec = fileCfg.PortRange
 	}
 	if rangeSpec == "" {
 		return nil
@@ -182,10 +204,14 @@ func runGenIptables(args []string) {
 	fs.String("c", "", "Path to configuration file")
 	fs.String("range", "", "UDP destination port range, e.g. 25000-25499 (<= 512 ports is recommended)")
 	internalPort := fs.String("port", "36712", "Internal UDP port the range is redirected to")
-	_ = fs.Parse(args)
+	requireFlagsParsed(fs, fs.Parse(args))
 
 	pr := resolveRangeSpec(args, fs)
-	port := atoiPort(*internalPort)
+	port, err := atoiPort(*internalPort)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 	if pr == nil {
 		// Legacy full-range behaviour when nothing explicit is given.
 		generateIptables(port, nil)
@@ -199,13 +225,21 @@ func runGenNftables(args []string) {
 	fs.String("c", "", "Path to configuration file")
 	fs.String("range", "", "UDP destination port range, e.g. 25000-25499 (<= 512 ports is recommended)")
 	to := fs.String("to", "127.0.0.1:36712", "Internal listen address the range is redirected to")
-	_ = fs.Parse(args)
+	requireFlagsParsed(fs, fs.Parse(args))
 
 	pr := resolveRangeSpec(args, fs)
 	internal := *to
 	if internal == "127.0.0.1:36712" {
-		if fileCfg, e := loadConfigFile(fs.Lookup("c").Value.String()); e == nil && fileCfg.Listen != "" {
-			internal = fileCfg.Listen
+		cfgPath := fs.Lookup("c").Value.String()
+		if cfgPath != "" {
+			fileCfg, e := loadConfigFile(cfgPath)
+			if e != nil {
+				fmt.Fprintf(os.Stderr, "Cannot load -c %q: %v\n", cfgPath, e)
+				os.Exit(1)
+			}
+			if fileCfg.Listen != "" {
+				internal = fileCfg.Listen
+			}
 		}
 	}
 	if pr == nil {

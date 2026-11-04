@@ -63,7 +63,14 @@ func GenerateUDPCustomURI(host, port, password, magic, pubKey, remark, pin strin
 		UDPCustomMagic: magic,
 		NoisePublicKey: rawPub,
 	}
-	profJSON, _ := json.Marshal(prof)
+	profJSON, err := json.Marshal(prof)
+	if err != nil {
+		// json.Marshal on a plain struct cannot fail today; if a future field
+		// makes it fail, printing an empty/garbage envelope would be worse
+		// than refusing the share link outright.
+		fmt.Fprintf(os.Stderr, "Error: failed to encode the share profile (%v); refusing to print a partial share link.\n", err)
+		return ""
+	}
 	stunURI, usedPin, err := encryptStunURI(profJSON, pin)
 	if err != nil {
 		// Never label a cleartext URI as "encrypted": the profile embeds the

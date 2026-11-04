@@ -19,7 +19,7 @@ var Version = "v1.0.0-dev"
 
 type Config struct {
 	// Mode selects what this binary does: "server" (default, also when absent)
-	// or "client". See config.server.json / config.client.json.
+	// or "client". See config.server.example.json / config.client.example.json.
 	Mode string `json:"mode"`
 
 	// Sockets is client-only: number of local UDP sockets used for n:n port
@@ -286,6 +286,13 @@ func runClientMode(cfg *Config, magicStr, lvl string, sendWindow int) {
 		<-sigCh
 		fmt.Println("Shutting down udp_custom client gracefully...")
 		cli.Close()
+		// A second signal means the graceful path is stuck: stop intercepting
+		// and let the default handler terminate the process immediately
+		// instead of forcing an operator to reach for SIGKILL.
+		<-sigCh
+		fmt.Println("Second signal; exiting immediately.")
+		signal.Stop(sigCh)
+		os.Exit(1)
 	}()
 
 	if err := cli.Start(); err != nil {
@@ -329,7 +336,7 @@ func runFromConfig(path string) {
 	sendWindow := cfg.SendWindow
 
 	// Client mode: same binary, different role — see client.go. Without this
-	// branch, "mode":"client" (config.client.json) would silently be ignored
+	// branch, "mode":"client" (config.client.example.json) would silently be ignored
 	// and the binary would boot as a server on the client's 'listen' port.
 	if strings.EqualFold(strings.TrimSpace(cfg.Mode), "client") {
 		runClientMode(cfg, m, lvl, sendWindow)
@@ -376,6 +383,13 @@ func runFromConfig(path string) {
 		srv.Close()
 		// Do NOT os.Exit here: closing the listening socket makes Start()
 		// return, so main unwinds normally and defers run.
+		// A second signal means the graceful path is stuck — restore the
+		// default handler and die immediately instead of hanging until an
+		// operator reaches for SIGKILL.
+		<-sigCh
+		log.Println("Second signal; exiting immediately.")
+		signal.Stop(sigCh)
+		os.Exit(1)
 	}()
 
 	if err := srv.Start(); err != nil {
@@ -483,36 +497,42 @@ func runGenURI(args []string) {
 	// Values from the config file are seeded first, then any explicit command
 	// line flag overrides the corresponding field.
 	if *cfgPath != "" {
-		if fileCfg, err := loadConfigFile(*cfgPath); err == nil {
-			// 'host' carries the server's public address for the client
-			// config; 'port_range' carries the client-facing UDP port range.
-			if *host == "" && fileCfg.Host != "" {
-				*host = fileCfg.Host
+		// An explicitly given -c that fails to load must fail loudly: silently
+		// falling back to the built-in defaults would share the WRONG node
+		// ("your-server-ip", default port) with whoever scans the QR code.
+		fileCfg, err := loadConfigFile(*cfgPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Cannot load -c %q: %v\n", *cfgPath, err)
+			os.Exit(1)
+		}
+		// 'host' carries the server's public address for the client
+		// config; 'port_range' carries the client-facing UDP port range.
+		if *host == "" && fileCfg.Host != "" {
+			*host = fileCfg.Host
+		}
+		if *port == "" && fileCfg.PortRange != "" {
+			if ports, pe := tunnel.ParsePortRangeSpec(fileCfg.PortRange); pe == nil {
+				*port = tunnel.FormatPortList(ports)
 			}
-			if *port == "" && fileCfg.PortRange != "" {
-				if ports, pe := tunnel.ParsePortRangeSpec(fileCfg.PortRange); pe == nil {
-					*port = tunnel.FormatPortList(ports)
-				}
+		}
+		if *port == "" && fileCfg.Listen != "" {
+			if _, p, err := net.SplitHostPort(fileCfg.Listen); err == nil {
+				*port = p
 			}
-			if *port == "" && fileCfg.Listen != "" {
-				if _, p, err := net.SplitHostPort(fileCfg.Listen); err == nil {
-					*port = p
-				}
-			}
-			if *password == "" && len(fileCfg.Passwords) > 0 {
-				*password = fileCfg.Passwords[0]
-			}
-			if *magic == "" && fileCfg.Magic != "" {
-				*magic = fileCfg.Magic
-			}
-			if *pubKey == "" && fileCfg.PubKey != "" {
-				*pubKey = fileCfg.PubKey
-			}
-			if *pubKey == "" && fileCfg.PrivKey != "" {
-				if kp, pe := tunnel.ParseNoiseKey(fileCfg.PrivKey); pe == nil {
-					_, pubB64 := tunnel.FormatNoiseKey(kp)
-					*pubKey = pubB64
-				}
+		}
+		if *password == "" && len(fileCfg.Passwords) > 0 {
+			*password = fileCfg.Passwords[0]
+		}
+		if *magic == "" && fileCfg.Magic != "" {
+			*magic = fileCfg.Magic
+		}
+		if *pubKey == "" && fileCfg.PubKey != "" {
+			*pubKey = fileCfg.PubKey
+		}
+		if *pubKey == "" && fileCfg.PrivKey != "" {
+			if kp, pe := tunnel.ParseNoiseKey(fileCfg.PrivKey); pe == nil {
+				_, pubB64 := tunnel.FormatNoiseKey(kp)
+				*pubKey = pubB64
 			}
 		}
 	}
@@ -534,11 +554,23 @@ func runGenURI(args []string) {
 	uri := GenerateUDPCustomURI(*host, *port, *password, *magic, *pubKey, *remark, *pin)
 	fmt.Printf("=== 📱 udp_custom Sharing URI (encrypted stun://) ===\n\n%s\n", uri)
 	PrintTerminalQR(uri)
+	fmt.Println("⚠️  The share envelope's 6-digit PIN is brute-forceable offline (~20 bits):")
+	fmt.Println("    anyone holding this stun:// URI can recover the embedded PSK by trying")
+	fmt.Println("    every PIN. Deliver the URI and the PIN over SEPARATE trusted channels,")
+	fmt.Println("    and treat the URI itself as PSK-secret material — never paste it in a")
+	fmt.Println("    public place. The plaintext [2] udpc:// link needs an equally trusted")
+	fmt.Println("    transport.")
 }
 
 func parseMagicHeader(m string) uint32 {
 	if len(m) == 4 {
 		return uint32(m[0])<<24 | uint32(m[1])<<16 | uint32(m[2])<<8 | uint32(m[3])
+	}
+	if m != "" {
+		// A non-empty but unparseable magic silently becoming the default would
+		// change this end's protocol identity while the operator believes the
+		// configured value is live — say so loudly instead.
+		fmt.Fprintf(os.Stderr, "⚠️ config 'magic' %q is not exactly 4 bytes; falling back to \"UDPC\" — peers must use the same header\n", m)
 	}
 	return 0x55445043 // "UDPC"
 }

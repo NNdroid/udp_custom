@@ -119,6 +119,31 @@ func TestFECRecoversTwoMissingDataShards(t *testing.T) {
 	}
 }
 
+// TestFECRecentBoundedUnderBelowWindowFlood pins the memory bound on
+// fecReceiver.recent. An authenticated peer can jump Seq space once and then
+// flood fresh Seqs far below `highest` — every frame on a fresh packet number,
+// which is what the replay filter keys on, so nothing downstream rejects them
+// before onData retains a copy. The hard cap in pruneRecentLocked must keep
+// the map bounded even though the ordinary prune (keyed on `highest`
+// advancing) never fires.
+func TestFECRecentBoundedUnderBelowWindowFlood(t *testing.T) {
+	r := newFECReceiver()
+	r.onData(1<<40, []byte("prime"))
+	payload := make([]byte, UDPC_MAX_DATA)
+	for seq := uint64(1); seq <= 4096; seq++ {
+		r.onData(seq, payload)
+	}
+	r.mu.Lock()
+	n := len(r.recent)
+	r.mu.Unlock()
+	if n > fecRecentDataHardLimit {
+		t.Fatalf("recent grew to %d entries under flood, hard limit is %d", n, fecRecentDataHardLimit)
+	}
+	if n == 0 {
+		t.Fatal("recent lost every entry; hard-cap eviction is over-aggressive")
+	}
+}
+
 func TestFECSenderFlushesPartialBlock(t *testing.T) {
 	ch := make(chan fecParityShard, 4)
 	sender := newFECSender(func(p fecParityShard) { ch <- p })

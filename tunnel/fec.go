@@ -16,9 +16,16 @@ const (
 	fecLengthPrefixSize = 2
 	fecFlushDelay       = 15 * time.Millisecond
 	fecRecentDataLimit  = 64
-	fecMaxPendingBlocks = 16
-	fecBlockTTL         = 2 * time.Second
-	fecBootstrapBlocks  = 4
+	// fecRecentDataHardLimit is the absolute cap on fecReceiver.recent entries.
+	// The ordinary prune trigger is keyed on `highest` advancing, so a peer that
+	// floods Seqs below the delivery window with fresh packet numbers (the
+	// replay filter keys on PacketNo, not Seq) could otherwise grow `recent`
+	// without bound — onData retains before delivery admission rejects. See
+	// pruneRecentLocked.
+	fecRecentDataHardLimit = 2 * fecRecentDataLimit
+	fecMaxPendingBlocks    = 16
+	fecBlockTTL            = 2 * time.Second
+	fecBootstrapBlocks     = 4
 	// EWMA denominator for the loss estimator. See observeOutcome for why it is
 	// 64 rather than 32.
 	fecLossAlpha = 64
@@ -67,11 +74,11 @@ func fecEnabled(v *bool) bool { return v == nil || *v }
 // UDPC header, so adaptive FEC costs just two bytes of DATA payload capacity
 // and never pushes a parity datagram beyond the converged max_pkt budget.
 func fecDataPayloadCap(recordPayloadCap int) int {
-	cap := recordPayloadCap - fecLengthPrefixSize
-	if cap < 1 {
+	n := recordPayloadCap - fecLengthPrefixSize
+	if n < 1 {
 		return 1
 	}
-	return cap
+	return n
 }
 
 type fecLossEstimator struct {
@@ -301,9 +308,14 @@ func parseFECParityFrameExt(frame *UDPCFrame, ext bool) (fecParityShard, error) 
 }
 
 type fecSender struct {
-	mu       sync.Mutex
-	pending  []fecSourceShard
-	timer    *time.Timer
+	mu      sync.Mutex
+	pending []fecSourceShard
+	timer   *time.Timer
+	// flushGen invalidates a flushTimer callback whose block was detached
+	// before the callback got the lock: without it a stale callback flushed a
+	// just-started block immediately, spending parity to protect one record.
+	// Guarded by mu; bumped when a fresh block arms a fresh timer in add.
+	flushGen int
 	closed   bool
 	blocks   uint64
 	adaptive fecAdaptiveLoss
@@ -377,17 +389,24 @@ func (s *fecSender) seedLoss(loss float64) {
 	s.adaptive.local.observeValue(loss, 1.0)
 }
 
-func (s *fecSender) codec(dataShards, parityShards, shardSize int) (reedsolomon.Encoder, error) {
+// fecCodecFor returns a cached Reed-Solomon encoder for the shard geometry,
+// building it on first use. Each owner (sender/receiver) serializes access to
+// its own cache map, so the map needs no internal locking.
+func fecCodecFor(codecs map[uint16]reedsolomon.Encoder, dataShards, parityShards, shardSize int) (reedsolomon.Encoder, error) {
 	key := uint16(dataShards)<<8 | uint16(parityShards)
-	if enc := s.codecs[key]; enc != nil {
+	if enc := codecs[key]; enc != nil {
 		return enc, nil
 	}
 	enc, err := reedsolomon.New(dataShards, parityShards, reedsolomon.WithAutoGoroutines(shardSize))
 	if err != nil {
 		return nil, err
 	}
-	s.codecs[key] = enc
+	codecs[key] = enc
 	return enc, nil
+}
+
+func (s *fecSender) codec(dataShards, parityShards, shardSize int) (reedsolomon.Encoder, error) {
+	return fecCodecFor(s.codecs, dataShards, parityShards, shardSize)
 }
 
 func (s *fecSender) observeAck(retransmitted bool) { s.adaptive.observeAck(retransmitted) }
@@ -420,11 +439,16 @@ func (s *fecSender) add(seq uint64, payload []byte) {
 	owned := fecSourceShard{seq: seq, payload: append([]byte(nil), payload...)}
 	s.pending = append(s.pending, owned)
 	if len(s.pending) == 1 {
-		if s.timer == nil {
-			s.timer = time.AfterFunc(fecFlushDelay, s.flushTimer)
-		} else {
-			s.timer.Reset(fecFlushDelay)
+		// A fresh block always arms a fresh timer under a bumped generation
+		// instead of Reset-ing the old one: a stale flushTimer callback (fired
+		// for the previous block but still queued on s.mu) must not detach this
+		// block the moment it acquires the lock.
+		s.flushGen++
+		gen := s.flushGen
+		if s.timer != nil {
+			s.timer.Stop()
 		}
+		s.timer = time.AfterFunc(fecFlushDelay, func() { s.flushTimer(gen) })
 	}
 	if len(s.pending) >= fecDataShardsMax {
 		blocks = append(blocks, s.detachLocked())
@@ -445,13 +469,16 @@ func (s *fecSender) detachLocked() []fecSourceShard {
 	s.pending = nil
 	if s.timer != nil {
 		s.timer.Stop()
+		s.timer = nil
 	}
 	return block
 }
 
-func (s *fecSender) flushTimer() {
+func (s *fecSender) flushTimer(gen int) {
 	s.mu.Lock()
-	if s.closed {
+	// A superseded generation means this callback belongs to a block that was
+	// already detached; the pending block (if any) belongs to a newer timer.
+	if s.closed || gen != s.flushGen {
 		s.mu.Unlock()
 		return
 	}
@@ -477,6 +504,20 @@ func (s *fecSender) emitBlock(block []fecSourceShard) {
 		if block[i].seq != block[0].seq+uint64(i) {
 			return
 		}
+	}
+
+	// Reserve nothing yet: everything that can fail without emitting runs
+	// first, so s.blocks only counts blocks that actually produced parity and
+	// the session-to-session loss memo never sees phantom samples.
+	maxPayload := 0
+	for _, src := range block {
+		if len(src.payload) > maxPayload {
+			maxPayload = len(src.payload)
+		}
+	}
+	shardSize := fecLengthPrefixSize + maxPayload
+	if shardSize < fecLengthPrefixSize || shardSize > UDPC_MAX_DATA {
+		return
 	}
 
 	s.mu.Lock()
@@ -515,17 +556,6 @@ func (s *fecSender) emitBlock(block []fecSourceShard) {
 	}
 	if parityShards > maxParity {
 		parityShards = maxParity
-	}
-
-	maxPayload := 0
-	for _, src := range block {
-		if len(src.payload) > maxPayload {
-			maxPayload = len(src.payload)
-		}
-	}
-	shardSize := fecLengthPrefixSize + maxPayload
-	if shardSize < fecLengthPrefixSize || shardSize > UDPC_MAX_DATA {
-		return
 	}
 
 	shards := make([][]byte, dataShards+parityShards)
@@ -628,16 +658,7 @@ func newFECReceiverExt(extParity bool) *fecReceiver {
 }
 
 func (r *fecReceiver) codec(dataShards, parityShards, shardSize int) (reedsolomon.Encoder, error) {
-	key := uint16(dataShards)<<8 | uint16(parityShards)
-	if enc := r.codecs[key]; enc != nil {
-		return enc, nil
-	}
-	enc, err := reedsolomon.New(dataShards, parityShards, reedsolomon.WithAutoGoroutines(shardSize))
-	if err != nil {
-		return nil, err
-	}
-	r.codecs[key] = enc
-	return enc, nil
+	return fecCodecFor(r.codecs, dataShards, parityShards, shardSize)
 }
 
 func (r *fecReceiver) feedbackBasisPoints() uint16 { return r.loss.basisPoints() }
@@ -792,8 +813,10 @@ func (r *fecReceiver) tryRecoverLocked(block *fecRecvBlock) []fecRecovered {
 		if len(shard) != block.shardSize {
 			return nil
 		}
+		// Uint16 is never negative; only the upper bound can be violated,
+		// by a reconstruction that produced garbage for this shard.
 		n := int(binary.BigEndian.Uint16(shard[:fecLengthPrefixSize]))
-		if n < 0 || n > block.shardSize-fecLengthPrefixSize {
+		if n > block.shardSize-fecLengthPrefixSize {
 			return nil
 		}
 		seq := block.baseSeq + uint64(idx)
@@ -817,16 +840,30 @@ func (r *fecReceiver) tryRecoverLocked(block *fecRecvBlock) []fecRecovered {
 }
 
 func (r *fecReceiver) pruneRecentLocked() {
-	if r.highest <= fecRecentDataLimit || r.highest-r.lastPrune < fecDataShardsMax {
-		return
-	}
-	cutoff := r.highest - fecRecentDataLimit
-	for seq := range r.recent {
-		if seq < cutoff {
-			delete(r.recent, seq)
+	if r.highest > fecRecentDataLimit && r.highest-r.lastPrune >= fecDataShardsMax {
+		cutoff := r.highest - fecRecentDataLimit
+		for seq := range r.recent {
+			if seq < cutoff {
+				delete(r.recent, seq)
+			}
 		}
+		r.lastPrune = r.highest
 	}
-	r.lastPrune = r.highest
+	// Hard cap. The prune trigger above is keyed on `highest` advancing, so a
+	// peer that floods fresh Seqs far below `highest` — each on a fresh packet
+	// number, which is what the replay filter keys on — advances neither and
+	// could grow `recent` at line rate until OOM (onData retains before
+	// delivery admission rejects). Evict the smallest Seqs: reconstruction
+	// only ever needs shards near the newest blocks.
+	for len(r.recent) > fecRecentDataHardLimit {
+		var lo uint64 = ^uint64(0)
+		for seq := range r.recent {
+			if seq < lo {
+				lo = seq
+			}
+		}
+		delete(r.recent, lo)
+	}
 }
 
 func (r *fecReceiver) pruneBlocksLocked(now time.Time) {

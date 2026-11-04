@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/netip"
+	"runtime/debug"
 
 	"net"
 	"strings"
@@ -127,6 +128,14 @@ type ServerConfig struct {
 	// preserved. 0/1 = single socket (default). On non-Linux platforms any
 	// value above 1 is clamped to 1 with a startup warning.
 	ReceiveSockets int `json:"receive_sockets"`
+
+	// MaxSessions soft-caps the live session population. The SYN rate limiter
+	// bounds intake RATE only, and every session holds goroutines plus an
+	// upstream socket — so a leaked or stolen PSK could otherwise grow the
+	// population without bound until FDs/memory run out (idle sessions are
+	// reaped, but creation-rate × lifetime is what a cap finally bounds).
+	// 0 (default) disables the cap.
+	MaxSessions int `json:"max_sessions"`
 }
 
 // defaultSendWindow is the cap on frames awaiting ACK before the target read
@@ -174,6 +183,38 @@ type pathChallenge struct {
 // re-verified after its cache entry expires.
 const synCacheTTL = 10 * time.Minute
 
+// synTimestampWindow is the ± clock drift (seconds) a SYN's Unix timestamp may
+// show against the server's clock and still be accepted.
+const synTimestampWindow = 300
+
+// targetDialTimeout bounds one backend dial during the handshake.
+const targetDialTimeout = 5 * time.Second
+
+// handshakeBacklogWait is how long a verified SYN waits for a free handshake
+// slot before being dropped.
+const handshakeBacklogWait = 2 * time.Second
+
+// handshakeMaxConcurrent caps the number of in-flight handshakes (each may
+// hold a backend dial for up to targetDialTimeout).
+const handshakeMaxConcurrent = 64
+
+// sessionIdleTimeout and cleanupInterval drive the idle-session reaper.
+const (
+	sessionIdleTimeout = 180 * time.Second
+	cleanupInterval    = 15 * time.Second
+)
+
+// synRatePerSec and synBurst configure the per-source-IP SYN token bucket.
+const (
+	synRatePerSec = 5
+	synBurst      = 20
+)
+
+// advertisedWindowFull is the handshake ACK's window advertisement and the
+// wide-window credit ceiling: the receiver is willing to buffer this many
+// frames once the session is running.
+const advertisedWindowFull = 65535
+
 // synCacheMax caps the handshake idempotency cache (16B nonce + ~30B record).
 const synCacheMax = 4096
 
@@ -191,6 +232,9 @@ type Server struct {
 	macFailures     atomic.Uint64 // v2 authentication failures
 	replayDrops     atomic.Uint64 // authenticated session packets rejected by the replay window
 	transientReads  atomic.Uint64 // UDP read errors retried instead of killing the recv loop
+	// packetPanics counts per-packet processing panics that were recovered
+	// instead of crashing the process (see processIncomingFrame/handleHandshake).
+	packetPanics atomic.Uint64
 
 	// logLevel is resolved ONCE at construction. The hot paths consult it
 	// several times per datagram purely to decide whether a debug log is
@@ -233,9 +277,15 @@ type Server struct {
 	handshakeSem chan struct{}
 	sendWindow   int
 	maxRecvQueue int
-}
 
-func parseLogLevel(s string) int { return LogLevel(s) }
+	// maxSessions soft-caps the live session population (0 = uncapped);
+	// liveSessions tracks it. A handshake landing in the nanosecond between
+	// its sessions.Store and its registered flag can leave the counter +1
+	// high until the session dies — acceptable for a soft cap. See
+	// handleHandshake and ServerSession.Close.
+	maxSessions  int
+	liveSessions atomic.Int64
+}
 
 // The server NEVER advertises a port list. The client picks its own
 // destination ports from the configured range (a firewall DNATs that range onto
@@ -408,6 +458,12 @@ type ServerSession struct {
 	sendPacketNo atomic.Uint64
 	sendSeq      atomic.Uint64
 	recvSeq      atomic.Uint64
+
+	// registered is set once the session wins its sessions.LoadOrStore: it
+	// gates the liveSessions decrement and the sessions.Delete in Close, so a
+	// handshake torn down before registration (server closing, SID collision)
+	// never reaps another session's map entry or skews the counter.
+	registered atomic.Bool
 
 	server        *Server
 	sessionID     uint32
@@ -784,10 +840,11 @@ func newServer(cfg ServerConfig, dial TargetDialer, injected *net.UDPConn) (*Ser
 		dialTarget:   dial,
 		events:       newEventBus[SessionEvent](256),
 		synCache:     newSynCache(),
-		synLimiter:   newSynLimiter(5, 20),
-		handshakeSem: make(chan struct{}, 64),
+		synLimiter:   newSynLimiter(synRatePerSec, synBurst),
+		handshakeSem: make(chan struct{}, handshakeMaxConcurrent),
 		sendWindow:   defaultSendWindow,
 		maxRecvQueue: deliveryWindowWide,
+		maxSessions:  cfg.MaxSessions,
 	}
 	if cfg.SendWindow > 0 {
 		srv.sendWindow = cfg.SendWindow
@@ -819,7 +876,11 @@ func newServer(cfg ServerConfig, dial TargetDialer, injected *net.UDPConn) (*Ser
 	if cfg.PrivateKey != "" {
 		pk, err := ParseNoiseKey(cfg.PrivateKey)
 		if err != nil {
-			conn.Close()
+			// Every socket of the reuseport group is already bound; leaking the
+			// rest would hold the port and accumulate FDs across retries.
+			for _, c2 := range recvConns {
+				c2.Close()
+			}
 			return nil, fmt.Errorf("invalid noise private key: %w", err)
 		}
 		srv.privKey = pk
@@ -948,6 +1009,15 @@ func (s *Server) serveConn(conn *net.UDPConn) {
 				if frame.SessionID != 0 || frame.PacketNo != 0 || frame.Seq != 0 || frame.Ack != 0 || len(frame.Data) < synPayloadBase {
 					continue
 				}
+				// Advisory backlog check: when every handshake slot is busy,
+				// skip the HKDF-per-PSK MAC verification and the goroutine
+				// spawn entirely — a SYN flood that holds all slots must not
+				// pile up one verifying goroutine per allowed SYN.
+				// handleHandshake still does the authoritative wait.
+				if len(s.handshakeSem) >= cap(s.handshakeSem) {
+					s.logWarn("[Handshake] 🚦 Handshake backlog full, dropping SYN from %s", remoteAddr)
+					continue
+				}
 				var clientNonce [clientNonceSize]byte
 				copy(clientNonce[:], frame.Data[:clientNonceSize])
 				matchedPSK := matchSynPSK(frame.raw, s.cfg.Passwords, clientNonce)
@@ -958,7 +1028,18 @@ func (s *Server) serveConn(conn *net.UDPConn) {
 				// The receive buffer is reused on the next batch read while handshake
 				// verification runs asynchronously, so retain this one payload.
 				frame.Data = append([]byte(nil), frame.Data...)
-				go s.handleHandshake(remoteAddr, &frame, origDstPort, matchedPSK)
+				go func() {
+					// A panic in handshake processing would take down the whole
+					// process (and every concurrent session with it). One bad
+					// SYN may cost that SYN, not the server.
+					defer func() {
+						if r := recover(); r != nil {
+							n := s.packetPanics.Add(1)
+							s.logError("🧨 panic in handshake from %s (count=%d): %v\n%s", remoteAddr, n, r, debug.Stack())
+						}
+					}()
+					s.handleHandshake(remoteAddr, &frame, origDstPort, matchedPSK)
+				}()
 				continue
 			}
 
@@ -977,7 +1058,18 @@ func (s *Server) serveConn(conn *net.UDPConn) {
 // processIncomingFrame is the complete post-handshake receive boundary. No
 // session state may be changed until shape, authentication, packet-number
 // replay and source-path checks all succeed.
+//
+// A panic here is recovered and counted instead of crashing the process: a
+// single logic bug on one authenticated frame must not kill every concurrent
+// session (same policy as QUIC/TLS stacks). After a recovery the frame is
+// simply not accepted.
 func (sess *ServerSession) processIncomingFrame(frame *UDPCFrame, remoteAddr netip.AddrPort, origPort int) bool {
+	defer func() {
+		if r := recover(); r != nil {
+			n := sess.server.packetPanics.Add(1)
+			sess.server.logError("🧨 panic processing session 0x%08X frame from %s (count=%d): %v\n%s", sess.sessionID, remoteAddr, n, r, debug.Stack())
+		}
+	}()
 	if frame == nil {
 		return false
 	}
@@ -1074,9 +1166,9 @@ func (s *Server) handleHandshake(remoteAddr netip.AddrPort, frame *UDPCFrame, or
 	copy(clientNonce[:], frame.Data[:clientNonceSize])
 	timestamp := int64(binary.BigEndian.Uint64(frame.Data[clientNonceSize:synPayloadBase]))
 
-	// Check time drift (allow +/- 300 seconds)
+	// Check time drift (allow +/- synTimestampWindow seconds)
 	now := time.Now().Unix()
-	if timestamp < now-300 || timestamp > now+300 {
+	if timestamp < now-synTimestampWindow || timestamp > now+synTimestampWindow {
 		s.logWarn("[Handshake] 🚫 Rejected SYN from %s: expired timestamp (%d vs now %d)", remoteAddr, timestamp, now)
 		return
 	}
@@ -1106,6 +1198,15 @@ func (s *Server) handleHandshake(remoteAddr netip.AddrPort, frame *UDPCFrame, or
 		return
 	}
 
+	// Global session cap, checked before any expensive work (HKDF, cache
+	// reservation, slot wait): the SYN rate limiter bounds intake RATE, not
+	// the live population, and a leaked/ stolen PSK must not silently exhaust
+	// FDs and memory. Soft cap — concurrent handshakes may overshoot briefly.
+	if s.maxSessions > 0 && s.liveSessions.Load() >= int64(s.maxSessions) {
+		s.logWarn("[Handshake] 🚦 Session cap %d reached; dropping SYN from %s", s.maxSessions, remoteAddr)
+		return
+	}
+
 	handshakeKeys := DerivePSKHandshakeKeys(matchedPSK, clientNonce)
 	cacheKey := makeSynCacheKey(clientNonce, handshakeKeys.SynMAC)
 
@@ -1114,7 +1215,7 @@ func (s *Server) handleHandshake(remoteAddr netip.AddrPort, frame *UDPCFrame, or
 	// legitimate case (client lost our ACK and retransmits the SYN) and kills
 	// the replay case (captive SYN within the ±300s window can no longer force
 	// a fresh target connection per replay).
-	cached, owner := s.synCache.Acquire(cacheKey, time.Now())
+	cached, owner := s.synCache.Acquire(cacheKey, time.Now(), remoteAddr)
 	if cached != nil {
 		s.logInfo("[Handshake] ♻️ Replayed SYN from %s: resending cached ACK", remoteAddr)
 		s.replyFromOrigPort(origPort, remoteAddr, cached)
@@ -1139,7 +1240,7 @@ func (s *Server) handleHandshake(remoteAddr netip.AddrPort, frame *UDPCFrame, or
 		defer func() { <-s.handshakeSem }()
 	case <-s.closeChan:
 		return
-	case <-time.After(2 * time.Second):
+	case <-time.After(handshakeBacklogWait):
 		s.logWarn("[Handshake] 🚦 Handshake backlog full, dropping SYN from %s", remoteAddr)
 		return
 	}
@@ -1190,11 +1291,19 @@ func (s *Server) handleHandshake(remoteAddr netip.AddrPort, frame *UDPCFrame, or
 	// Single upstream connection for every target type: plain TCP/UDP by
 	// default, or the embedder's TargetDialer (Keyed by session, so an
 	// embedder can route, pool, or proxy the upstream however it likes).
-	dialCtx, cancelDial := context.WithTimeout(context.Background(), 5*time.Second)
+	dialCtx, cancelDial := context.WithTimeout(context.Background(), targetDialTimeout)
 	defer cancelDial()
 	upstream, dialErr := s.dialTarget(dialCtx, sid, targetNet, targetHostPort)
 	if dialErr != nil {
 		s.logError("[Handshake] ❌ Failed to dial target [%s] %s: %v", targetNet, targetHostPort, dialErr)
+		return
+	}
+	// Close may have ranged over the sessions while this handshake was dialing
+	// (up to targetDialTimeout). Storing an orphan session now would leave its
+	// upstream read loop with nothing to stop it — roll the handshake back.
+	if atomic.LoadInt32(&s.closed) == 1 {
+		upstream.Close()
+		s.synCache.Abort(cacheKey)
 		return
 	}
 
@@ -1268,7 +1377,19 @@ func (s *Server) handleHandshake(remoteAddr netip.AddrPort, frame *UDPCFrame, or
 	}, func(err error) { s.logWarn("target delivery failed: %v", err); sess.Close() }, sess.sendCumulativeACK)
 	sess.retryWake = make(chan struct{}, 1)
 	sess.initTransmitter()
-	s.sessions.Store(sid, sess)
+	if _, loaded := s.sessions.LoadOrStore(sid, sess); loaded || atomic.LoadInt32(&s.closed) == 1 {
+		// LoadOrStore closes the SID-allocation TOCTOU: two concurrent
+		// handshakes drawing the same random ID must not clobber a live
+		// session. (Probability is negligible; the client simply retries.)
+		// The closed check covers the remaining sliver of the Close race
+		// after the post-dial check above.
+		upstream.Close()
+		s.synCache.Abort(cacheKey)
+		sess.Close()
+		return
+	}
+	sess.registered.Store(true)
+	s.liveSessions.Add(1)
 	sess.setPath(origPort, remoteAddr)
 
 	// ACK payload echoes ClientNonce for concurrent-handshake routing and adds
@@ -1300,7 +1421,7 @@ func (s *Server) handleHandshake(remoteAddr netip.AddrPort, frame *UDPCFrame, or
 		SessionID:  sid,
 		Seq:        0,
 		Ack:        0,
-		WindowSize: 65535,
+		WindowSize: advertisedWindowFull,
 		Data:       ackData,
 	}
 	ackEncoded := SealFrameMAC(ackFrame, &handshakeKeys.AckMAC)
@@ -1702,20 +1823,27 @@ func (sess *ServerSession) acceptPathResponse(remoteAddr netip.AddrPort, data []
 	return true
 }
 
+// nextPacketNo assigns the next per-direction record number, retiring the
+// session when the 64-bit space is exhausted: reusing any value under the same
+// session key would replay a nonce. Unreachable in practice (~584 years at 1G
+// frames/s), but the failure must not be silent. 0 = session retired.
+func (sess *ServerSession) nextPacketNo() uint64 {
+	no := sess.sendPacketNo.Add(1)
+	if no == 0 {
+		sess.server.logError("[Session 0x%08X] 💀 packet-number space exhausted; closing session", sess.sessionID)
+		sess.Close()
+		return 0
+	}
+	return no
+}
+
 // encodeFrame assigns a fresh per-direction packet number and seals the frame
 // as a ChaCha20-Poly1305 record (PSK-derived or Noise transport key — same
 // format, header as AAD, Poly1305 tag in the trailer). The buffer is freshly
 // allocated: only use for frames whose wire bytes are retained (DATA).
 func (sess *ServerSession) encodeFrame(f *UDPCFrame) []byte {
 	sess.applyFECFeedback(f)
-	f.PacketNo = sess.sendPacketNo.Add(1)
-	if f.PacketNo == 0 {
-		// The 64-bit packet-number space is exhausted: reusing any value under
-		// the same session key would replay a nonce. The only safe move is to
-		// retire the session (unreachable in practice — ~584 years at 1G
-		// frames/s — but the failure must not be silent).
-		sess.server.logError("[Session 0x%08X] 💀 packet-number space exhausted; closing session", sess.sessionID)
-		sess.Close()
+	if f.PacketNo = sess.nextPacketNo(); f.PacketNo == 0 {
 		return nil
 	}
 	if sess.frameKeys == nil {
@@ -1731,10 +1859,7 @@ func (sess *ServerSession) encodeFrame(f *UDPCFrame) []byte {
 // space is exhausted.
 func (sess *ServerSession) sendControl(f *UDPCFrame, send func([]byte) error) bool {
 	sess.applyFECFeedback(f)
-	f.PacketNo = sess.sendPacketNo.Add(1)
-	if f.PacketNo == 0 {
-		sess.server.logError("[Session 0x%08X] 💀 packet-number space exhausted; closing session", sess.sessionID)
-		sess.Close()
+	if f.PacketNo = sess.nextPacketNo(); f.PacketNo == 0 {
 		return false
 	}
 	if sess.frameKeys == nil {
@@ -1760,6 +1885,16 @@ func (sess *ServerSession) applyFECFeedback(f *UDPCFrame) {
 	}
 }
 
+// dispatchWire hands an encoded record to the batch transmitter when one is
+// running, or straight to the session socket otherwise.
+func (sess *ServerSession) dispatchWire(wire []byte) {
+	if sess.tx != nil {
+		sess.tx.bestEffort(wire)
+	} else {
+		sess.sendToSession(wire)
+	}
+}
+
 func (sess *ServerSession) sendFECParity(p fecParityShard) {
 	if atomic.LoadInt32(&sess.closed) == 1 || sess.fecSend == nil {
 		return
@@ -1771,12 +1906,8 @@ func (sess *ServerSession) sendFECParity(p fecParityShard) {
 	if !p.applyToFrame(f) {
 		return
 	}
-	if sess.tx != nil {
-		if wire := sess.encodeFrame(f); len(wire) > 0 {
-			sess.tx.bestEffort(wire)
-		}
-	} else {
-		sess.sendControl(f, func(data []byte) error { sess.sendToSession(data); return nil })
+	if wire := sess.encodeFrame(f); len(wire) > 0 {
+		sess.dispatchWire(wire)
 	}
 }
 
@@ -1847,16 +1978,18 @@ func (sess *ServerSession) handleAck(ackSeq uint64) {
 	// restored window is what grows, not the halved one.
 	spurious := false
 	for seq := sess.lowestOutstanding; seq <= ackSeq; seq++ {
-		if pkt, ok := sess.unacked[seq]; ok && sess.fecSend != nil {
-			sess.fecSend.observeAck(pkt.retries > 0)
-		}
-		if pkt, ok := sess.unacked[seq]; ok && !spurious && sess.flow != nil {
-			spurious = sess.flow.undoIfSpurious(pkt, srtt)
-		}
-		if sess.unacked[seq] != nil {
+		// One lookup serves all three consumers (FEC feedback, undo
+		// bookkeeping, ACK accounting).
+		if pkt, ok := sess.unacked[seq]; ok {
+			if sess.fecSend != nil {
+				sess.fecSend.observeAck(pkt.retries > 0)
+			}
+			if !spurious && sess.flow != nil {
+				spurious = sess.flow.undoIfSpurious(pkt, srtt)
+			}
 			acknowledged++
+			delete(sess.unacked, seq)
 		}
-		delete(sess.unacked, seq)
 	}
 	if len(sess.unacked) == 0 {
 		sess.lowestOutstanding = ackSeq + 1
@@ -1883,6 +2016,9 @@ func (sess *ServerSession) handleAck(ackSeq uint64) {
 	sess.unackedCond.Broadcast()
 }
 
+// handleData is a test-only convenience wrapper for handleDataFromPath with
+// no original-destination port (production receive paths always know the
+// port and call handleDataFromPath directly).
 func (sess *ServerSession) handleData(frame *UDPCFrame, remoteAddr netip.AddrPort) bool {
 	return sess.handleDataFromPath(frame, remoteAddr, 0)
 }
@@ -2062,7 +2198,7 @@ func (sess *ServerSession) feedbackFrame(ackSeq uint64) *UDPCFrame {
 		Cmd:        CMD_ACK,
 		SessionID:  sess.sessionID,
 		Ack:        ackSeq,
-		WindowSize: 65535,
+		WindowSize: advertisedWindowFull,
 	}
 }
 
@@ -2176,7 +2312,7 @@ func (sess *ServerSession) sendRecord(payload []byte) error {
 		SessionID:  sess.sessionID,
 		Seq:        seq,
 		Ack:        sess.currentAck(),
-		WindowSize: 65535,
+		WindowSize: advertisedWindowFull,
 		Data:       payload,
 	}
 
@@ -2243,7 +2379,7 @@ func (sess *ServerSession) upstreamToUdpLoop() {
 		}
 		n, err := sess.upstream.Read(buf)
 		if err != nil {
-			if sess.targetNetwork == "tcp" && err != io.EOF && !strings.Contains(err.Error(), "use of closed network connection") {
+			if sess.targetNetwork == "tcp" && err != io.EOF && !errors.Is(err, net.ErrClosed) {
 				sess.server.logWarn("[Session 0x%08X] ⚠️ Target TCP read error: %v", sess.sessionID, err)
 			}
 			return
@@ -2356,11 +2492,7 @@ func (sess *ServerSession) retransmitLoop() {
 			return
 		}
 		for _, wire := range due {
-			if sess.tx != nil {
-				sess.tx.bestEffort(wire)
-			} else {
-				sess.sendToSession(wire)
-			}
+			sess.dispatchWire(wire)
 		}
 		if probe {
 			sess.sendControl(&UDPCFrame{Magic: sess.server.cfg.Magic, Version: UDPC_VERSION, Cmd: CMD_PING, SessionID: sess.sessionID, Ack: sess.currentAck()}, func(p []byte) error { sess.sendToSession(p); return nil })
@@ -2380,6 +2512,10 @@ func (sess *ServerSession) retransmitLoop() {
 func (sess *ServerSession) Close() {
 	sess.closeOnce.Do(func() {
 		atomic.StoreInt32(&sess.closed, 1)
+		wasRegistered := sess.registered.CompareAndSwap(true, false)
+		if wasRegistered {
+			sess.server.liveSessions.Add(-1)
+		}
 		if sess.delivery != nil {
 			sess.delivery.close()
 		}
@@ -2395,7 +2531,11 @@ func (sess *ServerSession) Close() {
 		if sess.upstream != nil {
 			sess.upstream.Close()
 		}
-		sess.server.sessions.Delete(sess.sessionID)
+		// Only a registered session owns its map slot. A session torn down
+		// before registration must not delete a colliding handshake's entry.
+		if wasRegistered {
+			sess.server.sessions.Delete(sess.sessionID)
+		}
 		sess.server.logInfo("[Session 0x%08X] 🛑 Session closed", sess.sessionID)
 		sess.server.emitSessionEvent(SessionEvent{
 			Kind:      SessionClosed,
@@ -2480,6 +2620,14 @@ func (s *Server) emitSessionEvent(ev SessionEvent) {
 type synRecord struct {
 	ackFrame  []byte // pre-encoded CMD_HANDSHAKE_ACK for the created session
 	createdAt time.Time
+	// ownerIP is the source IP of the SYN that created the record. A replayed
+	// SYN from a different IP inside the TTL is answered with nothing:
+	// otherwise a captured SYN could redirect the cached ACK (~170B, ≈2x
+	// single-shot) to an attacker-chosen address once per nonce. The
+	// legitimate retransmit cases — the same client re-sending from another
+	// of its spread ports, or its NAT rebinding the port — keep the same IP,
+	// so only the IP is compared.
+	ownerIP netip.Addr
 }
 
 // synCache maps a client nonce plus an opaque PSK-derived identifier to its
@@ -2515,18 +2663,23 @@ func newSynCache() *synCache {
 
 // Acquire atomically returns a completed cached ACK or reserves the key for
 // exactly one handshake goroutine. A nil ACK with owner=false means another
-// goroutine currently owns the same in-progress handshake.
-func (c *synCache) Acquire(key synCacheKey, now time.Time) (ack []byte, owner bool) {
+// goroutine currently owns the same in-progress handshake — or that the
+// completed record belongs to a different source IP (see synRecord.ownerIP),
+// in which case the caller answers nothing.
+func (c *synCache) Acquire(key synCacheKey, now time.Time, from netip.AddrPort) (ack []byte, owner bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if rec, ok := c.entries[key]; ok {
 		if now.Sub(rec.createdAt) <= synCacheTTL {
-			return rec.ackFrame, false
+			if rec.ackFrame != nil && rec.ownerIP == from.Addr() {
+				return rec.ackFrame, false
+			}
+			return nil, false
 		}
 		delete(c.entries, key)
 	}
 	c.makeSpaceLocked(now)
-	c.entries[key] = synRecord{createdAt: now}
+	c.entries[key] = synRecord{createdAt: now, ownerIP: from.Addr()}
 	c.fifo = append(c.fifo, synFIFOEntry{key: key, createdAt: now})
 	return nil, true
 }
@@ -2620,8 +2773,12 @@ func newSynLimiter(ratePerSec, burst float64) *synLimiter {
 // The bucket map is hard-capped: SYN handling runs before authentication, and
 // UDP source IPs are freely spoofable, so an attacker must not be able to grow
 // this map without bound. When the cap is reached, long-idle buckets are
-// pruned first; if churn keeps the map at the cap, NEW sources are denied
-// until space frees up (existing sources keep their budgets).
+// pruned first; if churn keeps every bucket fresh (an attacker rotating ≤1024
+// spoofed IPs to hold their own buckets alive), the least-recently-used bucket
+// is evicted instead of locking out every NEW source for as long as the flood
+// persists — the flooders lose nothing they care about (they re-create
+// buckets freely), while a legitimate new source only competes with the
+// coldest offender.
 func (l *synLimiter) Allow(ip string, now time.Time) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -2635,7 +2792,15 @@ func (l *synLimiter) Allow(ip string, now time.Time) bool {
 				}
 			}
 			if len(l.buckets) >= synLimiterMaxBuckets {
-				return false // map still at cap: deny the unseen source
+				var oldestKey string
+				var oldest time.Time
+				first := true
+				for k, ob := range l.buckets {
+					if first || ob.last.Before(oldest) {
+						oldestKey, oldest, first = k, ob.last, false
+					}
+				}
+				delete(l.buckets, oldestKey)
 			}
 		}
 		b = &synBucket{tokens: l.burst, last: now}
@@ -2661,7 +2826,7 @@ func (l *synLimiter) Len() int {
 }
 
 func (s *Server) cleanupLoop() {
-	ticker := time.NewTicker(15 * time.Second)
+	ticker := time.NewTicker(cleanupInterval)
 	defer ticker.Stop()
 
 	for {
@@ -2676,7 +2841,7 @@ func (s *Server) cleanupLoop() {
 				inactive := now.Sub(sess.lastActive)
 				sess.activeMu.Unlock()
 
-				if inactive > 180*time.Second {
+				if inactive > sessionIdleTimeout {
 					s.logInfo("[Session 0x%08X] ⏱️ Inactive for %v, cleaning up", sess.sessionID, inactive)
 					sess.Close()
 				}
@@ -2802,10 +2967,6 @@ func (sess *ServerSession) handleSACK(f *UDPCFrame) {
 		sess.handleAck(f.Ack)
 	}
 	for _, wire := range wires {
-		if sess.tx != nil {
-			sess.tx.bestEffort(wire)
-		} else {
-			sess.sendToSession(wire)
-		}
+		sess.dispatchWire(wire)
 	}
 }

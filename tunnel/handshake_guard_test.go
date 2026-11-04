@@ -2,11 +2,16 @@ package tunnel
 
 import (
 	"bytes"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// testSynAddr is the source address every Acquire test handshake pretends to
+// come from, so completed records answer their owner.
+var testSynAddr = netip.MustParseAddrPort("203.0.113.7:4500")
 
 func TestSynCacheIdempotentLookup(t *testing.T) {
 	c := newSynCache()
@@ -81,7 +86,7 @@ func TestSynCacheAcquireHasSingleConcurrentOwner(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			ack, owner := c.Acquire(key, now)
+			ack, owner := c.Acquire(key, now, testSynAddr)
 			if ack != nil {
 				t.Error("in-progress reservation unexpectedly returned an ACK")
 			}
@@ -97,7 +102,7 @@ func TestSynCacheAcquireHasSingleConcurrentOwner(t *testing.T) {
 	}
 
 	c.Complete(key, []byte("ack"))
-	ack, owner := c.Acquire(key, now.Add(time.Second))
+	ack, owner := c.Acquire(key, now.Add(time.Second), testSynAddr)
 	if owner || !bytes.Equal(ack, []byte("ack")) {
 		t.Fatalf("completed Acquire = (%q, %v), want cached ACK", ack, owner)
 	}
@@ -107,12 +112,39 @@ func TestSynCacheAbortReleasesReservation(t *testing.T) {
 	c := newSynCache()
 	var nonce [16]byte
 	key := synCacheKey{nonce: nonce}
-	if _, owner := c.Acquire(key, time.Now()); !owner {
+	if _, owner := c.Acquire(key, time.Now(), testSynAddr); !owner {
 		t.Fatal("first acquire should own reservation")
 	}
 	c.Abort(key)
-	if _, owner := c.Acquire(key, time.Now()); !owner {
+	if _, owner := c.Acquire(key, time.Now(), testSynAddr); !owner {
 		t.Fatal("aborted reservation should be acquirable")
+	}
+}
+
+// TestSynCacheRejectsCrossIPReplay pins the ACK-redirect guard: a completed
+// handshake record answers only its owner IP. A replayed SYN from a different
+// source IP — the shape of a captured-SYN redirect — must get nothing, while
+// the legitimate retransmit cases (same IP, another spread port) keep working.
+func TestSynCacheRejectsCrossIPReplay(t *testing.T) {
+	c := newSynCache()
+	var nonce [16]byte
+	copy(nonce[:], "replay-replay-r")
+	key := synCacheKey{nonce: nonce}
+	if _, owner := c.Acquire(key, time.Now(), testSynAddr); !owner {
+		t.Fatal("first acquire should own the reservation")
+	}
+	c.Complete(key, []byte("ack"))
+	ack, owner := c.Acquire(key, time.Now(), testSynAddr)
+	if owner || !bytes.Equal(ack, []byte("ack")) {
+		t.Fatalf("same-IP replay must receive the cached ACK, got (%q, %v)", ack, owner)
+	}
+	attacker := netip.MustParseAddrPort("198.51.100.9:1234")
+	if ack, _ := c.Acquire(key, time.Now(), attacker); ack != nil {
+		t.Fatalf("cross-IP replay must receive nothing, got %q", ack)
+	}
+	// The record is never handed to a different IP, completed or not.
+	if _, owner := c.Acquire(key, time.Now(), attacker); owner {
+		t.Fatal("cross-IP replay must not take over the reservation")
 	}
 }
 
@@ -126,10 +158,10 @@ func TestSynCacheSeparatesSameNonceAcrossPSKs(t *testing.T) {
 		t.Fatal("distinct PSKs produced the same cache identity")
 	}
 	now := time.Now()
-	if _, owner := c.Acquire(a, now); !owner {
+	if _, owner := c.Acquire(a, now, testSynAddr); !owner {
 		t.Fatal("first PSK did not acquire its nonce")
 	}
-	if _, owner := c.Acquire(b, now); !owner {
+	if _, owner := c.Acquire(b, now, testSynAddr); !owner {
 		t.Fatal("second PSK was blocked by another credential's nonce")
 	}
 	c.Complete(a, []byte("ack-a"))

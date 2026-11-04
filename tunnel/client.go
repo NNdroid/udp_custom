@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -27,7 +28,7 @@ import (
 // sockets), the RFC 6298 RTT estimator, Noise_NK (client side), and the
 // PacketNo-derived AEAD nonces that make retransmission and reordering safe.
 
-// Log levels mirror parseLogLevel in server.go (debug=0 … error=3).
+// Log levels mirror LogLevel in server.go (debug=0 … error=3).
 const (
 	LogLevelDebug = 0
 	LogLevelInfo  = 1
@@ -163,6 +164,10 @@ type Client struct {
 	magic      uint32
 	maxPkt     int    // largest record we put on the wire (see ClientConfig.MaxPkt)
 	logger     Logger // never nil after NewClient (tests may build bare literals)
+
+	// packetPanics counts dispatch panics recovered instead of crashing the
+	// process (see Client.dispatch).
+	packetPanics atomic.Uint64
 
 	// logLevel is resolved ONCE at construction (injected logger = 0 = debug
 	// on) so hot paths can gate debug work without parsing strings per packet.
@@ -431,6 +436,11 @@ func (c *Client) Start() error {
 // startRecvLoops launches one receive goroutine per spread socket. Called by
 // Start and lazily by DialTunnel (once; subsequent calls are no-ops).
 func (c *Client) startRecvLoops() {
+	// DialTunnel checks c.closed before startOnce.Do; re-check here because
+	// Close can land in between, and the loop sockets must not outlive it.
+	if atomic.LoadInt32(&c.closed) == 1 {
+		return
+	}
 	for idx := 0; idx < c.dialer.Len(); idx++ {
 		c.wg.Add(1)
 		go func(idx int) {
@@ -472,7 +482,7 @@ func (c *Client) recvSocketLoop(idx int) {
 				return
 			case <-timer.C:
 			}
-			backoff = minDuration(backoff*2, 5*time.Second)
+			backoff = min(backoff*2, 5*time.Second)
 		}
 	}
 }
@@ -683,6 +693,15 @@ func (c *Client) recvFromSocket(conn *net.UDPConn) error {
 }
 
 func (c *Client) dispatch(frame *UDPCFrame, srcPort uint16) {
+	// A panic while dispatching one authenticated frame is recovered and
+	// counted instead of killing the receive goroutine (and with it the whole
+	// process): one bad frame costs that frame, not every session.
+	defer func() {
+		if r := recover(); r != nil {
+			n := c.packetPanics.Add(1)
+			c.logError("🧨 panic dispatching cmd=0x%02X session 0x%08X (count=%d): %v\n%s", frame.Cmd, frame.SessionID, n, r, debug.Stack())
+		}
+	}()
 	if frame.Cmd == CMD_HANDSHAKE_ACK {
 		if frame.SessionID == 0 || frame.PacketNo != 0 || frame.Seq != 0 || frame.Ack != 0 || len(frame.Data) < ackPayloadBase {
 			return
@@ -855,7 +874,21 @@ func (c *Client) establish(ctx context.Context, target string, conn net.Conn) (*
 	sess.delivery = newOrderedDelivery(deliveryLimitFor(wideWindow), sess.closeChan, func(p []byte) error { return writeAll(sess.conn, p) }, func(err error) { sess.closeWithReason("application write failed: " + err.Error()) }, sess.sendACK)
 	sess.retryWake = make(chan struct{}, 1)
 	sess.initTransmitter()
+	if atomic.LoadInt32(&c.closed) == 1 {
+		// Close() ran while the handshake was in flight. Registering now would
+		// strand this session outside Close's sessions.Range sweep — pumping
+		// forever on a torn-down dialer until the idle timeout. Fail the dial
+		// like any other post-close call.
+		sess.close()
+		return nil, ErrClosed
+	}
 	c.sessions.Store(sid, sess)
+	if atomic.LoadInt32(&c.closed) == 1 {
+		// Close ranged over sessions before our Store landed. Close here so
+		// the session cannot escape the sweep either way.
+		sess.close()
+		return nil, ErrClosed
+	}
 
 	// Converge the frame budget IN THE BACKGROUND. Walking the ladder serially
 	// here used to hold the first byte of a session for up to
@@ -930,7 +963,6 @@ func (c *Client) handshake(ctx context.Context, target string) (uint32, *NoiseSe
 	if _, err := rand.Read(clientNonce[:]); err != nil {
 		return 0, nil, nil, "", fmt.Errorf("nonce: %w", err)
 	}
-	handshakeKeys := DerivePSKHandshakeKeys(c.cfg.Passwords[0], clientNonce)
 
 	// [16B ClientNonce] [8B Timestamp] [target TLV] [optional 48B msg1].
 	payload := make([]byte, synPayloadBase)
@@ -952,13 +984,6 @@ func (c *Client) handshake(ctx context.Context, target string) (uint32, *NoiseSe
 		if fecEnabled(c.cfg.FECExtParity) {
 			synFlags |= FLAG_FEC_EXT_PARITY
 		}
-	}
-	syn := SealFrameMAC(&UDPCFrame{
-		Magic: c.magic, Version: UDPC_VERSION, Flags: synFlags,
-		Cmd: CMD_HANDSHAKE_SYN, Data: payload,
-	}, &handshakeKeys.SynMAC)
-	if len(syn) == 0 {
-		return 0, nil, nil, "", fmt.Errorf("failed to seal SYN")
 	}
 
 	ch := make(chan *UDPCFrame, 8)
@@ -983,6 +1008,20 @@ func (c *Client) handshake(ctx context.Context, target string) (uint32, *NoiseSe
 	}()
 
 	for attempt := 1; attempt <= clientMaxHandshakeAttempts; attempt++ {
+		// Re-seal the SYN per attempt under a rotating PSK. The server verifies
+		// the SYN against whichever of ITS keys match, so a server that has
+		// already dropped the client's first-listed PSK (rotation) would
+		// otherwise reject every retry forever — the same clientNonce retried
+		// under the next key hits the server's SYN cache/nonce handling intact.
+		psk := c.cfg.Passwords[(attempt-1)%len(c.cfg.Passwords)]
+		synKeys := DerivePSKHandshakeKeys(psk, clientNonce)
+		syn := SealFrameMAC(&UDPCFrame{
+			Magic: c.magic, Version: UDPC_VERSION, Flags: synFlags,
+			Cmd: CMD_HANDSHAKE_SYN, Data: payload,
+		}, &synKeys.SynMAC)
+		if len(syn) == 0 {
+			return 0, nil, nil, "", fmt.Errorf("failed to seal SYN")
+		}
 		if err := c.dialer.SendAt(0, syn); err != nil {
 			c.logDebug("[Client] 📤 Handshake attempt %d send failed: %v", attempt, err)
 		}
@@ -995,12 +1034,13 @@ func (c *Client) handshake(ctx context.Context, target string) (uint32, *NoiseSe
 				// An unauthenticated forged ACK is noise, not a terminal handshake
 				// error. Keep waiting for the genuine response until the deadline.
 				// Find which of OUR PSKs the server answered with (rotation
-				// support): the same PSK then derives the session keys.
+				// support): the same PSK then derives the session keys. The MACs
+				// were precomputed for every configured PSK above — verify
+				// against those instead of re-running the full HKDF per ACK.
 				matchedPSK := ""
-				for _, psk := range c.cfg.Passwords {
-					k := DerivePSKHandshakeKeys(psk, clientNonce)
-					if VerifyFrameAuth(ack.raw, &k.AckMAC) == nil {
-						matchedPSK = psk
+				for i := range ackMACs {
+					if VerifyFrameAuth(ack.raw, &ackMACs[i]) == nil {
+						matchedPSK = c.cfg.Passwords[i]
 						break
 					}
 				}
@@ -1514,6 +1554,16 @@ func (s *clientSession) retransmitLoop() {
 		if delay < time.Millisecond {
 			delay = time.Millisecond
 		}
+		// Drain a stale value before Reset: the select above may have woken via
+		// retryWake while the timer had already fired and left a token in its
+		// channel — without the drain the next iteration would consume it as a
+		// spurious immediate wake.
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
 		timer.Reset(delay)
 		s.mu.Lock()
 		idle := now.Sub(s.lastActive)
@@ -1587,9 +1637,8 @@ func (s *clientSession) handleData(frame *UDPCFrame, srcPort uint16) bool {
 		}
 		return ok
 	}
-	if frame.Seq == 0 {
-		return true
-	}
+	// validSessionFrameShape already rejected Seq==0 for CMD_DATA before this
+	// point, so the legacy path below only ever sees real sequence numbers.
 
 	payload := frame.Data
 
@@ -1858,13 +1907,6 @@ func (s *clientSession) deliverRecoveredFEC(recovered []fecRecovered) {
 		// Recovered locally, not a network arrival: srcPort 0 skips scoring.
 		_ = s.handleData(f, 0)
 	}
-}
-
-func minDuration(a, b time.Duration) time.Duration {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 // sendWindow is called with unackedMu held.

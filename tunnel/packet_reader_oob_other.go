@@ -11,5 +11,8 @@ func newPacketReaderOOB(n int) [][]byte { return nil }
 const msgTruncFlag = 0
 
 // msgTruncDataFlag is unused outside Linux: those platforms take the plain
-// read path, which cannot report truncation.
+// read path, which cannot report truncation. A datagram larger than the
+// receive buffer therefore surfaces as an opaque MAC-authentication failure
+// instead of a diagnosed MSG_TRUNC drop (the Linux reader logs it throttled
+// and discards). Known platform limitation, not a parse bug.
 const msgTruncDataFlag = 0

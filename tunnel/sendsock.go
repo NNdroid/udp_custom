@@ -144,6 +144,14 @@ func (p *sendSockPool) Get(port int) (*pooledConn, error) {
 
 	// Fast path: cache hit. Lock-free on purpose (P0-1): one sync.Map load,
 	// one atomic store for the recency stamp. No mutex is touched.
+	//
+	// Honest TOCTOU note: the returned pc is NOT yet pinned — the refcount is
+	// only taken inside writeOnce/WriteToUDPAddrPort — so the window between
+	// this return and the caller's write can lose a race against overflow
+	// eviction (which only reclaims refcount-zero entries). The write then
+	// fails and the caller's repair path (repairAndRetry / Reopen) re-binds
+	// the socket; callers that write WITHOUT that repair path must pin
+	// explicitly (session_transport adds its own ref).
 	if v, ok := p.conns.Load(port); ok {
 		pc := v.(*pooledConn)
 		pc.lastUse.Store(p.nextStamp())

@@ -364,6 +364,11 @@ func (d *SpreadDialer) sendBatch(wires [][]byte) error {
 			dst[i] = netip.AddrPortFrom(addr, uint16(p.port))
 		}
 		sock := d.socks[idx]
+		// The batch write runs under sock.mu.RLock deliberately: Reopen takes
+		// the write lock, so holding RLock here is what stops a concurrent
+		// reopen from closing `conn` between the nil check and writeUDPBatch
+		// (use-after-close). A slow write therefore delays a reopen by one
+		// batch — accepted, bounded, and far cheaper than a torn socket.
 		sock.mu.RLock()
 		conn := sock.conn
 		n := 0

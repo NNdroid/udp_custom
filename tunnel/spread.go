@@ -296,7 +296,11 @@ func (d *SpreadDialer) Next() (int, int) {
 	if len(d.socks) == 0 || atomic.LoadInt32(&d.closed) == 1 {
 		return -1, 0
 	}
-	idx := int(d.rr.Add(1)-1) % len(d.socks)
+	// Modulo in uint64 before the int conversion: once the counter wraps
+	// MaxUint64, Add(1)-1 would convert to -1 and index the slice out of
+	// bounds. (Unreachable at 2^64 sends, but one cast is cheaper than the
+	// class of bug.)
+	idx := int((d.rr.Add(1) - 1) % uint64(len(d.socks)))
 	return idx, d.pickPort(idx)
 }
 

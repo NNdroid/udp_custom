@@ -20,6 +20,7 @@ type eventBus[T any] struct {
 	handlerOnce sync.Once // guards the consumer goroutine spawn
 	handlerMu   sync.RWMutex
 	handler     func(T)
+	closeOnce   sync.Once // makes close idempotent
 }
 
 func newEventBus[T any](capacity int) *eventBus[T] {
@@ -29,12 +30,28 @@ func newEventBus[T any](capacity int) *eventBus[T] {
 // setHandler starts the single consumer goroutine (exactly once) and swaps the
 // handler function. Calling setHandler again replaces the active handler
 // without spawning additional goroutines; nil stops delivery.
+//
+// Events emitted before the FIRST setHandler are drained and counted as
+// dropped rather than replayed: they are stale by the time a handler exists
+// (a late subscriber would otherwise see HandshakeRetrying/TunnelEstablished
+// notifications whose Attempt numbering no longer describes reality), and the
+// bus's contract already makes Stats the authoritative record. Subsequent
+// events are delivered live.
 func (b *eventBus[T]) setHandler(h func(T)) {
 	b.handlerMu.Lock()
 	b.handler = h
 	b.handlerMu.Unlock()
 
 	b.handlerOnce.Do(func() {
+	drainBacklog:
+		for {
+			select {
+			case <-b.ch:
+				b.dropped.Add(1)
+			default:
+				break drainBacklog
+			}
+		}
 		b.wg.Add(1)
 		go func() {
 			defer b.wg.Done()
@@ -70,8 +87,10 @@ func (b *eventBus[T]) emit(ev T) {
 func (b *eventBus[T]) droppedCount() uint64 { return b.dropped.Load() }
 
 func (b *eventBus[T]) close() {
-	b.stopped.Store(true)
-	close(b.stop)
+	b.closeOnce.Do(func() {
+		b.stopped.Store(true)
+		close(b.stop)
+	})
 }
 
 // safeEventCall isolates embedder-handler panics: a panicking callback must

@@ -606,8 +606,9 @@ func TestLatencyProbe_HandshakeUnderLoss(t *testing.T) {
 }
 
 // TestLatencyProbe_BulkRate measures sustained single-stream throughput on the
-// emulated path. With a 2048-frame window a 50ms path should sustain tens of
-// Mbps; anything near a few hundred KB/s means the effective window collapsed.
+// emulated path. With the full wide window a 50ms RTT path should sustain
+// hundreds of Mbps; anything near a few hundred KB/s means the effective
+// window collapsed.
 func TestLatencyProbe_BulkRate(t *testing.T) {
 	for _, delay := range []time.Duration{0, 25 * time.Millisecond} {
 		for _, ports := range []int{1, 4} {
@@ -615,7 +616,7 @@ func TestLatencyProbe_BulkRate(t *testing.T) {
 			if err != nil {
 				t.Skipf("no free port block: %v", err)
 			}
-			blk := make([]byte, 4*1024*1024)
+			blk := make([]byte, 16*1024*1024)
 			echoLn, err := net.Listen("tcp", "127.0.0.1:0")
 			if err != nil {
 				t.Fatal(err)
@@ -710,6 +711,123 @@ func TestLatencyProbe_BulkRate(t *testing.T) {
 	}
 }
 
+// TestThroughput_WindowRamp pins the slow-start ramp: the congestion window
+// must reach at least half the wide window during a 16 MB transfer on a
+// lossless 25 ms emulated path, or every short-to-medium transfer pays the
+// +1-per-RTT congestion-avoidance crawl that the throughput review measured
+// at 8x below the BDP ceiling. The path injects no loss, so any window
+// movement is growth; halving here means a repair event demoted the flow.
+func TestThroughput_WindowRamp(t *testing.T) {
+	const delay = 25 * time.Millisecond
+	lo, err := findPortBlock(1, 24000)
+	if err != nil {
+		t.Skipf("no free port block: %v", err)
+	}
+	blk := make([]byte, 16*1024*1024)
+	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		for {
+			c, err := echoLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				req := make([]byte, 64)
+				for {
+					if _, err := conn.Read(req); err != nil {
+						return
+					}
+					if _, err := conn.Write(blk); err != nil {
+						return
+					}
+				}
+			}(c)
+		}
+	}()
+	srv, err := NewServer(ServerConfig{
+		ListenAddr: "127.0.0.1:0", TargetAddr: "tcp://" + echoLn.Addr().String(),
+		Passwords: []string{"latency-psk"}, Logger: Nop,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go srv.Start()
+	r := &rangeRelay{lo: lo, hi: lo, delay: delay}
+	if err := r.bind(t, srv.conn.LocalAddr().String()); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	cli, err := NewClient(ClientConfig{
+		ServerAddr: r.Addr(), Passwords: []string{"latency-psk"}, Logger: Nop,
+		Sockets: 1, Paths: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	conn, err := cli.DialTunnel(ctx, DialOptions{})
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var maxCwnd atomic.Int64
+	stop := make(chan struct{})
+	go func() {
+		tick := time.NewTicker(50 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-tick.C:
+				srv.sessions.Range(func(_, v any) bool {
+					s, ok := v.(*ServerSession)
+					if !ok || s.flow == nil {
+						return true
+					}
+					s.unackedMu.Lock()
+					if int64(s.flow.cwnd) > maxCwnd.Load() {
+						maxCwnd.Store(int64(s.flow.cwnd))
+					}
+					s.unackedMu.Unlock()
+					return true
+				})
+			}
+		}
+	}()
+	if _, err := conn.Write([]byte("go")); err != nil {
+		t.Fatal(err)
+	}
+	st := time.Now()
+	buf := make([]byte, 64*1024)
+	var got int64
+	conn.SetDeadline(time.Now().Add(8 * time.Second))
+	for got < int64(len(blk)) {
+		n, err := conn.Read(buf)
+		if err != nil {
+			close(stop)
+			dumpSessionState(t, cli, srv, "ramp-stall")
+			t.Fatalf("read at %d: %v", got, err)
+		}
+		got += int64(n)
+	}
+	close(stop)
+	el := time.Since(st)
+	if maxCwnd.Load() < int64(deliveryWindowWide/2) {
+		t.Fatalf("cwnd peaked at %d of %d; slow start never completed (%.1f Mbps in %v)",
+			maxCwnd.Load(), deliveryWindowWide, float64(got)*8/el.Seconds()/1e6, el)
+	}
+	t.Logf("ramp: cwnd peaked at %d/%d, %.1f Mbps in %v", maxCwnd.Load(), deliveryWindowWide, float64(got)*8/el.Seconds()/1e6, el)
+	conn.Close()
+	cli.Close()
+	r.Close()
+	srv.Close()
+	echoLn.Close()
+}
+
 // dumpSessionState prints the live window/credit/delivery state of every
 // session on both ends, for diagnosing stalls.
 func dumpSessionState(t *testing.T, cli *Client, srv *Server, why string) {
@@ -748,7 +866,7 @@ func dumpSessionState(t *testing.T, cli *Client, srv *Server, why string) {
 			if s.tx != nil {
 				qlen = len(s.tx.queue)
 			}
-			t.Logf("[%s:server] sid=%08X sendSeq=%d lowest=%d outstanding=%d sacked=%d retried=%d cwnd=%d credit=%d fbNo=%d paceDebt=%v txq=%d/32 | recv delivered=%d pending=%d/%d | srtt=%v rto=%v",
+			t.Logf("[%s:server] sid=%08X sendSeq=%d lowest=%d outstanding=%d sacked=%d retried=%d cwnd=%d credit=%d fbNo=%d paceDebt=%v txq=%d/64 | recv delivered=%d pending=%d/%d | srtt=%v rto=%v",
 				why, s.sessionID, s.sendSeq.Load(), lowest, outstanding, sackedN, retriedN, cwnd, credit, fb, next, qlen,
 				s.delivery.delivered.Load(), pending, limit, s.rttEst.SRTT(), s.rttEst.RTO())
 			return true

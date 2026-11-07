@@ -22,16 +22,19 @@ func TestRTTEstimator(t *testing.T) {
 	}
 
 	// Stable samples converge as rttvar decays to 0, but the RTO no longer
-	// collapses onto srtt: the 1.5*srtt margin floors it at 450ms here. That
-	// floor is the point — a quiet path's rttvar decays away, so without it the
-	// RTO sits a hair above the smoothed RTT and any ordinary jitter fires a
-	// timeout that is not loss.
+	// collapses onto srtt: the 2*srtt margin floors it at 600ms here. That
+	// floor is the point — a quiet path's rttvar decays away, so without it
+	// the RTO sits a hair above the smoothed RTT and any ordinary jitter fires
+	// a timeout that is not loss. The margin also has to cover the peer's
+	// cumulative-ACK suppression (up to srtt/2, capped at 100 ms): the plain
+	// RFC 6298 1.5x floor left ~1 ms of headroom past the suppression edge and
+	// timed out frames on lossless paths.
 	e2 := newRTTEstimator(200*time.Millisecond, 200*time.Millisecond, 10*time.Second)
 	for i := 0; i < 50; i++ {
 		e2.Sample(300 * time.Millisecond)
 	}
-	if e2.RTO() < 425*time.Millisecond || e2.RTO() > 475*time.Millisecond {
-		t.Fatalf("stable rto=%v, want ~1.5*srtt (450ms)", e2.RTO())
+	if e2.RTO() < 575*time.Millisecond || e2.RTO() > 625*time.Millisecond {
+		t.Fatalf("stable rto=%v, want ~2*srtt (600ms)", e2.RTO())
 	}
 
 	// Real variance still dominates the margin: a jittery path gets

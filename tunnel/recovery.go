@@ -33,13 +33,21 @@ type sendFlow struct {
 	// cut — never a stale, higher value from further back. Non-zero means
 	// undoLoss can revert that event.
 	lastLossCut int
-	feedbackNo  uint64
-	lastProbe   time.Time
+	// ssthresh before the same cut. undoing a proven-spurious timeout also
+	// undoes the congestion-avoidance demotion: without this the window
+	// came back but the flow stayed in +1-per-RTT growth for thousands of
+	// RTTs after a timeout that never corresponded to real loss.
+	lastLossSSThresh int
+	feedbackNo       uint64
+	lastProbe        time.Time
 	// fastRepairs is a diagnostic counter of fast-repair retransmissions; the
 	// weak-net pipeline test reads it to tell repair paths apart.
 	fastRepairs int
 	paceMu      sync.Mutex
 	nextSend    time.Time
+	// paceTimer is the reused wait timer of the transmit loop's pacer (see
+	// waitBurst). Guarded by paceMu while being reset.
+	paceTimer *time.Timer
 
 	// Westwood-style delivery-rate estimate, in frames per second. Loss-based
 	// AIMD misreads a lossy-but-uncongested path: every random wireless drop
@@ -235,6 +243,7 @@ func (f *sendFlow) loss(now time.Time, rtt time.Duration, undoable bool) {
 		// legitimate reduction in between. undoLoss may only ever revert the
 		// most recent cut.
 		f.lastLossCut = pre
+		f.lastLossSSThresh = f.ssthresh
 	}
 	floor := max(2, f.cwnd-f.cwnd/4)
 	target := max(2, f.cwnd/2)
@@ -271,6 +280,7 @@ func (f *sendFlow) loss(now time.Time, rtt time.Duration, undoable bool) {
 		// window already reduced for real there is nothing legitimate left to
 		// undo.
 		f.lastLossCut = 0
+		f.lastLossSSThresh = 0
 	}
 }
 
@@ -310,6 +320,12 @@ func (f *sendFlow) undoLoss() bool {
 		return false
 	}
 	f.cwnd = min(f.max, cut)
+	if f.lastLossSSThresh > f.ssthresh {
+		// A proven-spurious timeout also undoes the CA demotion: the window
+		// coming back while ssthresh stayed at the halved value left the flow
+		// crawling at +1 frame per RTT for thousands of RTTs.
+		f.ssthresh = f.lastLossSSThresh
+	}
 	f.growth = 0
 	return true
 }
@@ -337,6 +353,11 @@ func (f *sendFlow) undoIfSpurious(p *unackedPkt, srtt time.Duration) bool {
 // An unknown RTT is NOT a reason to skip pacing: that turned the opening
 // window into one unpaced burst (see initialCwnd). It is paced against a
 // deliberately short bootstrap RTT instead.
+//
+// The wait timer is allocated once per flow and Reset between waits: at a
+// full window a batch fires every few hundred microseconds, and a
+// time.NewTimer allocation per batch was pure allocator churn on the hot
+// path. Only the transmit loop's single goroutine waits here.
 func (f *sendFlow) waitBurst(n, window int, rtt time.Duration, done <-chan struct{}) bool {
 	if rtt <= 0 {
 		rtt = bootstrapPaceRTT
@@ -349,12 +370,27 @@ func (f *sendFlow) waitBurst(n, window int, rtt time.Duration, done <-chan struc
 	}
 	f.nextSend = when.Add(time.Duration(n) * rtt / time.Duration(max(window, 1)))
 	delay := when.Sub(now)
+	timer := f.paceTimer
+	if delay > 0 {
+		if timer == nil {
+			timer = time.NewTimer(delay)
+			f.paceTimer = timer
+		} else {
+			if !timer.Stop() {
+				// Already fired and unconsumed (or long expired): the drain is
+				// a no-op when the channel is empty.
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(delay)
+		}
+	}
 	f.paceMu.Unlock()
 	if delay <= 0 {
 		return true
 	}
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
 	select {
 	case <-timer.C:
 		return true
@@ -444,7 +480,16 @@ func updateSACK(flow *sendFlow, outstanding map[uint64]*unackedPkt, f *UDPCFrame
 			// on a frame that was never lost.
 			continue
 		}
-		if now.Sub(p.sentTime) < guard || p.retries >= clientMaxRetries {
+		// The FIRST repair of a frame keeps the low-latency rtt/4 guard; a
+		// REPEATED repair of the same hole backs off with its own RTO ladder
+		// (p.rto grows x3/2 per retry): without it a persistently misreported
+		// hole burned the whole 15-retry budget at the rtt/4 cadence, which is
+		// a few RTTs end to end.
+		guardFor := guard
+		if p.retries > 0 {
+			guardFor = max(guard, p.rto/4)
+		}
+		if now.Sub(p.sentTime) < guardFor || p.retries >= clientMaxRetries {
 			continue
 		}
 		due = append(due, retryFrame{seq, p.wire})
@@ -461,14 +506,21 @@ func updateSACK(flow *sendFlow, outstanding map[uint64]*unackedPkt, f *UDPCFrame
 		p.retries++
 		p.sentTime = now
 		// Advance the same backoff ladder retryDue does. This does not change
-		// the fast-repair guard itself (that stays at rtt/4): it keeps the RTO
-		// path from stacking another retransmission of the same frame on top
-		// of the fast repair while the hole is still unfilled.
+		// the fast-repair guard itself: it keeps the RTO path from stacking
+		// another retransmission of the same frame on top of the fast repair
+		// while the hole is still unfilled.
 		p.rto = min(p.rto*3/2, rttMaxRTO)
 		wires = append(wires, p.wire)
 	}
 	flow.fastRepairs += len(wires)
-	flow.loss(now, rtt, false)
+	// No window cut here, deliberately. The bitmap bits prove out-of-order
+	// admissions, which on a reordering path are NOT loss — and the hole they
+	// describe was just repaired for the cost of a few frames, so halving
+	// here punished a cheap repair twice. Measured on a lossless-but-
+	// reordering path: every repair event halved the window (2048→45 within
+	// six RTTs) and the session crawled at +1 frame per RTT afterwards.
+	// Genuine congestion surfaces as RTOs instead, whose cuts are undoable
+	// and which Westwood restores — see retryDue and loss.
 	return wires, true
 }
 

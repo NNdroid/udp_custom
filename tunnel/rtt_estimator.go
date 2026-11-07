@@ -84,11 +84,14 @@ func (e *rttEstimator) Sample(rtt time.Duration) {
 	// measurable. On a jittery last-mile link RTTVAR often stays tiny next to
 	// SRTT, so the computed RTO sits a fraction of a millisecond above SRTT and
 	// ordinary jitter fires a timeout that is not loss at all. Hold the RTO at
-	// least 50% past the smoothed RTT; the x1.5 retry ladder still backs off from
-	// whatever that turns out to be, and on a 1 ms LAN this only moves the RTO to
-	// 1.5 ms.
-	if e.rto < e.srtt*3/2 {
-		e.rto = e.srtt * 3 / 2
+	// least 2x the smoothed RTT: the peer suppresses cumulative ACKs for up to
+	// ackCoalesceInterval (srtt/2, capped at 100 ms), so the plain RFC 6298 1.5x
+	// floor left barely 1 ms of margin past the suppression edge and fired
+	// timeouts on LOSSLESS paths (148 spurious retransmits measured in a
+	// 25k-frame bulk run). The 2x floor keeps the same semantics on a 1 ms LAN,
+	// where the RTO becomes 2 ms.
+	if e.rto < e.srtt*2 {
+		e.rto = e.srtt * 2
 	}
 	if e.rto < e.minRTT {
 		e.rto = e.minRTT

@@ -13,7 +13,7 @@ func TestOrderedDeliveryBackpressureOwnershipAndOrder(t *testing.T) {
 		done := make(chan struct{})
 		gate := make(chan struct{})
 		var got bytes.Buffer
-		d := newOrderedDelivery(4, done, func(p []byte) error { <-gate; got.Write(p); return nil }, func(err error) { t.Error(err) }, func(uint64) {})
+		d := newOrderedDelivery(4, done, func(p []byte) error { <-gate; got.Write(p); return nil }, func(err error) { t.Error(err) }, func(uint64) {}, nil)
 		defer func() { d.close(); close(done) }()
 		p := []byte("B")
 		if !d.offer(2, p) || !d.offer(1, []byte("A")) {
@@ -49,7 +49,7 @@ func TestOrderedDeliveryConcurrentAdmission(t *testing.T) {
 		done := make(chan struct{})
 		gate := make(chan struct{})
 		var got bytes.Buffer
-		d := newOrderedDelivery(128, done, func(p []byte) error { <-gate; got.Write(p); return nil }, func(err error) { t.Error(err) }, func(uint64) {})
+		d := newOrderedDelivery(128, done, func(p []byte) error { <-gate; got.Write(p); return nil }, func(err error) { t.Error(err) }, func(uint64) {}, nil)
 		defer func() { d.close(); close(done) }()
 		var wg sync.WaitGroup
 		for i := 1; i <= 128; i++ {
@@ -111,7 +111,7 @@ func TestDelayedACKSinglePairAndClose(t *testing.T) {
 func TestSnapshotNeverOverrunsBitmap(t *testing.T) {
 	done := make(chan struct{})
 	defer close(done)
-	d := newOrderedDelivery(deliveryWindowWide, done, func([]byte) error { return nil }, func(error) {}, func(uint64) {})
+	d := newOrderedDelivery(deliveryWindowWide, done, func([]byte) error { return nil }, func(error) {}, func(uint64) {}, nil)
 	ack, bitmap, credit := d.snapshot()
 	if ack != 0 || credit != deliveryWindowWide {
 		t.Fatalf("empty snapshot ack=%d credit=%d", ack, credit)
@@ -162,7 +162,7 @@ func TestOrderedDeliveryFeedsPeerWhileWriterStalls(t *testing.T) {
 		d := newOrderedDelivery(8, done,
 			func([]byte) error { <-gate; return nil },
 			func(err error) { t.Error(err) },
-			func(seq uint64) { mu.Lock(); acks = append(acks, seq); mu.Unlock() })
+			func(seq uint64) { mu.Lock(); acks = append(acks, seq); mu.Unlock() }, nil)
 		defer func() { d.close(); close(done) }()
 
 		if !d.offer(1, []byte("A")) {

@@ -518,7 +518,7 @@ func (c *Client) DialTunnel(ctx context.Context, opts DialOptions) (net.Conn, er
 	}
 	c.startOnce.Do(c.startRecvLoops)
 
-	appConn, sessionConn := net.Pipe()
+	appConn, sessionConn := newChunkPipe()
 	type established struct {
 		sess *clientSession
 		err  error
@@ -871,7 +871,7 @@ func (c *Client) establish(ctx context.Context, target string, conn net.Conn) (*
 	// reuses its exact encoded bytes), so the cap is conservative until the
 	// probe proves otherwise. It only ever rises here.
 	sess.sendCap.Store(int32(mtuStartCap(c.maxPkt, mtuProbeEnabled(c.cfg.MtuProbe))))
-	sess.delivery = newOrderedDelivery(deliveryLimitFor(wideWindow), sess.closeChan, func(p []byte) error { return writeAll(sess.conn, p) }, func(err error) { sess.closeWithReason("application write failed: " + err.Error()) }, sess.sendACK)
+	sess.delivery = newOrderedDelivery(deliveryLimitFor(wideWindow), sess.closeChan, func(p []byte) error { return writeAll(sess.conn, p) }, func(err error) { sess.closeWithReason("application write failed: " + err.Error()) }, sess.sendACK, nil)
 	sess.retryWake = make(chan struct{}, 1)
 	sess.initTransmitter()
 	if atomic.LoadInt32(&c.closed) == 1 {

@@ -177,7 +177,7 @@ func TestFECSenderSeedAndMemoSnapshot(t *testing.T) {
 
 func TestDeliveryOfferObserved(t *testing.T) {
 	done := make(chan struct{})
-	d := newOrderedDelivery(16, done, func([]byte) error { return nil }, func(error) {}, func(uint64) {})
+	d := newOrderedDelivery(16, done, func([]byte) error { return nil }, func(error) {}, func(uint64) {}, nil)
 	defer close(done)
 
 	if fresh, ok := d.offerObserved(0, nil); fresh || ok {

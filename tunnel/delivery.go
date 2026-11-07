@@ -15,12 +15,13 @@ const deliveryWindow = 512
 // deliveryWindowWide is the flight cap for sessions that negotiated
 // FLAG_WIDE_WINDOW. The window IS the BDP ceiling: 512 frames of ~1450 bytes
 // caps throughput at 24 Mbps at 250 ms RTT and 15 Mbps at 400 ms — exactly
-// the high-RTT links weak networks run on. 2048 frames (~3 MB of wire
-// buffers per session in the worst case) lifts the ceiling to ~95 Mbps at
+// the high-RTT links weak networks run on. 4096 frames (~6 MB of wire
+// buffers per session in the worst case) lifts the ceiling to ~190 Mbps at
 // 250 ms. The SACK bitmap stays 512 bits: a short bitmap is legal (it only
 // describes the head of the outstanding range) and keeps the wire format
-// identical to the baseline.
-const deliveryWindowWide = 2048
+// identical to the baseline. The replay window widens in lockstep (see
+// replayWindowPackets) so far-ahead admissions cannot fall behind it.
+const deliveryWindowWide = 4096
 
 // deliveryLimitFor returns the ordered-delivery limit (and thus the credit
 // this end advertises) for a session. Only a negotiated wide session may
@@ -51,7 +52,13 @@ type orderedDelivery struct {
 	write     func([]byte) error
 	fail      func(error)
 	ack       func(uint64)
-	delayed   delayedACK
+	// idle runs when the ordered drain has caught up (nothing more can be
+	// delivered right now) and the run loop is about to sleep. It is where a
+	// buffered writer flushes what accumulated during the drain burst; nil
+	// for unbuffered writers. Runs on the delivery goroutine, never
+	// concurrently with write.
+	idle    func()
+	delayed delayedACK
 	// writeStarted is the Unix-nano time the in-flight write() began, or 0 when
 	// no write is running. A write that has been in flight for longer than
 	// stallFeedbackInterval means the local reader is not consuming, and
@@ -92,11 +99,11 @@ func (d *orderedDelivery) stalled() bool {
 	return start != 0 && time.Now().UnixNano()-start > int64(stallFeedbackInterval)
 }
 
-func newOrderedDelivery(limit int, done <-chan struct{}, write func([]byte) error, fail func(error), ack func(uint64)) *orderedDelivery {
+func newOrderedDelivery(limit int, done <-chan struct{}, write func([]byte) error, fail func(error), ack func(uint64), idle func()) *orderedDelivery {
 	if limit <= 0 || limit > deliveryWindowWide {
 		limit = deliveryWindowWide
 	}
-	d := &orderedDelivery{pending: make(map[uint64][]byte), limit: limit, wake: make(chan struct{}, 1), done: done, write: write, fail: fail, ack: ack}
+	d := &orderedDelivery{pending: make(map[uint64][]byte), limit: limit, wake: make(chan struct{}, 1), done: done, write: write, fail: fail, ack: ack, idle: idle}
 	go d.run()
 	return d
 }
@@ -206,6 +213,13 @@ func (d *orderedDelivery) run() {
 			d.delivered.Store(seq)
 			d.mu.Unlock()
 			d.delayed.queue(seq, d.ack)
+		}
+		// The drain caught up: hand buffered writers their flush point before
+		// the loop sleeps. A single delivered frame still reaches an idle
+		// flush immediately, so interactive latency is unchanged; a burst
+		// flushes once instead of once per frame.
+		if d.idle != nil {
+			d.idle()
 		}
 	}
 }

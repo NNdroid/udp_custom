@@ -158,7 +158,11 @@ func TestStalledApplicationDoesNotBlockSharedReceiver(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer slow.Close()
-	if _, err = slow.Write([]byte("application does not read this echo")); err != nil {
+	// The stalled application must fill the delivery pipeline deep enough to
+	// genuinely block it: the download path buffers 256 KB per direction
+	// (chunkPipe), so a payload smaller than that would sit buffered and the
+	// stall scenario would never materialize.
+	if _, err = slow.Write(bytes.Repeat([]byte("application does not read this echo"), 32*1024)); err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(time.Second)

@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"bufio"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
@@ -160,6 +161,22 @@ const targetWriteTimeout = 5 * time.Second
 // alone costs one read syscall per record. A larger buffer amortizes the reads;
 // the per-record cap is still enforced downstream.
 const upstreamReadBuf = 64 << 10
+
+// upstreamWriteBuf buffers the delivery pump's writes to a TCP target, and
+// upstreamWriteFlush is the buffered size at which a bulk stream flushes
+// ahead of the drain-boundary flush. See the delivery construction in
+// handleHandshake.
+const (
+	upstreamWriteBuf   = 256 << 10
+	upstreamWriteFlush = upstreamWriteBuf / 2
+)
+
+// flushTargetWrite bounds one buffered flush by the same write deadline the
+// unbuffered path applied per frame.
+func flushTargetWrite(upstream net.Conn, bw *bufio.Writer) error {
+	_ = upstream.SetWriteDeadline(time.Now().Add(targetWriteTimeout))
+	return bw.Flush()
+}
 
 const (
 	pathChallengeTTL  = 5 * time.Second
@@ -339,14 +356,25 @@ func (s *Server) logError(format string, v ...interface{}) {
 // of yielding a negative buffer size.
 func (s *Server) maxPayload() int { return effectivePayloadCap(s.maxPkt) }
 
-// ReplayFilter implements the per-direction 2048-packet sliding window used by
-// every established v2 frame. Packet number zero and packets older than the
+// replayWindowPackets is the per-direction packet-number replay window. It must
+// stay >= the widest delivery window (deliveryWindowWide): a frame admitted far
+// ahead of the cumulative Ack must not fall behind the replay filter's edge
+// before delivery gets to it, or it is misread as a replay and the stream
+// stalls. Widened in lockstep with deliveryWindowWide; the bitmap costs
+// replayWindowPackets/8 bytes per direction per session.
+const (
+	replayWindowPackets = 4096
+	replayWindowWords   = replayWindowPackets / 64
+)
+
+// ReplayFilter implements the per-direction packet-number sliding window used
+// by every established v2 frame. Packet number zero and packets older than the
 // window are always rejected. There is deliberately no wrap-around: exhausting
 // uint64 packet numbers closes the session before another nonce can be used.
 type ReplayFilter struct {
 	maxSeq  uint64
 	seenMax bool
-	window  [32]uint64
+	window  [replayWindowWords]uint64
 	mu      sync.Mutex
 }
 
@@ -363,7 +391,7 @@ func (rf *ReplayFilter) Seen(seq uint64) bool {
 		return false
 	}
 	behind := rf.maxSeq - seq
-	if behind >= 2048 {
+	if behind >= replayWindowPackets {
 		return true
 	}
 	return (rf.window[behind/64] & (1 << (behind % 64))) != 0
@@ -381,8 +409,8 @@ func (rf *ReplayFilter) acceptLocked(seq uint64) bool {
 	}
 	if seq > rf.maxSeq {
 		diff := seq - rf.maxSeq
-		if diff >= 2048 {
-			rf.window = [32]uint64{}
+		if diff >= replayWindowPackets {
+			rf.window = [replayWindowWords]uint64{}
 		} else {
 			for diff > 0 {
 				step := diff
@@ -401,7 +429,7 @@ func (rf *ReplayFilter) acceptLocked(seq uint64) bool {
 		return true
 	}
 	behind := rf.maxSeq - seq
-	if behind >= 2048 {
+	if behind >= replayWindowPackets {
 		return false
 	}
 	wordIdx := behind / 64
@@ -427,7 +455,7 @@ func (rf *ReplayFilter) Remove(seq uint64) {
 	}
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if !rf.seenMax || seq > rf.maxSeq || rf.maxSeq-seq >= 2048 {
+	if !rf.seenMax || seq > rf.maxSeq || rf.maxSeq-seq >= replayWindowPackets {
 		return
 	}
 	behind := rf.maxSeq - seq
@@ -1369,12 +1397,41 @@ func (s *Server) handleHandshake(remoteAddr netip.AddrPort, frame *UDPCFrame, or
 	sess.sendSeq.Store(1)
 	sess.recvSeq.Store(1)
 	limit := min(s.maxRecvQueue, deliveryLimitFor(frameKeys.wideWindow))
-	sess.delivery = newOrderedDelivery(limit, sess.closeChan, func(p []byte) error {
-		if sess.upstream != nil {
-			_ = sess.upstream.SetWriteDeadline(time.Now().Add(targetWriteTimeout))
+	// The delivery write callback. A TCP target writes through a buffer so a
+	// bulk stream pays one write syscall per upstreamWriteFlush bytes instead
+	// of two syscalls per ~1.4 KB frame (a deadline refresh and a write); the
+	// flush fires at the delivery drain boundary (idle) or when the buffer
+	// crosses the flush threshold, whichever comes first — a lone delivered
+	// frame still reaches the idle flush immediately, so interactive latency
+	// is unchanged. UDP targets keep per-frame datagram writes.
+	var writeFn func([]byte) error
+	var idleFn func()
+	failFn := func(err error) { s.logWarn("target delivery failed: %v", err); sess.Close() }
+	if targetNet == "tcp" {
+		bw := bufio.NewWriterSize(upstream, upstreamWriteBuf)
+		writeFn = func(p []byte) error {
+			if _, err := bw.Write(p); err != nil {
+				return err
+			}
+			if bw.Buffered() >= upstreamWriteFlush {
+				return flushTargetWrite(upstream, bw)
+			}
+			return nil
 		}
-		return sess.writeToTarget(p)
-	}, func(err error) { s.logWarn("target delivery failed: %v", err); sess.Close() }, sess.sendCumulativeACK)
+		idleFn = func() {
+			if bw.Buffered() > 0 {
+				if err := flushTargetWrite(upstream, bw); err != nil {
+					failFn(err)
+				}
+			}
+		}
+	} else {
+		writeFn = func(p []byte) error {
+			_ = upstream.SetWriteDeadline(time.Now().Add(targetWriteTimeout))
+			return sess.writeToTarget(p)
+		}
+	}
+	sess.delivery = newOrderedDelivery(limit, sess.closeChan, writeFn, failFn, sess.sendCumulativeACK, idleFn)
 	sess.retryWake = make(chan struct{}, 1)
 	sess.initTransmitter()
 	if _, loaded := s.sessions.LoadOrStore(sid, sess); loaded || atomic.LoadInt32(&s.closed) == 1 {

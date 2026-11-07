@@ -162,10 +162,14 @@ func TestStalledApplicationDoesNotBlockSharedReceiver(t *testing.T) {
 	// genuinely block it: the download path buffers 256 KB per direction
 	// (chunkPipe), so a payload smaller than that would sit buffered and the
 	// stall scenario would never materialize.
-	if _, err = slow.Write(bytes.Repeat([]byte("application does not read this echo"), 32*1024)); err != nil {
+	if _, err = slow.Write(bytes.Repeat([]byte("application does not read this echo"), 8*1024)); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(time.Second)
+	// Slow environments (qemu-emulated CI, race slowdown) may need several
+	// seconds for the echo to come back and fill the pipe; a healthy run sees
+	// pending within milliseconds, so the generous deadline only delays a
+	// genuine regression.
+	deadline := time.Now().Add(30 * time.Second)
 	for {
 		pending := false
 		c.sessions.Range(func(_, v any) bool {

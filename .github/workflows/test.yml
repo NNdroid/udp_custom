@@ -407,13 +407,33 @@ jobs:
           check-latest: true
 
       - name: Throughput benchmarks (Target x protocol)
-        run: >
-          go test -run XXX
-          -bench 'BenchmarkTCPTarget_|BenchmarkUDPTarget_'
-          -benchmem -benchtime=2s
-          -cpuprofile cpu-throughput.prof
-          ./tunnel/ | tee benchmark.txt
+        # The windows CI VM intermittently faults the Go runtime at high
+        # packet rates (golang/go#77975 — the same signature the race job
+        # below retries; the throughput benchmarks now drive far more
+        # packets than they used to). Retry the known signature, fail hard
+        # otherwise.
         shell: bash
+        run: |
+          set -o pipefail
+          for attempt in 1 2 3; do
+            log=$(mktemp)
+            if go test -run XXX \
+              -bench 'BenchmarkTCPTarget_|BenchmarkUDPTarget_' \
+              -benchmem -benchtime=2s \
+              -cpuprofile cpu-throughput.prof \
+              ./tunnel/ | tee "$log"; then
+              cp "$log" benchmark.txt
+              exit 0
+            fi
+            if grep -q 'Exception 0xc0000005' "$log" && grep -q 'unknown pc' "$log"; then
+              echo "::warning::benchmark run $attempt hit the golang/go#77975 windows runtime fault; retrying"
+              continue
+            fi
+            echo "benchmark run failed without the known crash signature"
+            exit 1
+          done
+          echo "benchmark runs exhausted: every attempt crashed the runtime"
+          exit 1
 
       - name: Micro benchmarks (codec, AEAD, replay filter)
         run: >

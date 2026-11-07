@@ -34,6 +34,10 @@ ExecStart=%s
 Restart=always
 RestartSec=3
 LimitNOFILE=65535
+# The per-frame wire buffers churn tens of MB/s at high throughput; a larger
+# heap goal cuts GC frequency roughly in half on small VPS boxes. Remove (or
+# set GOMEMLIMIT) if the machine shares memory with other services.
+Environment="GOGC=400"
 
 [Install]
 WantedBy=multi-user.target

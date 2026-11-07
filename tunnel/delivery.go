@@ -162,17 +162,17 @@ func (d *orderedDelivery) offerObserved(seq uint64, payload []byte) (fresh bool,
 	return true, true
 }
 
-func (d *orderedDelivery) snapshot() (ack uint64, bitmap [8]uint64, credit uint16) {
+func (d *orderedDelivery) snapshot() (ack uint64, bitmap [sackWordsWide]uint64, credit uint16) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	ack = d.delivered.Load()
-	// The bitmap has room for sackBitmapBits admissions regardless of how wide
-	// the delivery limit is: a wide session may hold far more pending frames,
-	// and indexing past the bitmap would panic. Frames beyond the last bitmap
-	// bit are simply not described here — the SACK covers its head, the peer's
-	// RTO covers the rest.
+	// The bitmap horizon is this session's own delivery limit — 512 words'
+	// worth of bits when narrow, the full 4096 when wide — so every admitted
+	// frame the peer may still be holding is described. Frames are admitted
+	// no further than `limit` above the delivered prefix, and the index below
+	// is bounded by the same check, so it cannot panic.
 	for seq := range d.pending {
-		if seq > ack && seq-ack <= sackBitmapBits {
+		if seq > ack && seq-ack <= uint64(d.limit) {
 			bit := seq - ack - 1
 			bitmap[bit/64] |= uint64(1) << (bit % 64)
 		}

@@ -36,7 +36,7 @@ func ackCoalesceInterval(srtt time.Duration) time.Duration {
 }
 
 // sackGaps counts the bits a snapshot bitmap would advertise as gaps.
-func sackGaps(bitmap [8]uint64) int {
+func sackGaps(bitmap [sackWordsWide]uint64) int {
 	n := 0
 	for _, w := range bitmap {
 		n += bits.OnesCount64(w)
@@ -383,4 +383,23 @@ func (d *SpreadDialer) sendBatch(wires [][]byte) error {
 		}
 	}
 	return firstErr
+}
+
+// sackMaxWords is the widest SACK bitmap this session may put on the wire:
+// 512 admission bits unless FLAG_WIDE_WINDOW was negotiated on both ends, in
+// which case the bitmap covers the full 4096-frame window. A narrow peer
+// validates the payload against the 66-byte baseline and would reject every
+// wider SACK from us, silently disabling its own fast repair.
+func (s *clientSession) sackMaxWords() int {
+	if s.frameKeys != nil && s.frameKeys.wideWindow {
+		return sackWordsWide
+	}
+	return sackWordsNarrow
+}
+
+func (sess *ServerSession) sackMaxWords() int {
+	if sess.frameKeys != nil && sess.frameKeys.wideWindow {
+		return sackWordsWide
+	}
+	return sackWordsNarrow
 }

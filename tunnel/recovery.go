@@ -8,12 +8,45 @@ import (
 	"time"
 )
 
-const sackPayloadSize = 66 // receive credit (2), up to 512 admission bits (64)
+const (
+	// sackWordsNarrow is the baseline SACK bitmap: 512 admission bits in the
+	// historical 66-byte payload, which narrow (and all pre-widening) peers
+	// build, accept, and validate.
+	sackWordsNarrow = 8
+	// sackWordsWide covers the 4096-frame wide window. Only sessions that
+	// negotiated FLAG_WIDE_WINDOW build payloads this large — and both ends
+	// of such a session run this code, so both accept them. A narrow peer
+	// validates len(Data) against the 66-byte ceiling and would reject every
+	// wider SACK from us, silently disabling its own fast repair; that is
+	// exactly why the wide encoding is gated on the negotiation.
+	sackWordsNarrowPayload = 2 + sackWordsNarrow*8
+	sackWordsWidePayload   = 2 + sackWordsWide*8
+	sackWordsWide          = 64
+)
 
-// sackBitmapBits is the SACK bitmap horizon: one admission bit per sequence
-// above the cumulative Ack, eight 64-bit words. The repair scan in updateSACK
-// covers the same horizon, as does the delivery-side bitmap snapshot.
-const sackBitmapBits = uint64(8 * 64)
+// encodeSACK builds the narrow 8-word feedback payload.
+func encodeSACK(credit uint16, bitmap uint64, extra ...uint64) []byte {
+	var words [sackWordsWide]uint64
+	words[0] = bitmap
+	copy(words[1:], extra)
+	return encodeSACKWords(credit, words, sackWordsNarrow)
+}
+
+// encodeSACKWords builds a SACK payload carrying at most maxWords 64-bit
+// admission words, trailing zero words trimmed. The receive credit rides in
+// the first two bytes.
+func encodeSACKWords(credit uint16, words [sackWordsWide]uint64, maxWords int) []byte {
+	n := maxWords
+	for n > 0 && words[n-1] == 0 {
+		n--
+	}
+	p := make([]byte, 2+n*8)
+	binary.BigEndian.PutUint16(p, credit)
+	for i := 0; i < n; i++ {
+		binary.BigEndian.PutUint64(p[2+i*8:], words[i])
+	}
+	return p
+}
 
 // idleRetryDelay is how long the retransmit loop sleeps when nothing is
 // outstanding. It bounds how long a submission on an empty window waits before
@@ -399,21 +432,6 @@ func (f *sendFlow) waitBurst(n, window int, rtt time.Duration, done <-chan struc
 	}
 }
 
-func encodeSACK(credit uint16, bitmap uint64, extra ...uint64) []byte {
-	words := [8]uint64{bitmap}
-	copy(words[1:], extra)
-	n := len(words)
-	for n > 0 && words[n-1] == 0 {
-		n--
-	}
-	p := make([]byte, 2+n*8)
-	binary.BigEndian.PutUint16(p, credit)
-	for i := 0; i < n; i++ {
-		binary.BigEndian.PutUint64(p[2+i*8:], words[i])
-	}
-	return p
-}
-
 // updateSACK rejects feedback outside the sent sequence range. Authenticated
 // but reordered control records cannot regress receive credit.
 // sackFastRepairMax bounds how many holes ONE SACK feedback may repair. The
@@ -429,13 +447,16 @@ const sackFastRepairMax = 3
 // and repairs nothing.
 func updateSACK(flow *sendFlow, outstanding map[uint64]*unackedPkt, f *UDPCFrame, highest uint64, rtt time.Duration) (wires [][]byte, valid bool) {
 	// highest == 0 means nothing was sent yet (Seq starts at 1); callers derive
-	// it as sendSeq-1, which would underflow the horizon math below.
-	if flow == nil || highest == 0 || len(f.Data) < 2 || len(f.Data) > sackPayloadSize || (len(f.Data)-2)%8 != 0 || f.Ack > highest || f.PacketNo <= flow.feedbackNo {
+	// it as sendSeq-1, which would underflow the horizon math below. Narrow
+	// peers send the 66-byte payload, wide peers up to 514 bytes — both
+	// validate by the same shape rules.
+	if flow == nil || highest == 0 || len(f.Data) < 2 || len(f.Data) > sackWordsWidePayload || (len(f.Data)-2)%8 != 0 || f.Ack > highest || f.PacketNo <= flow.feedbackNo {
 		return nil, false
 	}
-	var words [8]uint64
+	var words [sackWordsWide]uint64
+	wordCount := (len(f.Data) - 2) / 8
 	count := 0
-	for i := 0; i < (len(f.Data)-2)/8; i++ {
+	for i := 0; i < wordCount; i++ {
 		words[i] = binary.BigEndian.Uint64(f.Data[2+i*8:])
 		if words[i] != 0 && highest-f.Ack < uint64(i*64+bits.Len64(words[i])) {
 			return nil, false
@@ -469,10 +490,11 @@ func updateSACK(flow *sendFlow, outstanding map[uint64]*unackedPkt, f *UDPCFrame
 	now := time.Now()
 	guard := max(5*time.Millisecond, rtt/4)
 	// Repair the OLDEST holes first, up to sackFastRepairMax. The candidate
-	// scan covers the same horizon the bitmap does (one admission bit per
-	// sequence above f.Ack).
+	// scan covers the horizon the bitmap itself described (one admission bit
+	// per sequence above f.Ack) — 512 bits from a narrow peer, 4096 from a
+	// wide one.
 	var due []retryFrame
-	for seq := f.Ack + 1; seq <= f.Ack+sackBitmapBits && seq <= highest; seq++ {
+	for seq := f.Ack + 1; seq <= f.Ack+uint64(wordCount)*64 && seq <= highest; seq++ {
 		p := outstanding[seq]
 		if p == nil || p.sacked || p.queued {
 			// queued = still sitting in the transmit queue, not yet on the

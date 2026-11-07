@@ -596,3 +596,48 @@ func TestSendWindowCloseUnblocks(t *testing.T) {
 		t.Fatal("Close did not unblock the parked sender")
 	}
 }
+
+// TestReplayFilterFullWordSlide pins the step==64 shift: a packet-number gap
+// of exactly 64 must slide the bitmap by one whole word. The generic shift
+// expression used <<64 / >>64, which are both zero in Go, wiping every seen
+// bit — in-flight frames' retransmissions were then re-accepted as new and
+// the delivered stream misaligned (the weak-net stress corruption).
+func TestReplayFilterFullWordSlide(t *testing.T) {
+	var rf ReplayFilter
+	if !rf.Accept(1) {
+		t.Fatal("accept 1")
+	}
+	// Jump 64 ahead: frames 2..64 were lost in one burst.
+	if !rf.Accept(65) {
+		t.Fatal("accept 65 after a 64-gap")
+	}
+	if !rf.Seen(1) {
+		t.Fatal("seq 1 forgotten by the 64-bit slide")
+	}
+	if rf.Accept(1) {
+		t.Fatal("seq 1 re-accepted after the slide")
+	}
+	// The slide preserved the window: frame 65's bit sits in word 0, and the
+	// carried-over bit for seq 1 sits in word 1.
+	if !rf.Seen(65) {
+		t.Fatal("seq 65 not seen")
+	}
+	// A second 64-slide keeps carrying the history forward.
+	if !rf.Accept(129) {
+		t.Fatal("accept 129")
+	}
+	if !rf.Seen(65) || !rf.Seen(1) {
+		t.Fatal("history lost across two full-word slides")
+	}
+	// And a >64 multi-word slide (71 = 64 + 7) stays consistent too: every
+	// carried bit moves by exactly 71 positions and stays within the window.
+	if !rf.Accept(200) {
+		t.Fatal("accept 200")
+	}
+	if !rf.Seen(129) || !rf.Seen(65) || !rf.Seen(1) {
+		t.Fatal("history lost across the multi-word slide")
+	}
+	if rf.Accept(129) || rf.Accept(65) || rf.Accept(1) {
+		t.Fatal("replay accepted after the multi-word slide")
+	}
+}

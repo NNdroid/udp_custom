@@ -1735,7 +1735,7 @@ func (s *clientSession) sendACK(ackSeq uint64) {
 	iv := ackCoalesceInterval(s.ackSRTT())
 	ack, urgent := ackSeq, false
 	if s.flow != nil && s.delivery != nil {
-		var bitmap [8]uint64
+		var bitmap [sackWordsWide]uint64
 		ack, bitmap, _ = s.delivery.snapshot()
 		// A gap is the one piece of feedback that triggers the sender's fast
 		// repair, so it is never worth deferring for coalescing savings.
@@ -1792,7 +1792,7 @@ func (s *clientSession) emitFeedback(ackSeq uint64) {
 func (s *clientSession) feedbackFrame(ackSeq uint64) *UDPCFrame {
 	if s.flow != nil && s.delivery != nil {
 		ack, bitmap, credit := s.delivery.snapshot()
-		return &UDPCFrame{Magic: s.client.magic, Version: UDPC_VERSION, Cmd: CMD_SACK, SessionID: s.sid, Ack: ack, Data: encodeSACK(credit, bitmap[0], bitmap[1:]...)}
+		return &UDPCFrame{Magic: s.client.magic, Version: UDPC_VERSION, Cmd: CMD_SACK, SessionID: s.sid, Ack: ack, Data: encodeSACKWords(credit, bitmap, s.sackMaxWords())}
 	}
 	return &UDPCFrame{Magic: s.client.magic, Version: UDPC_VERSION, Cmd: CMD_ACK, SessionID: s.sid, Ack: ackSeq, WindowSize: 65535}
 }

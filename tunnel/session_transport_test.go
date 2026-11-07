@@ -128,12 +128,12 @@ func TestAckCoalescerUrgentSurvivesZeroAck(t *testing.T) {
 
 func TestSackGapsCountsBits(t *testing.T) {
 	for _, tc := range []struct {
-		bitmap [8]uint64
+		bitmap [sackWordsWide]uint64
 		want   int
 	}{
-		{[8]uint64{}, 0},
-		{[8]uint64{1 << 2, 1 << 63}, 2},
-		{[8]uint64{1<<1 | 1<<3 | 1<<5, ^uint64(0)}, 3 + 64},
+		{[sackWordsWide]uint64{}, 0},
+		{[sackWordsWide]uint64{1 << 2, 1 << 63}, 2},
+		{[sackWordsWide]uint64{1<<1 | 1<<3 | 1<<5, ^uint64(0)}, 3 + 64},
 	} {
 		if got := sackGaps(tc.bitmap); got != tc.want {
 			t.Fatalf("sackGaps=%d, want %d", got, tc.want)

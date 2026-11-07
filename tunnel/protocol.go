@@ -442,7 +442,7 @@ func validSessionFrameShape(frame *UDPCFrame) bool {
 	case CMD_DATA:
 		return frame.Seq != 0
 	case CMD_SACK:
-		return frame.Seq == 0 && len(frame.Data) >= 2 && len(frame.Data) <= sackPayloadSize && (len(frame.Data)-2)%8 == 0
+		return frame.Seq == 0 && len(frame.Data) >= 2 && len(frame.Data) <= sackWordsWidePayload && (len(frame.Data)-2)%8 == 0
 	case CMD_FEC:
 		// Seq carries the FEC block's base DATA sequence; parity bytes live
 		// in Data and the k/m/index tuple is packed into authenticated Flags.

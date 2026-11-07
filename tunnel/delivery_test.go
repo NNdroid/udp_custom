@@ -105,9 +105,11 @@ func TestDelayedACKSinglePairAndClose(t *testing.T) {
 	})
 }
 
-// TestSnapshotNeverOverrunsBitmap: a wide session may hold far more pending
-// frames than the 512-bit SACK bitmap can describe. snapshot must clamp its
-// scan to the bitmap instead of indexing past it.
+// TestSnapshotNeverOverrunsBitmap: the bitmap horizon is the session's own
+// delivery limit, so admissions up to `limit` above the delivered prefix are
+// described at their exact bit, and anything beyond the limit (a stale map
+// entry, a miscalculated admission) must be skipped instead of indexing past
+// the bitmap.
 func TestSnapshotNeverOverrunsBitmap(t *testing.T) {
 	done := make(chan struct{})
 	defer close(done)
@@ -117,21 +119,29 @@ func TestSnapshotNeverOverrunsBitmap(t *testing.T) {
 		t.Fatalf("empty snapshot ack=%d credit=%d", ack, credit)
 	}
 	d.mu.Lock()
-	d.pending[5] = []byte("head")   // within the bitmap: bit 4
-	d.pending[1000] = []byte("far") // beyond the bitmap: must be ignored, not panic
-	d.pending[2048] = []byte("farther")
+	d.pending[5] = []byte("head")       // bit 4, word 0
+	d.pending[1000] = []byte("far")     // bit 999, word 15
+	d.pending[2048] = []byte("further") // bit 2047, word 31
+	d.pending[5000] = []byte("beyond")  // past the limit: must be skipped, not panic
 	d.mu.Unlock()
 	ack, bitmap, credit = d.snapshot()
-	if bitmap[0] != 1<<4 {
-		t.Fatalf("bitmap[0] = %#x, want %#x", bitmap[0], uint64(1<<4))
+	want := func(bit int) uint64 { return uint64(1) << (bit % 64) }
+	if bitmap[0] != want(4) {
+		t.Fatalf("bitmap[0] = %#x, want %#x", bitmap[0], want(4))
 	}
-	for i := 1; i < len(bitmap); i++ {
-		if bitmap[i] != 0 {
-			t.Fatalf("bitmap[%d] = %#x, want 0 (out-of-range admissions must be skipped)", i, bitmap[i])
+	if bitmap[15] != want(999) {
+		t.Fatalf("bitmap[15] = %#x, want %#x", bitmap[15], want(999))
+	}
+	if bitmap[31] != want(2047) {
+		t.Fatalf("bitmap[31] = %#x, want %#x", bitmap[31], want(2047))
+	}
+	for i, w := range bitmap {
+		if i != 0 && i != 15 && i != 31 && w != 0 {
+			t.Fatalf("bitmap[%d] = %#x, want 0", i, w)
 		}
 	}
-	if credit != deliveryWindowWide-3 {
-		t.Fatalf("credit = %d, want %d", credit, deliveryWindowWide-3)
+	if credit != deliveryWindowWide-4 {
+		t.Fatalf("credit = %d, want %d", credit, deliveryWindowWide-4)
 	}
 }
 

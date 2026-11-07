@@ -417,10 +417,21 @@ func (rf *ReplayFilter) acceptLocked(seq uint64) bool {
 				if step > 64 {
 					step = 64
 				}
-				for i := len(rf.window) - 1; i > 0; i-- {
-					rf.window[i] = (rf.window[i] << step) | (rf.window[i-1] >> (64 - step))
+				if step == 64 {
+					// A full-word slide: <<64 and >>64 are both zero in Go,
+					// so the generic shift below would wipe the whole bitmap
+					// and forget every packet still in flight — their
+					// retransmissions were then re-accepted as new and the
+					// stream misaligned (the weak-net stress corruption).
+					// Slide by whole words instead.
+					copy(rf.window[1:], rf.window[:replayWindowWords-1])
+					rf.window[0] = 0
+				} else {
+					for i := len(rf.window) - 1; i > 0; i-- {
+						rf.window[i] = (rf.window[i] << step) | (rf.window[i-1] >> (64 - step))
+					}
+					rf.window[0] <<= step
 				}
-				rf.window[0] <<= step
 				diff -= step
 			}
 		}
@@ -2214,7 +2225,7 @@ func (sess *ServerSession) sendCumulativeACK(ackSeq uint64) {
 	iv := ackCoalesceInterval(sess.ackSRTT())
 	ack, urgent := ackSeq, false
 	if sess.flow != nil && sess.delivery != nil {
-		var bitmap [8]uint64
+		var bitmap [sackWordsWide]uint64
 		ack, bitmap, _ = sess.delivery.snapshot()
 		// A gap is the one piece of feedback that triggers the client's fast
 		// repair, so it is never worth deferring for coalescing savings.
@@ -2247,7 +2258,7 @@ func (sess *ServerSession) emitFeedback(ackSeq uint64) {
 func (sess *ServerSession) feedbackFrame(ackSeq uint64) *UDPCFrame {
 	if sess.flow != nil && sess.delivery != nil {
 		ack, bitmap, credit := sess.delivery.snapshot()
-		return &UDPCFrame{Magic: sess.server.cfg.Magic, Version: UDPC_VERSION, Cmd: CMD_SACK, SessionID: sess.sessionID, Ack: ack, Data: encodeSACK(credit, bitmap[0], bitmap[1:]...)}
+		return &UDPCFrame{Magic: sess.server.cfg.Magic, Version: UDPC_VERSION, Cmd: CMD_SACK, SessionID: sess.sessionID, Ack: ack, Data: encodeSACKWords(credit, bitmap, sess.sackMaxWords())}
 	}
 	return &UDPCFrame{
 		Magic:      sess.server.cfg.Magic,

@@ -73,9 +73,15 @@ type Config struct {
 	SendSockMax int `json:"sendsock_max"`
 
 	// SendWindow caps the number of DATA frames in flight awaiting an ACK
-	// before the target read loop blocks. 0 adapts up to 512 with negotiated
-	// recovery, or uses the legacy 256-frame window with older peers.
+	// before the target read loop blocks. 0 adapts up to 4096 with negotiated
+	// recovery, or uses the legacy 512-frame window with older peers.
 	SendWindow int `json:"send_window"`
+
+	// MaxSessions (server) soft-caps the live session population. 0/absent =
+	// uncapped. The SYN rate limiter bounds intake RATE only; without this cap
+	// a leaked or stolen PSK can grow the session population until FDs/memory
+	// run out. See tunnel.ServerConfig.MaxSessions.
+	MaxSessions int `json:"max_sessions"`
 
 	// MaxPkt is the largest v2 record (40-byte header + payload + 16-byte
 	// tag) this end puts on the wire, i.e. the UDP payload size. 0 or absent
@@ -122,7 +128,7 @@ type Config struct {
 	// instead of halving it. Absent = enabled on both ends; set false to
 	// restore classic AIMD halving on every loss.
 	Westwood *bool `json:"westwood,omitempty"`
-	// WideWindow negotiates 2048-frame delivery windows (vs the 512-frame
+	// WideWindow negotiates 4096-frame delivery windows (vs the 512-frame
 	// wire baseline) when BOTH ends support it. The window is the BDP
 	// ceiling: 512 frames caps throughput at ~24 Mbps on a 250 ms RTT link.
 	// Absent = enabled; set false to keep the 512-frame baseline always.
@@ -361,6 +367,7 @@ func runFromConfig(path string) {
 		PortRange:      cfg.PortRange,
 		AllowedTargets: cfg.AllowedTargets,
 		ReceiveSockets: cfg.ReceiveSockets,
+		MaxSessions:    cfg.MaxSessions,
 		MaxPkt:         cfg.MaxPkt,
 		MtuProbe:       cfg.MtuProbe,
 		FEC:            cfg.FEC,
@@ -537,18 +544,29 @@ func runGenURI(args []string) {
 		}
 	}
 
-	// Built-in fallbacks for anything still unset.
+	// Built-in fallbacks for anything still unset. Each warns loudly: a
+	// silently substituted placeholder is the same "shared the WRONG node"
+	// failure mode the -c fail-fast above guards, just slower to notice.
 	if *host == "" {
 		*host = "your-server-ip"
+		fmt.Fprintln(os.Stderr, "⚠️  gen-uri: no host given; using the placeholder \"your-server-ip\" — replace it or the shared URI points nowhere.")
 	}
 	if *port == "" {
 		*port = "36712"
+		fmt.Fprintln(os.Stderr, "⚠️  gen-uri: no UDP port given; using the default 36712.")
 	}
 	if *magic == "" {
 		*magic = "UDPC"
 	}
 	if *remark == "" {
 		*remark = "UDP Custom Node"
+	}
+	if *password == "" {
+		// An envelope without a PSK can never complete a handshake — emitting
+		// it would look like success and waste whoever scans the QR code.
+		fmt.Fprintln(os.Stderr, "❌ gen-uri: no PSK available (pass -p, or a config with \"passwords\").")
+		fmt.Fprintln(os.Stderr, "   Refusing to generate a share URI that cannot authenticate.")
+		os.Exit(1)
 	}
 
 	uri := GenerateUDPCustomURI(*host, *port, *password, *magic, *pubKey, *remark, *pin)

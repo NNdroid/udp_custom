@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 
 	qrcode "github.com/skip2/go-qrcode"
@@ -81,14 +82,20 @@ func GenerateUDPCustomURI(host, port, password, magic, pubKey, remark, pin strin
 		return ""
 	}
 
-	// 2. Direct Protocol URI (plaintext, for non-Stun clients)
-	protoURI := fmt.Sprintf("udpc://%s?magic=%s", serverAddr, magic)
+	// 2. Direct Protocol URI (plaintext, for non-Stun clients). The query is
+	// built with url.Values, not string concatenation: a base64 pubkey
+	// contains '+' (which any standards-compliant query decoder turns into a
+	// space, corrupting the key) and a PSK may contain '&', '#' or '%', which
+	// unescaped would truncate or reinterpret the URI on import.
+	q := url.Values{}
+	q.Set("magic", magic)
 	if password != "" {
-		protoURI += "&psk=" + password
+		q.Set("psk", password)
 	}
 	if rawPub != "" {
-		protoURI += "&pubkey=" + rawPub
+		q.Set("pubkey", rawPub)
 	}
+	protoURI := "udpc://" + serverAddr + "?" + q.Encode()
 
 	fmt.Printf("\n[1] Official Stun Sharing Link (stun://, encrypted):\n  %s\n", stunURI)
 	if pin == "" {

@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 
@@ -17,10 +18,24 @@ import (
 func generateSystemd() {
 	execPath, err := os.Executable()
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "⚠️  gen-systemd: could not resolve the executable path (%v); assuming /usr/local/bin/udp_custom — fix ExecStart if the binary lives elsewhere.\n", err)
 		execPath = "/usr/local/bin/udp_custom"
 	}
 
 	execLine := fmt.Sprintf("%s -c /etc/udp_custom/config.json", execPath)
+
+	// GOGC=400 halves GC frequency at high throughput, but a bare GOGC lets the
+	// heap goal ride up to 5x live — on a small VPS that is an OOM waiting for
+	// the first burst. Pair it with a soft GOMEMLIMIT at ~75% of the detected
+	// RAM; when detection fails, say so instead of staying silent.
+	envLines := `# The per-frame wire buffers churn tens of MB/s at high throughput; a larger
+# heap goal cuts GC frequency roughly in half on small VPS boxes.
+Environment="GOGC=400"`
+	if mem := memLimitEnvironment(); mem != "" {
+		envLines += "\n" + mem
+	} else {
+		envLines += "\n# Could not detect total RAM; add e.g. Environment=\"GOMEMLIMIT=700MiB\" on small boxes."
+	}
 
 	serviceContent := fmt.Sprintf(`[Unit]
 Description=UDPCustom Server (SSH over UDP Tunnel)
@@ -34,14 +49,11 @@ ExecStart=%s
 Restart=always
 RestartSec=3
 LimitNOFILE=65535
-# The per-frame wire buffers churn tens of MB/s at high throughput; a larger
-# heap goal cuts GC frequency roughly in half on small VPS boxes. Remove (or
-# set GOMEMLIMIT) if the machine shares memory with other services.
-Environment="GOGC=400"
+%s
 
 [Install]
 WantedBy=multi-user.target
-`, execLine)
+`, execLine, envLines)
 
 	fmt.Println("=== Systemd Service Configuration ===")
 	fmt.Println("Save to: /etc/systemd/system/udp_custom.service")
@@ -61,6 +73,36 @@ WantedBy=multi-user.target
 	fmt.Println("  sudo systemctl daemon-reload")
 	fmt.Println("  sudo systemctl enable --now udp_custom")
 	fmt.Println("  sudo systemctl status udp_custom")
+}
+
+// memLimitEnvironment reads the host's total RAM (Linux: /proc/meminfo) and
+// renders a GOMEMLIMIT soft limit at 75% of it, so the GOGC=400 heap goal
+// cannot outrun the box. Empty on non-Linux or unreadable /proc/meminfo — the
+// caller falls back to a comment.
+func memLimitEnvironment() string {
+	if runtime.GOOS != "linux" {
+		return ""
+	}
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if !strings.HasPrefix(line, "MemTotal:") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			return ""
+		}
+		kb, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil || kb == 0 {
+			return ""
+		}
+		limit := kb * 1024 / 4 * 3 // 75% of total RAM, in bytes
+		return fmt.Sprintf("Environment=\"GOMEMLIMIT=%dB\"", limit)
+	}
+	return ""
 }
 
 // dnatDportsArg splits range tokens into chunks of at most 15 entries, which is
@@ -217,9 +259,12 @@ func runGenIptables(args []string) {
 		os.Exit(1)
 	}
 	if pr == nil {
-		// Legacy full-range behaviour when nothing explicit is given.
-		generateIptables(port, nil)
-		return
+		// No legacy full-range fallback: a bare REDIRECT of UDP 1000-65535
+		// swallows DNS, WireGuard, QUIC and every other UDP service on the
+		// box, and printing it without confirmation was the most dangerous
+		// silent path 91b4197 left behind. gen-nftables refuses the same way.
+		fmt.Fprintln(os.Stderr, "No port range provided (use --range or set 'port_range' in config).")
+		os.Exit(1)
 	}
 	generateIptables(port, pr)
 }

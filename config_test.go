@@ -46,16 +46,19 @@ func TestUDPCustom_JSONConfigParsing(t *testing.T) {
 	}
 }
 
-// The shipped config.client.json template must actually boot the client (it
-// used to be silently ignored, which started a SERVER on the client's port).
+// The shipped config.client.example.json template must actually boot the
+// client (the mode field was once silently ignored, which started a SERVER on
+// the client's port). The template is named *.example.json since f5b0a4a; this
+// test kept reading the old name and regressed to a permanent Skip — load the
+// shipped file directly and fail hard when it is missing.
 func TestClientConfigTemplateBootsClient(t *testing.T) {
-	data, err := os.ReadFile("config.client.json")
+	data, err := os.ReadFile("config.client.example.json")
 	if err != nil {
-		t.Skipf("config.client.json not available: %v", err)
+		t.Fatalf("config.client.example.json must ship with the repository: %v", err)
 	}
 	var cfg Config
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		t.Fatalf("parse config.client.json: %v", err)
+		t.Fatalf("parse config.client.example.json: %v", err)
 	}
 	if cfg.Mode != "client" {
 		t.Fatalf("template mode = %q, want client", cfg.Mode)

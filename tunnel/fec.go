@@ -14,8 +14,17 @@ const (
 	fecDataShardsMax    = 8
 	fecParityShardsMax  = 4
 	fecLengthPrefixSize = 2
-	fecFlushDelay       = 15 * time.Millisecond
-	fecRecentDataLimit  = 64
+	fecFlushDelay = 15 * time.Millisecond
+	// fecRecentDataLimit is how far back the receiver's recent-survivor map
+	// reaches, in sequence numbers. Reconstruction needs the RECEIVED shards
+	// of a block to still be retained when its parity (or its last survivor)
+	// finally arrives; on a full 4096-frame window that arrival trails the
+	// receive edge by far more than 64 seqs, so the old 64-entry map evicted
+	// exactly the shards every rebuild depended on and FEC degraded to pure
+	// ARQ while parity bandwidth was still being paid. One full pending-block
+	// span (fecMaxPendingBlocks × fecDataShardsMax) is the widest span
+	// tryRecoverLocked can still act on.
+	fecRecentDataLimit = fecMaxPendingBlocks * fecDataShardsMax
 	// fecRecentDataHardLimit is the absolute cap on fecReceiver.recent entries.
 	// The ordinary prune trigger is keyed on `highest` advancing, so a peer that
 	// floods Seqs below the delivery window with fresh packet numbers (the
@@ -508,7 +517,10 @@ func (s *fecSender) emitBlock(block []fecSourceShard) {
 
 	// Reserve nothing yet: everything that can fail without emitting runs
 	// first, so s.blocks only counts blocks that actually produced parity and
-	// the session-to-session loss memo never sees phantom samples.
+	// the session-to-session loss memo never sees phantom samples. The
+	// parity-shard computation therefore happens BEFORE the counter, and a
+	// block with no parity capacity (a single record) returns uncounted —
+	// counting it diluted the fecMemoMinBlocks sample with no-parity blocks.
 	maxPayload := 0
 	for _, src := range block {
 		if len(src.payload) > maxPayload {
@@ -520,6 +532,9 @@ func (s *fecSender) emitBlock(block []fecSourceShard) {
 		return
 	}
 
+	parityShards := fecParityForLossExt(s.adaptive.loss(), s.extParity)
+	dataShards := len(block)
+
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -527,16 +542,12 @@ func (s *fecSender) emitBlock(block []fecSourceShard) {
 	}
 	s.blocks++
 	blockNo := s.blocks
-	s.mu.Unlock()
-
-	parityShards := fecParityForLossExt(s.adaptive.loss(), s.extParity)
 	// Bootstrap with one parity shard for a few blocks so a new path can
 	// measure recoverable loss before its first ARQ timeout. Clean paths then
 	// naturally fall to zero parity.
 	if blockNo <= fecBootstrapBlocks && parityShards < 1 {
 		parityShards = 1
 	}
-	dataShards := len(block)
 	// More parity than dataShards-1 recovers nothing extra: with k data and m
 	// parity the block needs k survivors out of k+m, so beyond k-1 every extra
 	// parity datagram is pure waste. The timer flush made this common — a
@@ -548,8 +559,18 @@ func (s *fecSender) emitBlock(block []fecSourceShard) {
 		parityShards = dataShards - 1
 	}
 	if parityShards <= 0 {
+		// A block with no parity capacity (a single record, or zero loss past
+		// the bootstrap window) emits nothing: un-count it, so s.blocks really
+		// holds "blocks that produced parity" and the session-to-session loss
+		// memo's fecMemoMinBlocks threshold is never diluted with no-parity
+		// samples. The reservation is rolled back under the same lock hold.
+		if s.blocks == blockNo {
+			s.blocks--
+		}
+		s.mu.Unlock()
 		return
 	}
+	s.mu.Unlock()
 	maxParity := fecParityShardsMax
 	if s.extParity {
 		maxParity = fecParityShardsExtMax
@@ -583,6 +604,13 @@ func (s *fecSender) emitBlock(block []fecSourceShard) {
 	}
 	s.encodeMu.Unlock()
 	if err != nil {
+		// Compensate the reservation: s.blocks counts only blocks that
+		// actually produced parity (see the comment above).
+		s.mu.Lock()
+		if s.blocks == blockNo {
+			s.blocks--
+		}
+		s.mu.Unlock()
 		return
 	}
 

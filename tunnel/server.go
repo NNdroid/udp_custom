@@ -356,14 +356,27 @@ func (s *Server) logError(format string, v ...interface{}) {
 // of yielding a negative buffer size.
 func (s *Server) maxPayload() int { return effectivePayloadCap(s.maxPkt) }
 
+// replayControlMargin is headroom above the delivery window for records that
+// share the PacketNo space but not the delivery window: SACK/ACK feedback,
+// PING/PONG, FEC parity and MTU probes each advance the replay filter's edge.
+// The admission window bounds only unacked DATA, so an exact-window filter
+// leaves zero room for them: once a window-filling stream lost its oldest
+// outstanding frame, every later control record pushed that frame further
+// behind the edge, and its retransmissions were then silently rejected as
+// replays until the retry budget tore the session down (the residual cause
+// behind the symptom 9fc9cd3 described). 1024 comfortably covers the gated
+// credit-probe rate (~40/s) over a stuck head frame's full 15-retry RTO ladder.
+const replayControlMargin = 1024
+
 // replayWindowPackets is the per-direction packet-number replay window. It must
-// stay >= the widest delivery window (deliveryWindowWide): a frame admitted far
-// ahead of the cumulative Ack must not fall behind the replay filter's edge
-// before delivery gets to it, or it is misread as a replay and the stream
-// stalls. Widened in lockstep with deliveryWindowWide; the bitmap costs
-// replayWindowPackets/8 bytes per direction per session.
+// stay >= the widest delivery window (deliveryWindowWide) PLUS the control
+// margin above: a frame admitted far ahead of the cumulative Ack must not fall
+// behind the replay filter's edge before delivery gets to it, or it is misread
+// as a replay and the stream stalls. Widened in lockstep with
+// deliveryWindowWide; the bitmap costs replayWindowPackets/8 bytes per
+// direction per session.
 const (
-	replayWindowPackets = 4096
+	replayWindowPackets = deliveryWindowWide + replayControlMargin
 	replayWindowWords   = replayWindowPackets / 64
 )
 
@@ -489,6 +502,11 @@ type unackedPkt struct {
 	sacked    bool
 	queued    bool
 	retries   int
+	// fastRepaired marks a frame whose most recent send was a SACK fast
+	// repair rather than an RTO retransmission. undoIfSpurious only trusts
+	// the ACK-inside-SRTT evidence of the latter — a redundant fast repair
+	// proves nothing about an earlier window cut (see recovery.go).
+	fastRepaired bool
 }
 
 type ServerSession struct {
@@ -503,6 +521,10 @@ type ServerSession struct {
 	// handshake torn down before registration (server closing, SID collision)
 	// never reaps another session's map entry or skews the counter.
 	registered atomic.Bool
+
+	// finReceived records a client-initiated FIN so Close does not answer one
+	// with a redundant FIN of its own.
+	finReceived atomic.Bool
 
 	server        *Server
 	sessionID     uint32
@@ -758,12 +780,17 @@ func newServer(cfg ServerConfig, dial TargetDialer, injected *net.UDPConn) (*Ser
 	bindIP := net.IPv4zero
 	bindPort := 0
 	if cfg.ListenAddr != "" {
-		if la, err := net.ResolveUDPAddr("udp", cfg.ListenAddr); err == nil {
-			if la.IP != nil {
-				bindIP = la.IP
-			}
-			bindPort = la.Port
+		la, err := net.ResolveUDPAddr("udp", cfg.ListenAddr)
+		if err != nil {
+			// Fail fast: silently falling through used to bind 0.0.0.0:0 — an
+			// ephemeral port on every interface — while the operator's firewall
+			// DNAT kept pointing at a port nothing listens on.
+			return nil, fmt.Errorf("server: invalid listen address %q: %w", cfg.ListenAddr, err)
 		}
+		if la.IP != nil {
+			bindIP = la.IP
+		}
+		bindPort = la.Port
 	}
 	if bindPort == 0 {
 		logger.Warnf("'listen' port is 0 (got %q): the OS will assign an ephemeral port. For a DNAT target use a fixed port so the firewall rule is stable.", cfg.ListenAddr)
@@ -1532,7 +1559,7 @@ func (s *Server) replyFromOrigPort(origPort int, addr netip.AddrPort, data []byt
 	// port. Skipping the per-port pool avoids a pointless bind(36712) that
 	// always fails with EADDRINUSE and only produces misleading warnings.
 	if origPort > 0 && origPort != s.bindPort {
-		c, err := s.sockPool.Get(origPort)
+		c, err := s.sockPool.Get(origPort, addr)
 		if err == nil {
 			if n, werr := c.WriteToUDPAddrPort(data, addr); werr == nil {
 				s.sendViaPort.Add(1)
@@ -1764,6 +1791,7 @@ func (sess *ServerSession) handleIncomingFrame(frame *UDPCFrame, remoteAddr neti
 		}
 	case CMD_FIN:
 		sess.server.logInfo("[Session 0x%08X] 👋 Received FIN from client", sess.sessionID)
+		sess.finReceived.Store(true)
 		sess.Close()
 	case CMD_MTU_PROBE:
 		// Echo the probe byte for byte: the payload LENGTH is the size under
@@ -1954,13 +1982,15 @@ func (sess *ServerSession) applyFECFeedback(f *UDPCFrame) {
 }
 
 // dispatchWire hands an encoded record to the batch transmitter when one is
-// running, or straight to the session socket otherwise.
+// running, or straight to the session socket otherwise. A full queue falls
+// back to the session socket rather than dropping: callers include repair
+// frames whose retry budget was already consumed and DATA handoffs that must
+// not vanish.
 func (sess *ServerSession) dispatchWire(wire []byte) {
-	if sess.tx != nil {
-		sess.tx.bestEffort(wire)
-	} else {
-		sess.sendToSession(wire)
+	if sess.tx != nil && sess.tx.bestEffort(wire) {
+		return
 	}
+	sess.sendToSession(wire)
 }
 
 func (sess *ServerSession) sendFECParity(p fecParityShard) {
@@ -2573,12 +2603,34 @@ func (sess *ServerSession) retransmitLoop() {
 		if delay < time.Millisecond {
 			delay = time.Millisecond
 		}
+		// Drain a stale value before Reset: the select above may have woken via
+		// retryWake while the timer had already fired and left a token in its
+		// channel — without the drain the next iteration would consume it as a
+		// spurious immediate wake. Mirrors the client-side loop.
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
 		timer.Reset(delay)
 	}
 }
 
 func (sess *ServerSession) Close() {
 	sess.closeOnce.Do(func() {
+		// Best-effort FIN before any teardown. Every server-side close path
+		// lands here — backend EOF or write failure, the idle reaper, retry
+		// exhaustion, Server.Close — and without this the client only learned
+		// of the death via its 210s recv timeout (or its own RTO ladder),
+		// leaving Done() untriggered and AutoReconnect idle the whole time.
+		// A client-initiated FIN is not answered with another one.
+		if !sess.finReceived.Load() && sess.frameKeys != nil {
+			sess.sendControl(&UDPCFrame{
+				Magic: sess.server.cfg.Magic, Version: UDPC_VERSION,
+				Cmd: CMD_FIN, SessionID: sess.sessionID, Ack: sess.currentAck(),
+			}, func(data []byte) error { sess.sendToSession(data); return nil })
+		}
 		atomic.StoreInt32(&sess.closed, 1)
 		wasRegistered := sess.registered.CompareAndSwap(true, false)
 		if wasRegistered {
@@ -2733,7 +2785,11 @@ func newSynCache() *synCache {
 // exactly one handshake goroutine. A nil ACK with owner=false means another
 // goroutine currently owns the same in-progress handshake — or that the
 // completed record belongs to a different source IP (see synRecord.ownerIP),
-// in which case the caller answers nothing.
+// in which case the caller answers nothing. PSK identity stays part of the
+// key on purpose: two authorized PSKs that reuse a nonce must not be able to
+// adopt or block each other's handshakes, so the CLIENT keeps one PSK per
+// handshake (rotation happens across handshakes, see client.go) and its
+// retransmissions hit this cache under the SAME key.
 func (c *synCache) Acquire(key synCacheKey, now time.Time, from netip.AddrPort) (ack []byte, owner bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

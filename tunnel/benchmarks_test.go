@@ -193,12 +193,12 @@ func BenchmarkSendSockPoolGetHit(b *testing.B) {
 	probe.Close()
 
 	pool := newSendSockPool(512, nil)
-	if _, err := pool.Get(port); err != nil {
+	if _, err := pool.Get(port, v4TestDest); err != nil {
 		b.Fatalf("prime pool: %v", err)
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := pool.Get(port); err != nil {
+		if _, err := pool.Get(port, v4TestDest); err != nil {
 			b.Fatal(err)
 		}
 	}

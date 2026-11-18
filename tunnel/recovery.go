@@ -368,10 +368,16 @@ func (f *sendFlow) undoLoss() bool {
 // packet's most recent send, so it cannot be that send's answer. An earlier copy
 // of the same frame got through, which means the timeout was jitter.
 //
+// Only RTO retransmissions qualify. A SACK fast repair also stamps
+// retries>0/sentTime (updateSACK), but its evidence proves only that the repair
+// itself was redundant (the original arrived) — nothing about whether some
+// earlier RTO cut was spurious. Treating fast-repair frames as undo evidence
+// systematically retracted real congestion cuts.
+//
 // Returns true only if it actually reverted a halving, so a caller undoing at
 // most one event per ACK can stop looking.
 func (f *sendFlow) undoIfSpurious(p *unackedPkt, srtt time.Duration) bool {
-	if p == nil || p.retries == 0 || srtt <= 0 {
+	if p == nil || p.retries == 0 || p.fastRepaired || srtt <= 0 {
 		return false
 	}
 	if time.Since(p.sentTime) >= srtt {
@@ -526,6 +532,7 @@ func updateSACK(flow *sendFlow, outstanding map[uint64]*unackedPkt, f *UDPCFrame
 	for _, d := range due {
 		p := outstanding[d.seq]
 		p.retries++
+		p.fastRepaired = true
 		p.sentTime = now
 		// Advance the same backoff ladder retryDue does. This does not change
 		// the fast-repair guard itself: it keeps the RTO path from stacking
@@ -570,7 +577,11 @@ const retryBurstMax = 64
 // do up to four scans plus four lock round trips per wake (retryDue,
 // nextRetryDelay, and two nested creditProbeInterval passes), mostly
 // re-reading a map nothing had changed in. It also returns whether a credit
-// probe is due, so the loop never re-locks to discover that.
+// probe is due, so the loop never re-locks to discover that. "Due" is gated by
+// the probe interval itself: creditProbeInterval only nominates, and a probe
+// whose interval has not elapsed is folded into the wake deadline instead of
+// being sent — without that gate every wake emitted a PING at wake frequency
+// (hundreds per second on a busy session), each burning a packet number.
 func retryDue(outstanding map[uint64]*unackedPkt, now time.Time, maximumRTO time.Duration, flow *sendFlow, rtt time.Duration) ([][]byte, bool, time.Duration, bool) {
 	// Most wakeups only register a fresh transmission or feedback. Do not
 	// allocate a sorting buffer until a packet actually needs repair.
@@ -594,10 +605,18 @@ func retryDue(outstanding map[uint64]*unackedPkt, now time.Time, maximumRTO time
 	}
 	interval, probe := creditProbeInterval(flow, outstanding)
 	if probe {
-		if d := interval - now.Sub(flow.lastProbe); d < next {
-			next = d
+		elapsed := now.Sub(flow.lastProbe)
+		if elapsed < interval {
+			// Not due yet: wake again when it is, but do not send. Refreshing
+			// lastProbe here would push the next probe a full interval away on
+			// every wake, so the stamp happens only when the probe fires.
+			if d := interval - elapsed; d < next {
+				next = d
+			}
+			probe = false
+		} else {
+			flow.lastProbe = now
 		}
-		flow.lastProbe = now
 	}
 	sort.Slice(due, func(i, j int) bool { return due[i].seq < due[j].seq })
 	if len(due) > retryBurstMax {
@@ -607,6 +626,11 @@ func retryDue(outstanding map[uint64]*unackedPkt, now time.Time, maximumRTO time
 	for _, d := range due {
 		p := outstanding[d.seq]
 		p.retries++
+		// This is now an RTO retransmission, so its ACK-inside-SRTT evidence is
+		// again eligible for undoIfSpurious: a fast repair stamped
+		// fastRepaired to keep the same evidence from retracting unrelated
+		// cuts, and the RTO path revokes that stamp.
+		p.fastRepaired = false
 		p.sentTime = now
 		p.rto = min(p.rto*3/2, maximumRTO)
 		if p.rto < next { // this frame's own backed-off deadline

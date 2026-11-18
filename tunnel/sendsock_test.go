@@ -2,10 +2,16 @@ package tunnel
 
 import (
 	"net"
+	"net/netip"
 	"sync"
 	"testing"
 	"time"
 )
+
+// v4TestDest is the destination every Get call in this file answers to: the
+// pool keys sockets by port AND address family, and these tests exercise the
+// udp4 half (loopback IPv4).
+var v4TestDest = netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), 9)
 
 // freeUDPPorts reserves n ephemeral UDP ports, releases them, and returns the
 // numbers. They are very likely still free for the duration of the test, and
@@ -43,7 +49,7 @@ func freeUDPPorts(t *testing.T, n int) []int {
 // report a pool bug for environmental port theft.
 func requireBindablePort(t *testing.T, p *sendSockPool, port int) bool {
 	t.Helper()
-	c, err := p.Get(port)
+	c, err := p.Get(port, v4TestDest)
 	if err != nil {
 		return false
 	}
@@ -59,7 +65,7 @@ func TestSendSockPool_BindsRequestedSourcePort(t *testing.T) {
 	p := newSendSockPool(8, nil)
 	defer p.Close()
 
-	c, err := p.Get(ports[0])
+	c, err := p.Get(ports[0], v4TestDest)
 	if err != nil {
 		t.Fatalf("Get(%d): %v", ports[0], err)
 	}
@@ -68,7 +74,7 @@ func TestSendSockPool_BindsRequestedSourcePort(t *testing.T) {
 	}
 
 	// Second request must be served from the cache (same *net.UDPConn).
-	c2, err := p.Get(ports[0])
+	c2, err := p.Get(ports[0], v4TestDest)
 	if err != nil {
 		t.Fatalf("Get(%d) again: %v", ports[0], err)
 	}
@@ -81,7 +87,7 @@ func TestSendSockPool_RejectsInvalidPorts(t *testing.T) {
 	p := newSendSockPool(4, nil)
 	defer p.Close()
 	for _, bad := range []int{0, -1, 65536, 70000} {
-		if _, err := p.Get(bad); err == nil {
+		if _, err := p.Get(bad, v4TestDest); err == nil {
 			t.Errorf("Get(%d) succeeded, want error", bad)
 		}
 	}
@@ -92,20 +98,20 @@ func TestSendSockPool_LRUEvictsLeastRecentlyUsed(t *testing.T) {
 	p := newSendSockPool(2, nil) // deliberately smaller than the 3 ports
 	defer p.Close()
 
-	first, err := p.Get(ports[0])
+	first, err := p.Get(ports[0], v4TestDest)
 	if err != nil {
 		t.Fatalf("Get(%d): %v", ports[0], err)
 	}
-	if _, err := p.Get(ports[1]); err != nil {
+	if _, err := p.Get(ports[1], v4TestDest); err != nil {
 		t.Fatalf("Get(%d): %v", ports[1], err)
 	}
 
 	// Touch ports[0] so ports[1] becomes the eviction candidate.
-	if _, err := p.Get(ports[0]); err != nil {
+	if _, err := p.Get(ports[0], v4TestDest); err != nil {
 		t.Fatalf("Get(%d) refresh: %v", ports[0], err)
 	}
 
-	if _, err := p.Get(ports[2]); err != nil {
+	if _, err := p.Get(ports[2], v4TestDest); err != nil {
 		t.Fatalf("Get(%d): %v", ports[2], err)
 	}
 	if p.Len() != 2 {
@@ -113,7 +119,7 @@ func TestSendSockPool_LRUEvictsLeastRecentlyUsed(t *testing.T) {
 	}
 
 	// ports[0] survived (it was used most recently)...
-	again, err := p.Get(ports[0])
+	again, err := p.Get(ports[0], v4TestDest)
 	if err != nil {
 		t.Fatalf("Get(%d) after eviction: %v", ports[0], err)
 	}
@@ -122,7 +128,7 @@ func TestSendSockPool_LRUEvictsLeastRecentlyUsed(t *testing.T) {
 	}
 
 	// ...and ports[1] was evicted, so it now gets a brand new socket.
-	if _, err := p.Get(ports[1]); err != nil {
+	if _, err := p.Get(ports[1], v4TestDest); err != nil {
 		t.Fatalf("Get(%d) after eviction: %v", ports[1], err)
 	}
 }
@@ -141,7 +147,7 @@ func TestSendSockPool_DefaultLimitAndConcurrentGet(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < 50; i++ {
-				if _, err := p.Get(ports[i%len(ports)]); err != nil {
+				if _, err := p.Get(ports[i%len(ports)], v4TestDest); err != nil {
 					t.Errorf("concurrent Get: %v", err)
 					return
 				}
@@ -158,7 +164,7 @@ func TestSendSockPool_CloseReleasesEverything(t *testing.T) {
 	ports := freeUDPPorts(t, 2)
 	p := newSendSockPool(4, nil)
 	for _, pt := range ports {
-		if _, err := p.Get(pt); err != nil {
+		if _, err := p.Get(pt, v4TestDest); err != nil {
 			t.Fatalf("Get(%d): %v", pt, err)
 		}
 	}
@@ -395,11 +401,11 @@ func TestMultipathSession_RoutesReplyPerPath(t *testing.T) {
 // port IS still bindable is a real bug and fails the test instead.
 func getOrSkip(t *testing.T, p *sendSockPool, port int) *pooledConn {
 	t.Helper()
-	pc, err := p.Get(port)
+	pc, err := p.Get(port, v4TestDest)
 	if err == nil {
 		return pc
 	}
-	if probe, perr := p.Get(port); perr == nil && probe.LocalAddr().(*net.UDPAddr).Port == port {
+	if probe, perr := p.Get(port, v4TestDest); perr == nil && probe.LocalAddr().(*net.UDPAddr).Port == port {
 		t.Fatalf("Get(%d): %v (port is bindable, so this is a real bug)", port, err)
 	}
 	t.Skipf("reserved port %d was stolen by the OS before the pool could bind it", port)

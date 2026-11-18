@@ -43,11 +43,19 @@ func (t *transmitQueue) submit(wire []byte) bool {
 	}
 }
 
-func (t *transmitQueue) bestEffort(wire []byte) {
+// bestEffort enqueues wire without blocking. It reports whether the frame was
+// actually accepted: a caller that already consumed retry budget or carries
+// repair/DATA handoff traffic must fall back to a direct send when this
+// returns false — a full queue silently eating the frame turns the burned
+// accounting into a guaranteed 1.5x-backoff RTO wait.
+func (t *transmitQueue) bestEffort(wire []byte) bool {
 	select {
 	case <-t.done:
+		return true
 	case t.queue <- wire:
+		return true
 	default:
+		return false
 	}
 }
 

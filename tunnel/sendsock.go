@@ -57,9 +57,14 @@ import (
 type sendSockPool struct {
 	limit int
 
-	// conns maps port -> *pooledConn. Chosen over a mutex-guarded map so the
-	// per-datagram cache-hit path takes no lock at all (P0-1); writes to it
-	// are rare (a port seen for the first time) and reconciled by LoadOrStore.
+	// conns maps sockKey -> *pooledConn. Chosen over a mutex-guarded map so
+	// the per-datagram cache-hit path takes no lock at all (P0-1); writes to
+	// it are rare (a port+family seen for the first time) and reconciled by
+	// LoadOrStore. The family half of the key exists because the sockets are
+	// bound explicitly per address family (udp4/udp6): a wildcard bind is
+	// dual-stack only where the OS supports v4-mapped addresses (Linux, macOS)
+	// and IPv4-only on Windows, where every IPv6 reply then failed permanently
+	// and triggered a bind+close repair churn per datagram.
 	conns sync.Map
 
 	total   atomic.Int32 // number of entries currently in conns
@@ -68,6 +73,13 @@ type sendSockPool struct {
 	bindMu  sync.Mutex   // serializes bind/publish/repair on the cold path only; never held on healthy hits
 	closed  atomic.Bool
 	logf    func(format string, v ...interface{})
+}
+
+// sockKey identifies one cached socket: the mirrored source port and the
+// address family its bind must serve.
+type sockKey struct {
+	port int
+	v6   bool
 }
 
 // DefaultSendSockMax bounds the reply-socket LRU when sendsock_max is unset.
@@ -85,6 +97,7 @@ type pooledConn struct {
 	pool *sendSockPool
 	conn *net.UDPConn
 	port int
+	v6   bool // bound udp6 (IPv6 destinations); udp4 otherwise
 
 	refs    atomic.Int32 // >0 while a WriteToUDPAddrPort through this socket is in flight
 	lastUse atomic.Int64 // pool clock stamp of the most recent Get; eviction reclaims the oldest
@@ -132,15 +145,17 @@ func newSendSockPool(limit int, logf func(format string, v ...interface{})) *sen
 // between two Gets, and equal stamps would make the LRU victim ambiguous.
 func (p *sendSockPool) nextStamp() int64 { return p.clock.Add(1) }
 
-// Get returns the pooled socket bound to the given local port, creating it on
-// demand. It never returns a nil conn together with a nil error.
-func (p *sendSockPool) Get(port int) (*pooledConn, error) {
+// Get returns the pooled socket bound to the given local port for the
+// destination's address family, creating it on demand. It never returns a nil
+// conn together with a nil error.
+func (p *sendSockPool) Get(port int, addr netip.AddrPort) (*pooledConn, error) {
 	if port <= 0 || port > 65535 {
 		return nil, fmt.Errorf("invalid source port %d", port)
 	}
 	if p.closed.Load() {
 		return nil, fmt.Errorf("send socket pool is closed")
 	}
+	v6 := isV6Destination(addr)
 
 	// Fast path: cache hit. Lock-free on purpose (P0-1): one sync.Map load,
 	// one atomic store for the recency stamp. No mutex is touched.
@@ -152,17 +167,17 @@ func (p *sendSockPool) Get(port int) (*pooledConn, error) {
 	// fails and the caller's repair path (repairAndRetry / Reopen) re-binds
 	// the socket; callers that write WITHOUT that repair path must pin
 	// explicitly (session_transport adds its own ref).
-	if v, ok := p.conns.Load(port); ok {
+	if v, ok := p.conns.Load(sockKey{port, v6}); ok {
 		pc := v.(*pooledConn)
 		pc.lastUse.Store(p.nextStamp())
 		return pc, nil
 	}
 
-	// Slow path: this port is seen for the first time (or was evicted). The
-	// bind+publish pair runs under bindMu so two racers for the SAME port can
-	// never both bind.
+	// Slow path: this port+family is seen for the first time (or was evicted).
+	// The bind+publish pair runs under bindMu so two racers for the SAME key
+	// can never both bind.
 	p.bindMu.Lock()
-	if v, ok := p.conns.Load(port); ok { // racer published while we waited
+	if v, ok := p.conns.Load(sockKey{port, v6}); ok { // racer published while we waited
 		p.bindMu.Unlock()
 		pc := v.(*pooledConn)
 		pc.lastUse.Store(p.nextStamp())
@@ -172,19 +187,13 @@ func (p *sendSockPool) Get(port int) (*pooledConn, error) {
 		p.bindMu.Unlock()
 		return nil, fmt.Errorf("send socket pool is closed")
 	}
-	uc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: port})
+	pc, err := p.bindLocked(port, v6)
 	if err != nil {
 		p.bindMu.Unlock()
-		if p.logf != nil {
-			p.logf("[SockPool] ❌ bind port=%d failed: %v", port, err)
-		}
 		return nil, err
 	}
-	_ = uc.SetWriteBuffer(socketBufferSize)
-
-	pc := &pooledConn{pool: p, conn: uc, port: port}
 	pc.lastUse.Store(p.nextStamp())
-	p.conns.Store(port, pc)
+	p.conns.Store(sockKey{port, v6}, pc)
 	p.bindMu.Unlock()
 
 	n := p.total.Add(1)
@@ -202,9 +211,37 @@ func (p *sendSockPool) Get(port int) (*pooledConn, error) {
 	return pc, nil
 }
 
+// bindLocked creates the UDP socket for one port+family. Callers hold bindMu.
+func (p *sendSockPool) bindLocked(port int, v6 bool) (*pooledConn, error) {
+	var uc *net.UDPConn
+	var err error
+	if v6 {
+		uc, err = net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6unspecified, Port: port})
+	} else {
+		uc, err = net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: port})
+	}
+	if err != nil {
+		if p.logf != nil {
+			p.logf("[SockPool] ❌ bind port=%d v6=%v failed: %v", port, v6, err)
+		}
+		return nil, err
+	}
+	_ = uc.SetWriteBuffer(socketBufferSize)
+	return &pooledConn{pool: p, conn: uc, port: port, v6: v6}, nil
+}
+
+// isV6Destination reports whether replies to addr need a udp6 socket. IPv4
+// addresses embedded in IPv6 (Is4In6) are answered from the v4 pool, matching
+// how the kernel routes them.
+func isV6Destination(addr netip.AddrPort) bool {
+	a := addr.Addr()
+	return a.IsValid() && a.Is6() && !a.Is4In6()
+}
+
 // repairAndRetry replaces a permanently failed cached socket and retries one
-// datagram. bindMu coalesces concurrent repair attempts for the same port. If
-// another goroutine already published a replacement, use that socket instead.
+// datagram. bindMu coalesces concurrent repair attempts for the same
+// port+family. If another goroutine already published a replacement, use that
+// socket instead.
 func (p *sendSockPool) repairAndRetry(broken *pooledConn, b []byte, addr netip.AddrPort, cause error) (int, error) {
 	if broken == nil || broken.port <= 0 {
 		return 0, cause
@@ -212,20 +249,21 @@ func (p *sendSockPool) repairAndRetry(broken *pooledConn, b []byte, addr netip.A
 	if p.closed.Load() {
 		return 0, cause
 	}
+	key := sockKey{broken.port, broken.v6}
 
 	p.bindMu.Lock()
 	if p.closed.Load() {
 		p.bindMu.Unlock()
 		return 0, cause
 	}
-	if v, ok := p.conns.Load(broken.port); ok && v != any(broken) {
+	if v, ok := p.conns.Load(key); ok && v != any(broken) {
 		replacement := v.(*pooledConn)
 		replacement.lastUse.Store(p.nextStamp())
 		p.bindMu.Unlock()
 		return replacement.WriteToUDPAddrPort(b, addr)
 	}
 
-	if actual, loaded := p.conns.LoadAndDelete(broken.port); loaded && actual == any(broken) {
+	if actual, loaded := p.conns.LoadAndDelete(key); loaded && actual == any(broken) {
 		p.total.Add(-1)
 	}
 	// A permanent write failure means this descriptor is no longer useful.
@@ -233,7 +271,7 @@ func (p *sendSockPool) repairAndRetry(broken *pooledConn, b []byte, addr netip.A
 	// the single replacement published below.
 	_ = broken.conn.Close()
 
-	uc, bindErr := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: broken.port})
+	replacement, bindErr := p.bindLocked(broken.port, broken.v6)
 	if bindErr != nil {
 		p.bindMu.Unlock()
 		if p.logf != nil {
@@ -241,10 +279,8 @@ func (p *sendSockPool) repairAndRetry(broken *pooledConn, b []byte, addr netip.A
 		}
 		return 0, fmt.Errorf("reply socket write failed: %w; rebind port %d failed: %v", cause, broken.port, bindErr)
 	}
-	_ = uc.SetWriteBuffer(socketBufferSize)
-	replacement := &pooledConn{pool: p, conn: uc, port: broken.port}
 	replacement.lastUse.Store(p.nextStamp())
-	p.conns.Store(broken.port, replacement)
+	p.conns.Store(key, replacement)
 	ncached := p.total.Add(1)
 	p.bindMu.Unlock()
 
@@ -274,14 +310,14 @@ func (p *sendSockPool) reclaimOverflow() {
 
 	for p.total.Load() > int32(p.limit) {
 		type cand struct {
-			port int
-			pc   *pooledConn
+			key sockKey
+			pc  *pooledConn
 		}
 		cands := make([]cand, 0, 8)
 		p.conns.Range(func(key, value any) bool {
 			pc := value.(*pooledConn)
 			if pc.refs.Load() == 0 {
-				cands = append(cands, cand{port: key.(int), pc: pc})
+				cands = append(cands, cand{key: key.(sockKey), pc: pc})
 			}
 			return true
 		})
@@ -297,13 +333,13 @@ func (p *sendSockPool) reclaimOverflow() {
 			victim.pc.lastUse.Store(p.nextStamp())
 			return
 		}
-		if actual, loaded := p.conns.LoadAndDelete(victim.port); !loaded || actual != any(victim.pc) {
+		if actual, loaded := p.conns.LoadAndDelete(victim.key); !loaded || actual != any(victim.pc) {
 			return
 		}
 		p.total.Add(-1)
 		_ = victim.pc.conn.Close()
 		if p.logf != nil {
-			p.logf("[SockPool] 🗑️ evict port=%d (cached=%d/limit=%d)", victim.port, p.total.Load(), p.limit)
+			p.logf("[SockPool] 🗑️ evict port=%d v6=%v (cached=%d/limit=%d)", victim.key.port, victim.key.v6, p.total.Load(), p.limit)
 		}
 	}
 }

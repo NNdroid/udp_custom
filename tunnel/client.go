@@ -186,6 +186,13 @@ type Client struct {
 	ackMu       sync.Mutex
 	pendingAcks map[[clientNonceSize]byte]*pendingHandshake
 
+	// pskCursor rotates the starting PSK across handshake establishments
+	// (each establishment picks passwords[pskCursor++ % len] and keeps it for
+	// ALL of its SYN retries — the server's synCache keys handshakes on the
+	// PSK-derived SYN MAC, so rotating mid-handshake would turn every retry
+	// into a new session and a second target dial).
+	pskCursor atomic.Uint32
+
 	// probeCache memoizes the MTU probe result for the server's path, so only
 	// the first session (or the first after the TTL) pays for the ladder walk.
 	probeCache *mtuProbeCache
@@ -666,6 +673,12 @@ func (c *Client) recvFromSocket(conn *net.UDPConn) error {
 	// Close does not need a polling deadline: Client.Close closes the socket
 	// via dialer.Close, which unblocks the first (deadline-less) read.
 	reader := newPacketReader(conn, c.logger, c.logLevel <= LogLevelDebug)
+	// Same contract as the server's serveConn: a transient read error
+	// (ENOBUFS under a burst, EINTR from a signal) must not spin this loop at
+	// 1000 wakes/second or kill it — back off exponentially and surface the
+	// condition at most once per 100 occurrences.
+	var backoff time.Duration
+	var transientReads uint64
 	for {
 		pkts, err := reader.next()
 		if err != nil {
@@ -673,11 +686,21 @@ func (c *Client) recvFromSocket(conn *net.UDPConn) error {
 				return nil
 			}
 			if isRetryableUDPReadError(err) {
-				time.Sleep(time.Millisecond)
+				if backoff == 0 {
+					backoff = time.Millisecond
+				} else if backoff < time.Second {
+					backoff *= 2
+				}
+				transientReads++
+				if transientReads == 1 || transientReads%100 == 0 {
+					c.logWarn("[Client] UDP read: transient error, retrying (count=%d, backoff=%v): %v", transientReads, backoff, err)
+				}
+				time.Sleep(backoff)
 				continue
 			}
 			return err
 		}
+		backoff = 0
 		for i := range pkts {
 			pkt := &pkts[i]
 			if !c.dialer.acceptsRemote(pkt.from) {
@@ -1007,13 +1030,19 @@ func (c *Client) handshake(ctx context.Context, target string) (uint32, *NoiseSe
 		c.ackMu.Unlock()
 	}()
 
+	// One PSK per handshake, fixed across all of its SYN retries. The server's
+	// synCache keys the idempotency cache on (nonce, PSK-derived SynMAC): a
+	// retry under a DIFFERENT PSK is a different cache key, so with several
+	// shared PSKs every rotation round used to register a fresh session and
+	// dial the target again whenever the ACK was slower than the retry
+	// backoff. The cursor still rotates ACROSS handshakes, so a server that
+	// has dropped the first-listed PSK (key rotation on the server side) is
+	// picked up by the next establishment instead of failing forever. The ACK
+	// matcher below accepts whichever of the configured PSKs the server
+	// answered with, so a server mid-rotation still completes this handshake.
+	startPSK := int(c.pskCursor.Add(1)-1) % len(c.cfg.Passwords)
+	psk := c.cfg.Passwords[startPSK]
 	for attempt := 1; attempt <= clientMaxHandshakeAttempts; attempt++ {
-		// Re-seal the SYN per attempt under a rotating PSK. The server verifies
-		// the SYN against whichever of ITS keys match, so a server that has
-		// already dropped the client's first-listed PSK (rotation) would
-		// otherwise reject every retry forever — the same clientNonce retried
-		// under the next key hits the server's SYN cache/nonce handling intact.
-		psk := c.cfg.Passwords[(attempt-1)%len(c.cfg.Passwords)]
 		synKeys := DerivePSKHandshakeKeys(psk, clientNonce)
 		syn := SealFrameMAC(&UDPCFrame{
 			Magic: c.magic, Version: UDPC_VERSION, Flags: synFlags,
@@ -1095,7 +1124,7 @@ func (c *Client) handshake(ctx context.Context, target string) (uint32, *NoiseSe
 				waiting = false
 			case <-c.closeChan:
 				timer.Stop()
-				return 0, nil, nil, "", fmt.Errorf("client closed")
+				return 0, nil, nil, "", fmt.Errorf("handshake aborted by Client.Close: %w", ErrClosed)
 			case <-ctx.Done():
 				timer.Stop()
 				return 0, nil, nil, "", ctx.Err()
@@ -1485,16 +1514,18 @@ func (s *clientSession) handleAck(ackSeq uint64) {
 	// restored window is what grows, not the halved one.
 	spurious := false
 	for seq := s.lowestOutstanding; seq <= ackSeq; seq++ {
-		if pkt, ok := s.unacked[seq]; ok && s.fecSend != nil {
-			s.fecSend.observeAck(pkt.retries > 0)
-		}
-		if pkt, ok := s.unacked[seq]; ok && !spurious && s.flow != nil {
-			spurious = s.flow.undoIfSpurious(pkt, srtt)
-		}
-		if s.unacked[seq] != nil {
+		// One lookup serves all three consumers (FEC feedback, undo
+		// bookkeeping, ACK accounting) — mirrors the server-side loop.
+		if pkt, ok := s.unacked[seq]; ok {
+			if s.fecSend != nil {
+				s.fecSend.observeAck(pkt.retries > 0)
+			}
+			if !spurious && s.flow != nil {
+				spurious = s.flow.undoIfSpurious(pkt, srtt)
+			}
 			acknowledged++
+			delete(s.unacked, seq)
 		}
-		delete(s.unacked, seq)
 	}
 	if len(s.unacked) == 0 {
 		s.lowestOutstanding = ackSeq + 1
@@ -1537,11 +1568,13 @@ func (s *clientSession) retransmitLoop() {
 			return
 		}
 		for _, wire := range due {
-			if s.tx != nil {
-				s.tx.bestEffort(wire)
-			} else {
-				_ = s.client.dialer.Send(wire)
+			// The retry budget for these frames was just consumed: a full
+			// transmit queue must not silently eat them, so fall back to a
+			// direct send instead of dropping.
+			if s.tx != nil && s.tx.bestEffort(wire) {
+				continue
 			}
+			_ = s.client.dialer.Send(wire)
 		}
 		if probe {
 			s.sendControl(&UDPCFrame{Magic: s.client.magic, Version: UDPC_VERSION, Cmd: CMD_PING, SessionID: s.sid, Ack: s.currentAck()}, s.client.dialer.Send)
@@ -1935,10 +1968,12 @@ func (s *clientSession) handleSACK(f *UDPCFrame) {
 		s.handleAck(f.Ack)
 	}
 	for _, wire := range wires {
-		if s.tx != nil {
-			s.tx.bestEffort(wire)
-		} else {
-			_ = s.client.dialer.Send(wire)
+		// Same rule as the retransmit loop: the repair's retry accounting is
+		// already spent, so a full queue must fall back to a direct send
+		// instead of dropping the frame.
+		if s.tx != nil && s.tx.bestEffort(wire) {
+			continue
 		}
+		_ = s.client.dialer.Send(wire)
 	}
 }

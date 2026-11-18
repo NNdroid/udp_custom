@@ -274,7 +274,7 @@ func (s *ServerSession) sendToSessionBatch(wires [][]byte) error {
 		return nil
 	}
 	if port > 0 && port != s.server.bindPort {
-		pc, err := s.server.sockPool.Get(port)
+		pc, err := s.server.sockPool.Get(port, addr)
 		if err != nil {
 			for _, wire := range wires {
 				s.sendToSession(wire)

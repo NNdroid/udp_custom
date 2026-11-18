@@ -77,7 +77,8 @@ func TestSendSockPoolRepairsPoisonedReplySocket(t *testing.T) {
 	pool := newSendSockPool(8, nil)
 	defer pool.Close()
 	port := freeUDPPort(t)
-	pc, err := pool.Get(port)
+	dst := recv.LocalAddr().(*net.UDPAddr).AddrPort()
+	pc, err := pool.Get(port, dst)
 	if err != nil {
 		t.Fatalf("pool.Get(%d): %v", port, err)
 	}
@@ -86,12 +87,11 @@ func TestSendSockPoolRepairsPoisonedReplySocket(t *testing.T) {
 	}
 
 	payload := []byte("reply-from-repaired-source-port")
-	dst := recv.LocalAddr().(*net.UDPAddr).AddrPort()
 	if _, err := pc.WriteToUDPAddrPort(payload, dst); err != nil {
 		t.Fatalf("write through poisoned pooled socket: %v", err)
 	}
 
-	replacement, err := pool.Get(port)
+	replacement, err := pool.Get(port, dst)
 	if err != nil {
 		t.Fatalf("pool.Get replacement: %v", err)
 	}

@@ -135,14 +135,18 @@ func (a *MessageAssembler) Feed(chunk []byte) ([][]byte, error) {
 			break
 		}
 		n := binary.BigEndian.Uint32(a.buf)
-		if n > a.maxPayload {
+		// The int64 comparison also guards 32-bit builds: a maxPayload >= 2^31
+		// would make int(n) negative there, bypassing the length check and
+		// crashing in make(). maxPayload is uint32 by API, so the guard is a
+		// no-op on any realistic configuration.
+		if uint64(n) > uint64(a.maxPayload) || uint64(n) > math.MaxInt32 {
 			// A desynced stream cannot be resynchronised: refuse to keep
 			// guessing at frame boundaries.
 			a.broken = true
 			a.buf = nil
 			return nil, fmt.Errorf("%w (%d > %d)", ErrMessageTooLarge, n, a.maxPayload)
 		}
-		if len(a.buf) < FrameHeaderSize+int(n) {
+		if uint64(len(a.buf)) < uint64(FrameHeaderSize)+uint64(n) {
 			break
 		}
 		if msgs == nil {

@@ -30,7 +30,7 @@ scope.
 # Background (read carefully, do not re-research)
 
 - Wire spec: PROTOCOL_V2.md — fixed 40-byte header + 16-byte AEAD tag,
-  cumulative Ack, per-direction PacketNo with an independent 2048 replay
+  cumulative Ack, per-direction PacketNo with an independent 5120 replay
   window, 64-bit Seq, HMAC-SHA256-128 handshake, ChaCha20-Poly1305 session
   records.
 - The existing UDP profile's triad: client spread.go randomizes destination

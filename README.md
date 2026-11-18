@@ -5,7 +5,7 @@ High-Performance Custom UDP Stream Tunnel Server & Client with Authenticated Con
 ## Features
 
 - **Reliable UDP Stream Transmission**: ARQ with adaptive RTO, negotiated selective ACK and fast repair, ordered bounded delivery queues, adaptive send windows and RTT-based pacing. Older peers retain cumulative ACKs and a fixed window.
-- **Authenticated Protocol v2 Records**: every DATA, ACK, PING, PONG, FIN, PATH_CHALLENGE, and PATH_RESPONSE carries a 64-bit per-direction `PacketNo` plus a fixed 16-byte authentication tag. A 2048-packet sliding window rejects duplicates and too-old packets before they can mutate session state.
+- **Authenticated Protocol v2 Records**: every DATA, ACK, PING, PONG, FIN, PATH_CHALLENGE, and PATH_RESPONSE carries a 64-bit per-direction `PacketNo` plus a fixed 16-byte authentication tag. A 5120-packet sliding window rejects duplicates and too-old packets before they can mutate session state.
 - **Hardened Handshake**: direction-separated PSK MAC keys protect both SYN and ACK; the ACK echoes `ClientNonce` and adds `ServerNonce`. Session keys bind both nonces and `SessionID`. A ±300s timestamp window, per-source-IP SYN rate limiting, target-dial concurrency cap, and PSK-isolated idempotency cache limit replay and resource exhaustion.
 - **Dual Target Forwarding**: Proxies to both TCP (`tcp://host:port`) and UDP (`udp://host:port`) services.
 - **Mandatory PSK Authentication & Encryption**: open/CRC-only mode no longer exists. Every session record — DATA and control frames alike — is **ChaCha20-Poly1305 encrypted and authenticated**, in PSK-only mode too (keys bound to the PSK, both handshake nonces, and the SessionID). Note: PSK-only mode has **no forward secrecy** — a leaked PSK exposes past PSK-only traffic. Configure Noise when that matters.
@@ -136,7 +136,7 @@ Notes for embedders:
 
 | Area | Status |
 | :--- | :--- |
-| Congestion control | ARQ with adaptive RTO + fixed send window (256 frames). No loss-based throttling: on a heavily lossy path retransmissions can be aggressive. A pacing/BBR-style mode is a possible future option. |
+| Congestion control | ARQ with adaptive RTO, SACK fast repair, an adaptive send window (256 → 4096 frames with slow start) and Westwood-style loss discrimination: random wireless loss restores the window to the measured BDP, real congestion halves it (with RTO undo). On a heavily lossy path retransmissions can still be aggressive; a pacing/BBR-style mode is a possible future option. |
 | Forward secrecy | PSK-only sessions are ChaCha20-Poly1305 encrypted but derive keys from the long-lived PSK — a leaked PSK exposes past PSK-only traffic. Noise (`privkey`/`pubkey`) gives forward secrecy. |
 | Packet-number exhaustion | 64-bit per-direction counters; the session dies before a nonce can repeat. Theoretical. |
 | Multi-threaded receive | ✅ Supported on Linux via `receive_sockets` (SO_REUSEPORT group, one read goroutine per socket, 4-tuple hash keeps per-session ordering). Other platforms are single-reader; `SO_REUSEPORT` on Windows/BSD has different semantics and is not attempted. |
@@ -203,7 +203,7 @@ Keep `"mode": "client"` in the config.
 | `origdst` | `bool` | `true` | **Required (Linux).** Enables `IP_RECVORIGDSTADDR` so the server recovers each client packet's original destination port (pre-DNAT) and replies FROM that exact port. Without it every reply leaves from `listen` and any NAT stricter than full-cone drops it. Ignored on non-Linux platforms. |
 | `receive_sockets` | `int` | `1` | **Linux only.** Opens N UDP sockets sharing `listen` via `SO_REUSEPORT`, one read goroutine each — scales packet intake across cores. The kernel hashes the 4-tuple, so one client source socket always lands on the same receiver (per-session ordering preserved) while different clients spread across the group. 0/1 = single socket; non-Linux platforms clamp to 1 with a warning; hard cap 8. |
 | `sendsock_max` | `int` | `512` | Per-port reply-socket pool cap (LRU). One socket is bound per distinct origdst port so the kernel stamps the reply's source port correctly. Set it >= the size of `port_range`. |
-| `send_window` | `int` | `0` (automatic) | With negotiated recovery, starts at 64 frames and grows up to 512; loss reduces the congestion window and peer receive credit limits admission. A positive value caps the adaptive window (at most 512). Older peers or `recovery:false` use the configured fixed window, default 256. |
+| `send_window` | `int` | `0` (automatic) | With negotiated recovery, starts at 256 frames and grows up to 4096; loss reduces the congestion window and peer receive credit limits admission. A positive value caps the adaptive window (at most 4096). Older peers or `recovery:false` use the configured fixed window, default 256. |
 | `recovery` | `bool` | `true` | Enables authenticated negotiation of SACK, receive-credit feedback, adaptive windows and pacing. Set false on either end to retain the legacy cumulative-ACK behavior. Does not disable FEC or ordered delivery. |
 | `max_pkt` | `int` | `1450` | Largest v2 record this end puts on the wire (40-byte header + payload + 16-byte tag), i.e. the UDP payload size. See [Frame size](#frame-size-max_pkt). |
 
@@ -265,7 +265,7 @@ after the handshake — see the next section.
 
 Right after the handshake — and before any DATA is encoded, because an
 in-flight oversized frame can never be re-chunked — the client walks a
-descending ladder of record sizes (`1450 → 1200 → 1000 → 800 → 548`) and sends
+descending ladder of record sizes (`1450 → 1392 → 1200 → 1000 → 800 → 548`) and sends
 an authenticated probe whose **payload length is the size under test**; the
 server echoes it byte for byte, so one round trip proves both directions. The
 converged size is published to the server with a commit record, which also
@@ -276,12 +276,14 @@ ever encoded against a narrow path).
   target dial), zero afterwards — the result is cached per server for 10
   minutes and re-probed on reconnects.
 - A peer that does not implement probing (or `mtu_probe: false` on the server)
-  simply never answers: the client falls back to `max_pkt` after the ladder
-  walk, exactly today's behaviour. Safe during mixed-version rollouts, at the
-  cost of up to ~3s on the first session.
+  simply never answers: after the ladder walk the client falls back to a
+  conservative 548-byte floor (`max_pkt`'s never-fragment size), not to
+  `max_pkt` itself. Safe during mixed-version rollouts, at the cost of up to
+  ~7s on the first session (six rungs × up to two probes × a 600ms timeout).
 - Set `mtu_probe: false` on the client to pin `max_pkt` verbatim.
-- The converged size is immutable for the session's lifetime; re-probing only
-  affects new sessions.
+- The converged size is NOT frozen for the session's lifetime: while the
+  session is idle the client re-probes (every 30s) and can both lower and
+  raise the committed budget mid-session as the path changes.
 
 ---
 
@@ -305,7 +307,7 @@ which is what makes a CGNAT / symmetric NAT accept it.
 - **Load balancing:** the client spreads writes across the N chosen ports (and, with
   `sockets` > 1, across N local sockets too) and the server fans replies back per
   path; keepalive traffic follows the active spread selection.
-- **N=32** is a good default (see `config.server.example.json`).
+- **N=32** is a good default (see `config.client.example.json`).
 
 > The earlier direct-bind multi-path design (server binding N ports and advertising
 > them in the ACK) was abandoned: it could not recover from a behind-CGNAT
@@ -664,8 +666,8 @@ for _, c := range d.Conns() {
 Notes:
 
 - **K × N amplifies reordering** — exactly why the AEAD nonce is derived from
-  the frame `PacketNo` instead of a receive-order counter. The 512-entry reorder
-  buffer and 2048-packet replay window still cover a few-hundred-port setup.
+  the frame `PacketNo` instead of a receive-order counter. The 4096-entry reorder
+  buffer and 5120-packet replay window still cover a few-hundred-port setup.
 - **conntrack**: each 4-tuple consumes an entry; keep `nf_conntrack_max` roomy.
 - **`sendsock_max` only needs to cover N** (the server-side port count); it is
   independent of K.

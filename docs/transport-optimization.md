@@ -7,7 +7,7 @@ is not merged.
 ## Delivery and ownership
 
 Each session has one application/backend writer. Socket readers authenticate and
-copy accepted DATA into a queue bounded to 512 frames, including the write in
+copy accepted DATA into a queue bounded to 4096 frames, including the write in
 progress. Sequence distance is bounded as well, leaving room for a missing
 prefix. Queue saturation rejects admission and rolls back DATA replay state so
 the immutable retransmission can be retried. A slow session cannot park a shared
@@ -29,14 +29,14 @@ socket/decryption scratch view.
 Handshake flag `1<<2` negotiates recovery independently of FEC. Only negotiated
 sessions emit command `0x0e` (SACK). Its authenticated header carries the
 cumulative delivery ACK; plaintext is a 2-byte receive credit followed by zero
-to eight big-endian 64-bit words. Bits enumerate admitted sequences after ACK.
-Trailing empty words are omitted. This covers the complete 512-frame window
+to sixty-four big-endian 64-bit words. Bits enumerate admitted sequences after ACK.
+Trailing empty words are omitted. This covers the complete 4096-frame window
 without inflating normal empty-bitmap feedback.
 
 Feedback is checked against the sent sequence range. Packet numbers prevent old
 feedback from regressing credit. Three later admissions plus a quarter-RTT
 reorder guard (at least 5ms) trigger repair of the gap. Timeout repair skips
-admitted frames, sends in sequence order, backs off and caps each burst to 16.
+admitted frames, sends in sequence order, backs off and caps each burst to 64.
 Timers follow actual send deadlines and sleep up to one second when idle.
 Credit/admission probes recover lost ACKs and window-opening feedback; zero
 credit is probed even if a PONG drained the outstanding queue.
@@ -45,20 +45,21 @@ Both peers must opt into recovery. `recovery:false`, missing peer capability, or
 an older peer preserves the legacy cumulative-ACK format and default 256-frame
 window. FEC capability and record authentication remain unchanged. Explicit
 `send_window` remains the fixed window with legacy peers, and is an upper bound
-on the adaptive window (at most 512) with recovery peers.
+on the adaptive window (at most 4096) with recovery peers.
 
 ## Scheduling, ACK and batching
 
-The congestion window starts at at most 64, grows with acknowledged DATA, and
+The congestion window starts at 256 frames, grows with acknowledged DATA, and
 reduces on loss, at most once per RTT. Receive credit and a hard ceiling bound
 outstanding memory. The pacer derives each burst's interval from measured RTT
 and the congestion window; initial unknown RTT incurs no synthetic 200ms delay.
 DATA, retransmissions and FEC use the same session pacer. Control feedback bypasses
 it. This is a bounded TCP-like controller, not BBR or a bandwidth estimator.
 
-Normal delivery ACKs coalesce two frames, with a maximum 1ms wait for a single
-frame. Duplicate and gap feedback stays immediate. Immutable DATA/parity slices
-enter a 32-frame transmit queue that drains ready frames without a batching
+Normal delivery ACKs coalesce, waiting up to half an SRTT per batch — bounded
+below so a fresh session still ACKs promptly, never past 100 ms. Duplicate and
+gap feedback stays immediate. Immutable DATA/parity slices
+enter a 64-frame transmit queue that drains ready frames without a batching
 delay. Linux uses `sendmmsg` with `MSG_DONTWAIT`; other platforms use ordinary UDP
 writes. Client batches group by source socket and preserve each chosen remote
 port. Server batches pin reply sockets against LRU eviction. Partial sends only

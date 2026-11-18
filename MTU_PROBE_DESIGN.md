@@ -220,6 +220,11 @@ new tag) must upgrade together.
 §1/§5's "cap is immutable within a session" is no longer true and the sections
 below describe the CURRENT algorithm (`tunnel/mtuprobe.go`):
 
+- **Current probe constants** (§6/§12's numbers are stale): the ladder is
+  `1450, 1392, 1200, 1000, 800, 548` (six rungs), each probe waits up to
+  **600 ms** (not 300 ms), so the no-answer worst case is ≈ 7.2 s, and a peer
+  that never answers converges on the **548-byte floor**, not `max_pkt`.
+
 - **The cap is converged in the background.** `establish` starts the pumps at
   the never-fragment floor immediately and `convergeFrameBudget` walks the
   ladder concurrently; the floor is committed BEFORE the ladder so the server's
